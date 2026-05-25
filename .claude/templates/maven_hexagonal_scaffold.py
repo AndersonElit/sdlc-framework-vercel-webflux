@@ -2,8 +2,11 @@
 """Genera un proyecto base Spring Boot Reactivo multimódulo con arquitectura hexagonal."""
 
 import argparse
+import logging
 import sys
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 def get_yaml_content(database: str, messaging_system: str) -> str:
@@ -275,6 +278,8 @@ def create_rabbit_producer_files(root: Path, safe_project_name: str) -> None:
     base_package = f"com.{safe_project_name}.{module_name}"
     package_path = "/src/main/java/" + base_package.replace(".", "/")
 
+    logger.debug("Generando archivos RabbitMQ producer en: %s", module_path)
+
     config_class = f"""\
 package {base_package};
 
@@ -336,7 +341,10 @@ public class MessagePublisher {{
     pkg_dir = root / (module_path + package_path)
     pkg_dir.mkdir(parents=True, exist_ok=True)
     (pkg_dir / "RabbitMQConfig.java").write_text(config_class)
+    logger.debug("Archivo creado: %s/RabbitMQConfig.java", pkg_dir)
     (pkg_dir / "MessagePublisher.java").write_text(publisher)
+    logger.debug("Archivo creado: %s/MessagePublisher.java", pkg_dir)
+    logger.info("Módulo rabbit-producer generado")
 
 
 def create_rabbit_consumer_files(root: Path, safe_project_name: str) -> None:
@@ -344,6 +352,8 @@ def create_rabbit_consumer_files(root: Path, safe_project_name: str) -> None:
     module_name = "rabbitconsumer"
     base_package = f"com.{safe_project_name}.{module_name}"
     package_path = "/src/main/java/" + base_package.replace(".", "/")
+
+    logger.debug("Generando archivos RabbitMQ consumer en: %s", module_path)
 
     config_class = f"""\
 package {base_package};
@@ -402,13 +412,16 @@ public class MessageListener {{
     pkg_dir = root / (module_path + package_path)
     pkg_dir.mkdir(parents=True, exist_ok=True)
     (pkg_dir / "RabbitMQConfig.java").write_text(config_class)
+    logger.debug("Archivo creado: %s/RabbitMQConfig.java", pkg_dir)
     (pkg_dir / "MessageListener.java").write_text(listener)
+    logger.debug("Archivo creado: %s/MessageListener.java", pkg_dir)
+    logger.info("Módulo rabbit-consumer generado")
 
 
 def scaffold(project_name: str, database: str, messaging_system: str) -> None:
     safe_name = project_name.replace("-", "")
     root = Path(project_name)
-    print(f"[INFO] Creando proyecto: {project_name}")
+    logger.info("Creando proyecto: %s (db=%s, messaging=%s)", project_name, database, messaging_system)
 
     db_adapter_module = (
         "infrastructure/driven-adapters/mongo"
@@ -426,10 +439,15 @@ def scaffold(project_name: str, database: str, messaging_system: str) -> None:
 
     if messaging_system.lower() == "rabbit-producer":
         modules.append("infrastructure/driven-adapters/rabbit-producer")
+        logger.debug("Mensajería habilitada: rabbit-producer")
     elif messaging_system.lower() == "rabbit-consumer":
         modules.append("infrastructure/entry-points/rabbit-consumer")
+        logger.debug("Mensajería habilitada: rabbit-consumer")
+
+    logger.info("Módulos a generar: %d", len(modules))
 
     for module in modules:
+        logger.debug("Procesando módulo: %s", module)
         module_name = module.split("/")[-1].replace("-", "")
         base_package = f"com.{safe_name}.{module_name}"
         package_path = "/src/main/java/" + base_package.replace(".", "/")
@@ -437,7 +455,9 @@ def scaffold(project_name: str, database: str, messaging_system: str) -> None:
         pkg_dir = root / (module + package_path)
         pkg_dir.mkdir(parents=True, exist_ok=True)
 
-        (root / module / "pom.xml").write_text(get_module_pom(project_name, safe_name, module))
+        pom_path = root / module / "pom.xml"
+        pom_path.write_text(get_module_pom(project_name, safe_name, module))
+        logger.debug("pom.xml creado: %s", pom_path)
 
         if module == "infrastructure/entry-points/rest-api":
             controller = f"""\
@@ -456,6 +476,7 @@ public class HelloController {{
 }}
 """
             (pkg_dir / "HelloController.java").write_text(controller)
+            logger.debug("HelloController.java creado en: %s", pkg_dir)
 
         if module == "infrastructure/entry-points/app":
             main_package = f"com.{safe_name}"
@@ -477,6 +498,7 @@ public class MainApplication {{
 }}
 """
             (main_dir / "MainApplication.java").write_text(main_class)
+            logger.debug("MainApplication.java creado en: %s", main_dir)
 
             app_config = f"""\
 package {main_package};
@@ -504,10 +526,14 @@ public class ApplicationConfig {{
 }}
 """
             (main_dir / "ApplicationConfig.java").write_text(app_config)
+            logger.debug("ApplicationConfig.java creado en: %s", main_dir)
 
             resources_dir = root / module / "src/main/resources"
             resources_dir.mkdir(parents=True, exist_ok=True)
             (resources_dir / "application.yml").write_text(get_yaml_content(database, messaging_system))
+            logger.debug("application.yml creado en: %s", resources_dir)
+
+        logger.info("Módulo listo: %s", module)
 
     if messaging_system.lower() == "rabbit-producer":
         create_rabbit_producer_files(root, safe_name)
@@ -515,7 +541,9 @@ public class ApplicationConfig {{
         create_rabbit_consumer_files(root, safe_name)
 
     (root / ".env").write_text(get_env_content(project_name, database, messaging_system))
+    logger.debug(".env creado")
     (root / ".env.example").write_text(get_env_example_content(project_name, database, messaging_system))
+    logger.debug(".env.example creado")
 
     gitignore = """\
 target/
@@ -541,9 +569,11 @@ bin/
 .env
 """
     (root / ".gitignore").write_text(gitignore)
+    logger.debug(".gitignore creado")
     (root / "pom.xml").write_text(get_root_pom(project_name, database, messaging_system))
+    logger.debug("pom.xml raíz creado")
 
-    print(f"[SUCCESS] Proyecto creado en: {root.resolve()}")
+    logger.info("Proyecto creado exitosamente en: %s", root.resolve())
 
 
 def main() -> None:
@@ -558,13 +588,23 @@ def main() -> None:
     parser.add_argument("-m", "--messaging-system", default="none",
                         choices=["none", "rabbit-producer", "rabbit-consumer"],
                         help="Sistema de mensajería a configurar")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="Mostrar logs detallados (DEBUG)")
 
     args = parser.parse_args()
+
+    log_level = logging.DEBUG if args.verbose else logging.INFO
+    logging.basicConfig(
+        level=log_level,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        stream=sys.stdout,
+    )
 
     try:
         scaffold(args.service_name, args.database, args.messaging_system)
     except OSError as e:
-        print(f"[ERROR] No se pudo crear el proyecto: {e}", file=sys.stderr)
+        logger.error("No se pudo crear el proyecto: %s", e)
         sys.exit(1)
 
 
