@@ -574,6 +574,38 @@ bin/
     logger.debug("pom.xml raíz creado")
 
     logger.info("Proyecto creado exitosamente en: %s", root.resolve())
+    _print_run_instructions(project_name, root, messaging_system)
+
+
+def _print_run_instructions(project_name: str, root: Path, messaging_system: str) -> None:
+    rabbit_note = ""
+    if messaging_system.lower() in ("rabbit-producer", "rabbit-consumer"):
+        rabbit_note = "\n  # Asegúrate de tener RabbitMQ corriendo antes de iniciar:\n  docker run -d --name rabbitmq -p 5672:5672 -p 15672:15672 rabbitmq:3-management\n"
+
+    instructions = f"""
+╔══════════════════════════════════════════════════════════════════════╗
+║              Proyecto listo: {project_name:<40}║
+╚══════════════════════════════════════════════════════════════════════╝
+
+ 1. Entra al directorio del proyecto:
+    cd {root}
+
+ 2. Configura las variables de entorno:
+    cp .env.example .env
+    # Edita .env con tus credenciales reales
+{rabbit_note}
+ 3. Compila el proyecto:
+    mvn clean install -DskipTests
+
+ 4. Ejecuta la aplicación:
+    mvn -pl infrastructure/entry-points/app spring-boot:run
+
+ 5. Verifica que está corriendo:
+    curl http://localhost:8080/hello
+
+────────────────────────────────────────────────────────────────────────
+"""
+    print(instructions)
 
 
 def main() -> None:
