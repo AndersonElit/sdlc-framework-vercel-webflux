@@ -32,7 +32,7 @@ def get_package_json(project_name: str) -> str:
     "prepare": "husky"
   }},
   "dependencies": {{
-    "next": "15.1.0",
+    "next": "^15.3.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "@tanstack/react-query": "^5.62.0",
@@ -57,11 +57,11 @@ def get_package_json(project_name: str) -> str:
     "tailwindcss": "^3.4.1",
     "postcss": "^8",
     "autoprefixer": "^10.0.1",
-    "eslint": "^8",
-    "eslint-config-next": "15.1.0",
+    "eslint": "^9.0.0",
+    "eslint-config-next": "^15.3.0",
+    "@eslint/eslintrc": "^3.2.0",
     "@typescript-eslint/eslint-plugin": "^8.0.0",
     "@typescript-eslint/parser": "^8.0.0",
-    "eslint-plugin-import": "^2.31.0",
     "prettier": "^3.4.0",
     "prettier-plugin-tailwindcss": "^0.6.9",
     "husky": "^9.1.7",
@@ -213,35 +213,27 @@ module.exports = {
 
 def get_eslint_config() -> str:
     return """\
-{
-  "extends": [
-    "next/core-web-vitals",
-    "next/typescript",
-    "plugin:@typescript-eslint/recommended",
-    "plugin:import/recommended",
-    "plugin:import/typescript"
-  ],
-  "plugins": ["@typescript-eslint", "import"],
-  "rules": {
-    "@typescript-eslint/no-unused-vars": ["error", { "argsIgnorePattern": "^_" }],
-    "@typescript-eslint/no-explicit-any": "error",
-    "@typescript-eslint/consistent-type-imports": ["error", { "prefer": "type-imports" }],
-    "import/order": [
-      "error",
-      {
-        "groups": ["builtin", "external", "internal", "parent", "sibling", "index"],
-        "newlines-between": "always",
-        "alphabetize": { "order": "asc" }
-      }
-    ],
-    "import/no-duplicates": "error"
+import { dirname } from 'path'
+import { fileURLToPath } from 'url'
+import { FlatCompat } from '@eslint/eslintrc'
+
+const __filename = fileURLToPath(import.meta.url)
+const __dirname = dirname(__filename)
+
+const compat = new FlatCompat({ baseDirectory: __dirname })
+
+const eslintConfig = [
+  ...compat.extends('next/core-web-vitals', 'next/typescript'),
+  {
+    rules: {
+      '@typescript-eslint/no-unused-vars': ['error', { argsIgnorePattern: '^_' }],
+      '@typescript-eslint/no-explicit-any': 'error',
+      '@typescript-eslint/consistent-type-imports': ['error', { prefer: 'type-imports' }],
+    },
   },
-  "settings": {
-    "import/resolver": {
-      "typescript": { "alwaysTryTypes": true }
-    }
-  }
-}
+]
+
+export default eslintConfig
 """
 
 
@@ -1935,7 +1927,7 @@ def scaffold(project_name: str) -> None:
         "next.config.ts": get_next_config(),
         "tailwind.config.ts": get_tailwind_config(),
         "postcss.config.js": get_postcss_config(),
-        ".eslintrc.json": get_eslint_config(),
+        "eslint.config.mjs": get_eslint_config(),
         ".prettierrc": get_prettier_config(),
         ".prettierignore": get_prettier_ignore(),
         ".lintstagedrc.json": get_lintstaged_config(),
@@ -2068,16 +2060,16 @@ def _print_run_instructions(project_name: str, root: Path) -> None:
     git init
     npx husky init
 
- 5. Agrega componentes shadcn/ui:
-    npx shadcn@latest init
-    npx shadcn@latest add button input label card
-
- 6. Inicia el servidor de desarrollo:
+ 5. Inicia el servidor de desarrollo:
     npm run dev
 
  7. Abre en el navegador:
     http://localhost:3000
 
+────────────────────────────────────────────────────────────────────────
+ Agregar componentes shadcn/ui (cuando los necesites):
+    npx shadcn@latest add button input label card badge table
+    # shadcn copia el código fuente a src/components/ui/ — no es una dep.
 ────────────────────────────────────────────────────────────────────────
  Comandos útiles:
     npm run type-check     → Verificar tipos TypeScript
