@@ -55,3 +55,35 @@ docker run -d \
   floci/floci:latest
 
 log_ok "Floci listo."
+
+# ---------------------------------------------------------------------------
+# Estructura base de Terraform
+# ---------------------------------------------------------------------------
+TERRAFORM_ROOT="${PROJECT_ROOT:-$(pwd)}/terraform"
+
+log "Creando estructura Terraform en $TERRAFORM_ROOT..."
+
+mkdir -p \
+  "$TERRAFORM_ROOT/modules/vpc" \
+  "$TERRAFORM_ROOT/modules/eks" \
+  "$TERRAFORM_ROOT/modules/rds" \
+  "$TERRAFORM_ROOT/environments/dev" \
+  "$TERRAFORM_ROOT/environments/staging" \
+  "$TERRAFORM_ROOT/environments/prod" \
+  "$TERRAFORM_ROOT/shared"
+
+# Archivos main.tf vacíos como punto de entrada por módulo/entorno
+for dir in \
+  modules/vpc \
+  modules/eks \
+  modules/rds \
+  environments/dev \
+  environments/staging \
+  environments/prod \
+  shared; do
+  touch "$TERRAFORM_ROOT/$dir/main.tf"
+  touch "$TERRAFORM_ROOT/$dir/variables.tf"
+  touch "$TERRAFORM_ROOT/$dir/outputs.tf"
+done
+
+log_ok "Estructura Terraform creada en $TERRAFORM_ROOT."
