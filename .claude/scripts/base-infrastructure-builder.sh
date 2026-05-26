@@ -70,7 +70,6 @@ mkdir -p \
   "$TF_FRONTEND/environments/dev" \
   "$TF_FRONTEND/environments/staging" \
   "$TF_FRONTEND/environments/prod" \
-  "$TF_BACKEND/modules/vpc" \
   "$TF_BACKEND/modules/eks" \
   "$TF_BACKEND/modules/rds" \
   "$TF_BACKEND/modules/iam" \
@@ -256,14 +255,335 @@ EOF
 done
 
 # ===========================================================================
-# BACKEND — placeholders vpc / eks / rds
+# BACKEND — módulo EKS
 # ===========================================================================
 
-for mod in vpc eks rds; do
-  touch "$TF_BACKEND/modules/$mod/main.tf"
-  touch "$TF_BACKEND/modules/$mod/variables.tf"
-  touch "$TF_BACKEND/modules/$mod/outputs.tf"
-done
+log "Escribiendo módulo EKS..."
+
+cat > "$TF_BACKEND/modules/eks/main.tf" << 'EOF'
+data "aws_iam_policy_document" "eks_assume_role" {
+  statement {
+    actions = ["sts:AssumeRole"]
+    principals {
+      type        = "Service"
+      identifiers = ["eks.amazonaws.com"]
+    }
+  }
+}
+
+data "aws_iam_policy_document" "nodes_assume_role" {
+  statement {
+    actions = ["sts:AssumeRole"]
+    principals {
+      type        = "Service"
+      identifiers = ["ec2.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "cluster" {
+  name               = "${var.project_name}-${var.environment}-eks-cluster"
+  assume_role_policy = data.aws_iam_policy_document.eks_assume_role.json
+}
+
+resource "aws_iam_role_policy_attachment" "cluster_policy" {
+  role       = aws_iam_role.cluster.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSClusterPolicy"
+}
+
+resource "aws_iam_role" "nodes" {
+  name               = "${var.project_name}-${var.environment}-eks-nodes"
+  assume_role_policy = data.aws_iam_policy_document.nodes_assume_role.json
+}
+
+resource "aws_iam_role_policy_attachment" "nodes_worker" {
+  role       = aws_iam_role.nodes.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy"
+}
+
+resource "aws_iam_role_policy_attachment" "nodes_cni" {
+  role       = aws_iam_role.nodes.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy"
+}
+
+resource "aws_iam_role_policy_attachment" "nodes_ecr" {
+  role       = aws_iam_role.nodes.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
+}
+
+resource "aws_eks_cluster" "main" {
+  name     = "${var.project_name}-${var.environment}"
+  version  = var.kubernetes_version
+  role_arn = aws_iam_role.cluster.arn
+
+  vpc_config {
+    subnet_ids = var.subnet_ids
+  }
+
+  tags = {
+    Environment = var.environment
+    Project     = var.project_name
+  }
+
+  depends_on = [aws_iam_role_policy_attachment.cluster_policy]
+}
+
+resource "aws_eks_node_group" "main" {
+  cluster_name    = aws_eks_cluster.main.name
+  node_group_name = "${var.project_name}-${var.environment}-ng"
+  node_role_arn   = aws_iam_role.nodes.arn
+  subnet_ids      = var.subnet_ids
+  instance_types  = var.node_instance_types
+
+  scaling_config {
+    desired_size = var.node_desired_size
+    min_size     = var.node_min_size
+    max_size     = var.node_max_size
+  }
+
+  update_config {
+    max_unavailable = 1
+  }
+
+  tags = {
+    Environment = var.environment
+    Project     = var.project_name
+  }
+
+  depends_on = [
+    aws_iam_role_policy_attachment.nodes_worker,
+    aws_iam_role_policy_attachment.nodes_cni,
+    aws_iam_role_policy_attachment.nodes_ecr,
+  ]
+}
+EOF
+
+cat > "$TF_BACKEND/modules/eks/variables.tf" << 'EOF'
+variable "project_name" {
+  description = "Prefijo del proyecto"
+  type        = string
+}
+
+variable "environment" {
+  description = "Nombre del ambiente (dev/staging/prod)"
+  type        = string
+}
+
+variable "subnet_ids" {
+  description = "IDs de subnets donde se desplegará el cluster"
+  type        = list(string)
+}
+
+variable "kubernetes_version" {
+  description = "Versión de Kubernetes"
+  type        = string
+  default     = "1.31"
+}
+
+variable "node_instance_types" {
+  description = "Tipos de instancia para los nodos"
+  type        = list(string)
+  default     = ["t3.medium"]
+}
+
+variable "node_desired_size" {
+  description = "Número deseado de nodos"
+  type        = number
+  default     = 2
+}
+
+variable "node_min_size" {
+  description = "Número mínimo de nodos"
+  type        = number
+  default     = 1
+}
+
+variable "node_max_size" {
+  description = "Número máximo de nodos"
+  type        = number
+  default     = 4
+}
+EOF
+
+cat > "$TF_BACKEND/modules/eks/outputs.tf" << 'EOF'
+output "cluster_name" {
+  description = "Nombre del cluster EKS"
+  value       = aws_eks_cluster.main.name
+}
+
+output "cluster_endpoint" {
+  description = "Endpoint del API server de Kubernetes"
+  value       = aws_eks_cluster.main.endpoint
+}
+
+output "cluster_arn" {
+  description = "ARN del cluster EKS"
+  value       = aws_eks_cluster.main.arn
+}
+
+output "cluster_ca_certificate" {
+  description = "Certificado CA del cluster (base64)"
+  value       = aws_eks_cluster.main.certificate_authority[0].data
+  sensitive   = true
+}
+
+output "cluster_oidc_issuer_url" {
+  description = "URL del OIDC issuer (para IRSA)"
+  value       = aws_eks_cluster.main.identity[0].oidc[0].issuer
+}
+
+output "node_group_arn" {
+  description = "ARN del node group"
+  value       = aws_eks_node_group.main.arn
+}
+EOF
+
+log_ok "Módulo EKS listo."
+
+# ===========================================================================
+# BACKEND — módulo RDS
+# ===========================================================================
+
+log "Escribiendo módulo RDS..."
+
+cat > "$TF_BACKEND/modules/rds/main.tf" << 'EOF'
+resource "aws_db_subnet_group" "main" {
+  name        = "${var.project_name}-${var.environment}-rds"
+  description = "Subnet group para ${var.project_name} ${var.environment}"
+  subnet_ids  = var.subnet_ids
+
+  tags = {
+    Environment = var.environment
+    Project     = var.project_name
+  }
+}
+
+resource "aws_db_instance" "main" {
+  identifier        = "${var.project_name}-${var.environment}"
+  engine            = "postgres"
+  engine_version    = var.engine_version
+  instance_class    = var.instance_class
+  allocated_storage = var.allocated_storage
+  storage_encrypted = var.environment != "dev"
+
+  db_name  = var.db_name
+  username = var.db_username
+  password = var.db_password
+
+  db_subnet_group_name   = aws_db_subnet_group.main.name
+  vpc_security_group_ids = var.vpc_security_group_ids
+
+  multi_az            = var.multi_az
+  deletion_protection = var.deletion_protection
+  skip_final_snapshot = var.environment == "dev"
+
+  backup_retention_period = var.environment == "dev" ? 0 : 7
+  backup_window           = "03:00-04:00"
+  maintenance_window      = "Mon:04:00-Mon:05:00"
+
+  tags = {
+    Environment = var.environment
+    Project     = var.project_name
+  }
+}
+EOF
+
+cat > "$TF_BACKEND/modules/rds/variables.tf" << 'EOF'
+variable "project_name" {
+  description = "Prefijo del proyecto"
+  type        = string
+}
+
+variable "environment" {
+  description = "Nombre del ambiente (dev/staging/prod)"
+  type        = string
+}
+
+variable "subnet_ids" {
+  description = "IDs de subnets para el DB subnet group"
+  type        = list(string)
+}
+
+variable "vpc_security_group_ids" {
+  description = "IDs de security groups con acceso a RDS"
+  type        = list(string)
+}
+
+variable "db_name" {
+  description = "Nombre de la base de datos inicial"
+  type        = string
+}
+
+variable "db_username" {
+  description = "Usuario administrador de la base de datos"
+  type        = string
+}
+
+variable "db_password" {
+  description = "Contraseña del usuario administrador"
+  type        = string
+  sensitive   = true
+}
+
+variable "engine_version" {
+  description = "Versión del motor PostgreSQL"
+  type        = string
+  default     = "16.3"
+}
+
+variable "instance_class" {
+  description = "Tipo de instancia RDS"
+  type        = string
+  default     = "db.t3.micro"
+}
+
+variable "allocated_storage" {
+  description = "Almacenamiento asignado en GB"
+  type        = number
+  default     = 20
+}
+
+variable "multi_az" {
+  description = "Habilitar despliegue Multi-AZ"
+  type        = bool
+  default     = false
+}
+
+variable "deletion_protection" {
+  description = "Proteger la instancia contra eliminación accidental"
+  type        = bool
+  default     = false
+}
+EOF
+
+cat > "$TF_BACKEND/modules/rds/outputs.tf" << 'EOF'
+output "endpoint" {
+  description = "Endpoint de conexión a RDS"
+  value       = aws_db_instance.main.endpoint
+}
+
+output "port" {
+  description = "Puerto de conexión a RDS"
+  value       = aws_db_instance.main.port
+}
+
+output "db_name" {
+  description = "Nombre de la base de datos"
+  value       = aws_db_instance.main.db_name
+}
+
+output "identifier" {
+  description = "Identificador de la instancia RDS"
+  value       = aws_db_instance.main.identifier
+}
+
+output "arn" {
+  description = "ARN de la instancia RDS"
+  value       = aws_db_instance.main.arn
+}
+EOF
+
+log_ok "Módulo RDS listo."
 
 # ===========================================================================
 # BACKEND — módulo IAM
