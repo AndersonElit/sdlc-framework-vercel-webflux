@@ -95,6 +95,63 @@ def get_env_example_content(project_name: str, database: str, messaging_system: 
     return "\n".join(lines) + "\n"
 
 
+def get_dockerfile_content(database: str, messaging_system: str) -> str:
+    db_module = "mongo" if database.lower() == "mongo" else "postgres"
+
+    copy_poms = [
+        "COPY domain/model/pom.xml domain/model/",
+        "COPY application/use-cases/pom.xml application/use-cases/",
+        f"COPY infrastructure/driven-adapters/{db_module}/pom.xml infrastructure/driven-adapters/{db_module}/",
+        "COPY infrastructure/entry-points/rest-api/pom.xml infrastructure/entry-points/rest-api/",
+        "COPY infrastructure/entry-points/app/pom.xml infrastructure/entry-points/app/",
+    ]
+    if messaging_system.lower() == "rabbit-producer":
+        copy_poms.append(
+            "COPY infrastructure/driven-adapters/rabbit-producer/pom.xml infrastructure/driven-adapters/rabbit-producer/"
+        )
+    elif messaging_system.lower() == "rabbit-consumer":
+        copy_poms.append(
+            "COPY infrastructure/entry-points/rabbit-consumer/pom.xml infrastructure/entry-points/rabbit-consumer/"
+        )
+
+    copy_poms_str = "\n".join(copy_poms)
+
+    return f"""\
+# ── Build stage ────────────────────────────────────────────────────────
+FROM maven:3.9-eclipse-temurin-21-alpine AS builder
+WORKDIR /app
+
+# Copy pom files first to leverage Docker layer caching for dependencies
+COPY pom.xml .
+{copy_poms_str}
+RUN mvn dependency:go-offline -B --no-transfer-progress
+
+# Copy source and build
+COPY . .
+RUN mvn clean package -DskipTests --no-transfer-progress
+
+# ── Runtime stage ───────────────────────────────────────────────────────
+FROM eclipse-temurin:21-jre-alpine
+WORKDIR /app
+COPY --from=builder /app/infrastructure/entry-points/app/target/*.jar app.jar
+EXPOSE 8080
+ENTRYPOINT ["java", "-jar", "app.jar"]
+"""
+
+
+def get_dockerignore_content() -> str:
+    return """\
+target/
+.git/
+.idea/
+*.iml
+.env
+**/*.class
+**/*.log
+"""
+
+
+
 def get_root_pom(project_name: str, database: str, messaging_system: str) -> str:
     safe_name = project_name.replace("-", "")
     db_module = "mongo" if database.lower() == "mongo" else "postgres"
@@ -573,6 +630,10 @@ bin/
     (root / "pom.xml").write_text(get_root_pom(project_name, database, messaging_system))
     logger.debug("pom.xml raíz creado")
 
+    (root / "Dockerfile").write_text(get_dockerfile_content(database, messaging_system))
+    logger.debug("Dockerfile creado")
+    (root / ".dockerignore").write_text(get_dockerignore_content())
+    logger.debug(".dockerignore creado")
     logger.info("Proyecto creado exitosamente en: %s", root.resolve())
     _print_run_instructions(project_name, root, messaging_system)
 
@@ -586,6 +647,8 @@ def _print_run_instructions(project_name: str, root: Path, messaging_system: str
 ╔══════════════════════════════════════════════════════════════════════╗
 ║              Proyecto listo: {project_name:<40}║
 ╚══════════════════════════════════════════════════════════════════════╝
+
+ ── Ejecución local (Maven) ────────────────────────────────────────────
 
  1. Entra al directorio del proyecto:
     cd {root}
@@ -602,6 +665,24 @@ def _print_run_instructions(project_name: str, root: Path, messaging_system: str
 
  5. Verifica que está corriendo:
     curl http://localhost:8080/hello
+
+ ── Ejecución con Docker ───────────────────────────────────────────────
+
+    # Construir la imagen
+    docker build -t {project_name}:latest .
+
+    # Ejecutar pasando variables de entorno desde .env
+    docker run -d --name {project_name} \\
+      --env-file .env \\
+      -p 8080:8080 \\
+      {project_name}:latest
+
+ Verificar contenedor:
+    docker logs -f {project_name}
+    curl http://localhost:8080/hello
+
+ Detener y eliminar:
+    docker rm -f {project_name}
 
 ────────────────────────────────────────────────────────────────────────
 """
