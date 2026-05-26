@@ -119,6 +119,7 @@ def get_next_config() -> str:
 import type { NextConfig } from 'next'
 
 const nextConfig: NextConfig = {
+  output: 'standalone',
   reactStrictMode: true,
   images: {
     remotePatterns: [
@@ -1852,6 +1853,75 @@ export interface NotificationSettings {
 """
 
 
+# ─── DOCKER ───────────────────────────────────────────────────────────────────
+
+def get_dockerfile() -> str:
+    return """\
+# Stage 1: Install dependencies
+FROM node:20-alpine AS deps
+RUN apk add --no-cache libc6-compat
+WORKDIR /app
+COPY package.json package-lock.json* ./
+RUN npm ci
+
+# Stage 2: Build the application
+FROM node:20-alpine AS builder
+WORKDIR /app
+COPY --from=deps /app/node_modules ./node_modules
+COPY . .
+RUN npm run build
+
+# Stage 3: Production runtime (minimal image)
+FROM node:20-alpine AS runner
+WORKDIR /app
+
+ENV NODE_ENV=production
+
+RUN addgroup --system --gid 1001 nodejs && \\
+    adduser  --system --uid 1001 nextjs
+
+COPY --from=builder /app/public ./public
+COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
+COPY --from=builder --chown=nextjs:nodejs /app/.next/static   ./.next/static
+
+USER nextjs
+
+EXPOSE 3000
+ENV PORT=3000
+ENV HOSTNAME="0.0.0.0"
+
+CMD ["node", "server.js"]
+"""
+
+
+def get_dockerignore() -> str:
+    return """\
+node_modules
+.next
+out
+coverage
+
+.env
+.env*.local
+
+.git
+.gitignore
+.husky
+
+Dockerfile
+.dockerignore
+docker-compose*.yml
+
+*.test.ts
+*.test.tsx
+*.spec.ts
+*.spec.tsx
+
+README.md
+"""
+
+
+
 # ─── TESTS ────────────────────────────────────────────────────────────────────
 
 def get_vitest_config() -> str:
@@ -1937,6 +2007,8 @@ def scaffold(project_name: str) -> None:
         "components.json": get_components_json(),
         "vitest.config.ts": get_vitest_config(),
         ".husky/pre-commit": get_husky_pre_commit(),
+        "Dockerfile": get_dockerfile(),
+        ".dockerignore": get_dockerignore(),
 
         # Middleware (Next.js root)
         "src/middleware.ts": get_middleware(),
@@ -2077,6 +2149,33 @@ def _print_run_instructions(project_name: str, root: Path) -> None:
     npm run format         → Formatear con Prettier
     npm test               → Ejecutar tests unitarios con Vitest
     npm run build          → Build de producción
+────────────────────────────────────────────────────────────────────────
+ Docker — Dockerizar la aplicación:
+
+    # Construir la imagen
+    docker build -t {project_name}:latest .
+
+    # Ejecutar el contenedor
+    docker run -d \\
+      --name {project_name} \\
+      -p 3000:3000 \\
+      -e NEXT_PUBLIC_APP_URL=http://localhost:3000 \\
+      -e NEXT_PUBLIC_API_URL=http://your-api-url/api/v1 \\
+      {project_name}:latest
+
+    # Ver logs
+    docker logs -f {project_name}
+
+    # Detener el contenedor
+    docker stop {project_name} && docker rm {project_name}
+
+  Notas importantes:
+    · Las variables NEXT_PUBLIC_* se inyectan en build-time por Next.js.
+      Si cambian sus valores, debes reconstruir la imagen.
+    · Las variables sin NEXT_PUBLIC_ (secretos de servidor) puedes
+      pasarlas con -e o con un archivo: --env-file .env.production
+    · El Dockerfile usa 'output: standalone' (next.config.ts) para
+      generar un bundle mínimo sin node_modules completos en producción.
 ────────────────────────────────────────────────────────────────────────
  Estructura generada:
 

@@ -29,7 +29,7 @@ Both scripts are in `.claude/templates/` and write generated project files to th
 ### Spring Boot Hexagonal Microservice
 
 ```bash
-python .claude/templates/maven_hexagonal_scaffold.py \
+python3 .claude/templates/maven_hexagonal_scaffold.py \
   -n <service-name> \
   -d <postgres|mongo> \
   -m <none|rabbit-producer|rabbit-consumer> \
@@ -49,7 +49,7 @@ Stack: Spring Boot 3.4.1, Java 21, Project Reactor, Lombok, spring-dotenv, Docke
 ### Next.js Feature-Based Frontend
 
 ```bash
-python .claude/templates/nextjs_feature_scaffold.py \
+python3 .claude/templates/nextjs_feature_scaffold.py \
   -n <project-name> \
   -v   # verbose/debug logging
 ```
