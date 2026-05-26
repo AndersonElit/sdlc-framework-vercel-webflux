@@ -57,42 +57,115 @@ docker run -d \
 log_ok "Floci listo."
 
 # ---------------------------------------------------------------------------
-# Estructura base de Terraform
+# Estructura base de Terraform (frontend / backend desacoplados)
 # ---------------------------------------------------------------------------
 TERRAFORM_ROOT="${PROJECT_ROOT:-$(pwd)}/terraform"
+TF_FRONTEND="$TERRAFORM_ROOT/frontend"
+TF_BACKEND="$TERRAFORM_ROOT/backend"
 
 log "Creando estructura Terraform en $TERRAFORM_ROOT..."
 
 mkdir -p \
-  "$TERRAFORM_ROOT/modules/vpc" \
-  "$TERRAFORM_ROOT/modules/eks" \
-  "$TERRAFORM_ROOT/modules/rds" \
-  "$TERRAFORM_ROOT/environments/dev" \
-  "$TERRAFORM_ROOT/environments/staging" \
-  "$TERRAFORM_ROOT/environments/prod" \
-  "$TERRAFORM_ROOT/shared"
+  "$TF_FRONTEND/modules/vercel-project" \
+  "$TF_FRONTEND/environments/dev" \
+  "$TF_FRONTEND/environments/staging" \
+  "$TF_FRONTEND/environments/prod" \
+  "$TF_BACKEND/modules/vpc" \
+  "$TF_BACKEND/modules/eks" \
+  "$TF_BACKEND/modules/rds" \
+  "$TF_BACKEND/environments/dev" \
+  "$TF_BACKEND/environments/staging" \
+  "$TF_BACKEND/environments/prod"
+
+# ===========================================================================
+# FRONTEND — provider Vercel
+# ===========================================================================
 
 # ---------------------------------------------------------------------------
-# shared/ — versiones y variables comunes a todos los entornos
+# frontend/modules/vercel-project/
 # ---------------------------------------------------------------------------
-cat > "$TERRAFORM_ROOT/shared/versions.tf" << 'EOF'
+cat > "$TF_FRONTEND/modules/vercel-project/main.tf" << 'EOF'
+resource "vercel_project" "this" {
+  name      = var.project_name
+  framework = var.framework
+
+  git_repository {
+    type = var.git_type
+    repo = var.git_repo
+  }
+}
+
+resource "vercel_project_environment_variable" "api_url" {
+  project_id = vercel_project.this.id
+  key        = "NEXT_PUBLIC_API_URL"
+  value      = var.api_url
+  target     = ["production", "preview", "development"]
+}
+EOF
+
+cat > "$TF_FRONTEND/modules/vercel-project/variables.tf" << 'EOF'
+variable "project_name" {
+  description = "Nombre del proyecto en Vercel"
+  type        = string
+}
+
+variable "framework" {
+  description = "Framework del proyecto (nextjs, create-react-app, etc.)"
+  type        = string
+  default     = "nextjs"
+}
+
+variable "git_type" {
+  description = "Proveedor Git: github | gitlab | bitbucket"
+  type        = string
+  default     = "github"
+}
+
+variable "git_repo" {
+  description = "Repositorio Git (owner/repo)"
+  type        = string
+}
+
+variable "api_url" {
+  description = "URL del backend expuesta al frontend"
+  type        = string
+}
+EOF
+
+cat > "$TF_FRONTEND/modules/vercel-project/outputs.tf" << 'EOF'
+output "project_id" {
+  description = "ID del proyecto Vercel"
+  value       = vercel_project.this.id
+}
+
+output "deployment_url" {
+  description = "URL de despliegue del proyecto"
+  value       = "https://${vercel_project.this.name}.vercel.app"
+}
+EOF
+
+# ---------------------------------------------------------------------------
+# frontend/environments/dev/
+# ---------------------------------------------------------------------------
+cat > "$TF_FRONTEND/environments/dev/providers.tf" << 'EOF'
 terraform {
   required_version = ">= 1.6.0"
 
   required_providers {
-    aws = {
-      source  = "hashicorp/aws"
-      version = "~> 5.0"
-    }
     vercel = {
       source  = "vercel/vercel"
       version = "~> 2.0"
     }
   }
 }
+
+provider "vercel" {
+  api_token = var.vercel_api_token
+  team      = var.vercel_team
+}
 EOF
 
-cat > "$TERRAFORM_ROOT/shared/variables.tf" << 'EOF'
+cat > "$TF_FRONTEND/environments/dev/variables.tf" << 'EOF'
 variable "vercel_api_token" {
   description = "Token de API de Vercel"
   type        = string
@@ -100,25 +173,109 @@ variable "vercel_api_token" {
 }
 
 variable "vercel_team" {
-  description = "Slug del equipo en Vercel (dejar vacío para cuenta personal)"
+  description = "Slug del equipo en Vercel (vacío = cuenta personal)"
   type        = string
   default     = ""
 }
 
-variable "aws_region" {
-  description = "Región AWS"
+variable "git_repo" {
+  description = "Repositorio Git (owner/repo)"
   type        = string
-  default     = "us-east-1"
+}
+
+variable "api_url" {
+  description = "URL del backend (dev usa Floci en localhost)"
+  type        = string
+  default     = "http://localhost:8080"
 }
 EOF
 
-touch "$TERRAFORM_ROOT/shared/main.tf"
-touch "$TERRAFORM_ROOT/shared/outputs.tf"
+cat > "$TF_FRONTEND/environments/dev/main.tf" << 'EOF'
+module "frontend" {
+  source       = "../../modules/vercel-project"
+  project_name = "my-app-dev"
+  git_repo     = var.git_repo
+  api_url      = var.api_url
+}
+EOF
+
+touch "$TF_FRONTEND/environments/dev/outputs.tf"
 
 # ---------------------------------------------------------------------------
-# environments/dev/ — Floci (emulador AWS local) + Vercel preview
+# frontend/environments/staging/ y prod/ — misma estructura, distinto api_url
 # ---------------------------------------------------------------------------
-cat > "$TERRAFORM_ROOT/environments/dev/providers.tf" << 'EOF'
+for env in staging prod; do
+cat > "$TF_FRONTEND/environments/$env/providers.tf" << EOF
+terraform {
+  required_version = ">= 1.6.0"
+
+  required_providers {
+    vercel = {
+      source  = "vercel/vercel"
+      version = "~> 2.0"
+    }
+  }
+}
+
+provider "vercel" {
+  api_token = var.vercel_api_token
+  team      = var.vercel_team
+}
+EOF
+
+cat > "$TF_FRONTEND/environments/$env/variables.tf" << 'EOF'
+variable "vercel_api_token" {
+  description = "Token de API de Vercel"
+  type        = string
+  sensitive   = true
+}
+
+variable "vercel_team" {
+  description = "Slug del equipo en Vercel (vacío = cuenta personal)"
+  type        = string
+  default     = ""
+}
+
+variable "git_repo" {
+  description = "Repositorio Git (owner/repo)"
+  type        = string
+}
+
+variable "api_url" {
+  description = "URL del backend"
+  type        = string
+}
+EOF
+
+cat > "$TF_FRONTEND/environments/$env/main.tf" << EOF
+module "frontend" {
+  source       = "../../modules/vercel-project"
+  project_name = "my-app-${env}"
+  git_repo     = var.git_repo
+  api_url      = var.api_url
+}
+EOF
+
+  touch "$TF_FRONTEND/environments/$env/outputs.tf"
+done
+
+# ===========================================================================
+# BACKEND — provider AWS / Floci
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# backend/modules/ — placeholders (heredan provider del entorno)
+# ---------------------------------------------------------------------------
+for mod in vpc eks rds; do
+  touch "$TF_BACKEND/modules/$mod/main.tf"
+  touch "$TF_BACKEND/modules/$mod/variables.tf"
+  touch "$TF_BACKEND/modules/$mod/outputs.tf"
+done
+
+# ---------------------------------------------------------------------------
+# backend/environments/dev/ — Floci (emulador AWS local, puerto 4566)
+# ---------------------------------------------------------------------------
+cat > "$TF_BACKEND/environments/dev/providers.tf" << 'EOF'
 terraform {
   required_version = ">= 1.6.0"
 
@@ -126,10 +283,6 @@ terraform {
     aws = {
       source  = "hashicorp/aws"
       version = "~> 5.0"
-    }
-    vercel = {
-      source  = "vercel/vercel"
-      version = "~> 2.0"
     }
   }
 }
@@ -152,35 +305,24 @@ provider "aws" {
     sts = "http://localhost:4566"
   }
 }
+EOF
 
-# Vercel — despliegue de preview para dev
-provider "vercel" {
-  api_token = var.vercel_api_token
-  team      = var.vercel_team
+cat > "$TF_BACKEND/environments/dev/variables.tf" << 'EOF'
+variable "aws_region" {
+  description = "Región AWS"
+  type        = string
+  default     = "us-east-1"
 }
 EOF
 
-cat > "$TERRAFORM_ROOT/environments/dev/variables.tf" << 'EOF'
-variable "vercel_api_token" {
-  description = "Token de API de Vercel"
-  type        = string
-  sensitive   = true
-}
-
-variable "vercel_team" {
-  description = "Slug del equipo en Vercel"
-  type        = string
-  default     = ""
-}
-EOF
-
-touch "$TERRAFORM_ROOT/environments/dev/main.tf"
-touch "$TERRAFORM_ROOT/environments/dev/outputs.tf"
+touch "$TF_BACKEND/environments/dev/main.tf"
+touch "$TF_BACKEND/environments/dev/outputs.tf"
 
 # ---------------------------------------------------------------------------
-# environments/staging/ — AWS real + Vercel preview
+# backend/environments/staging/ y prod/ — AWS real
 # ---------------------------------------------------------------------------
-cat > "$TERRAFORM_ROOT/environments/staging/providers.tf" << 'EOF'
+for env in staging prod; do
+cat > "$TF_BACKEND/environments/$env/providers.tf" << 'EOF'
 terraform {
   required_version = ">= 1.6.0"
 
@@ -189,107 +331,24 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 5.0"
     }
-    vercel = {
-      source  = "vercel/vercel"
-      version = "~> 2.0"
-    }
   }
 }
 
 provider "aws" {
   region = var.aws_region
 }
-
-# Vercel — despliegue de preview para staging
-provider "vercel" {
-  api_token = var.vercel_api_token
-  team      = var.vercel_team
-}
 EOF
 
-cat > "$TERRAFORM_ROOT/environments/staging/variables.tf" << 'EOF'
+cat > "$TF_BACKEND/environments/$env/variables.tf" << 'EOF'
 variable "aws_region" {
   description = "Región AWS"
   type        = string
   default     = "us-east-1"
 }
-
-variable "vercel_api_token" {
-  description = "Token de API de Vercel"
-  type        = string
-  sensitive   = true
-}
-
-variable "vercel_team" {
-  description = "Slug del equipo en Vercel"
-  type        = string
-  default     = ""
-}
 EOF
 
-touch "$TERRAFORM_ROOT/environments/staging/main.tf"
-touch "$TERRAFORM_ROOT/environments/staging/outputs.tf"
-
-# ---------------------------------------------------------------------------
-# environments/prod/ — AWS real + Vercel producción
-# ---------------------------------------------------------------------------
-cat > "$TERRAFORM_ROOT/environments/prod/providers.tf" << 'EOF'
-terraform {
-  required_version = ">= 1.6.0"
-
-  required_providers {
-    aws = {
-      source  = "hashicorp/aws"
-      version = "~> 5.0"
-    }
-    vercel = {
-      source  = "vercel/vercel"
-      version = "~> 2.0"
-    }
-  }
-}
-
-provider "aws" {
-  region = var.aws_region
-}
-
-# Vercel — despliegue de producción
-provider "vercel" {
-  api_token = var.vercel_api_token
-  team      = var.vercel_team
-}
-EOF
-
-cat > "$TERRAFORM_ROOT/environments/prod/variables.tf" << 'EOF'
-variable "aws_region" {
-  description = "Región AWS"
-  type        = string
-  default     = "us-east-1"
-}
-
-variable "vercel_api_token" {
-  description = "Token de API de Vercel"
-  type        = string
-  sensitive   = true
-}
-
-variable "vercel_team" {
-  description = "Slug del equipo en Vercel"
-  type        = string
-  default     = ""
-}
-EOF
-
-touch "$TERRAFORM_ROOT/environments/prod/main.tf"
-touch "$TERRAFORM_ROOT/environments/prod/outputs.tf"
-
-# ---------------------------------------------------------------------------
-# modules/ — placeholders para recursos (sin bloque provider, lo heredan)
-# ---------------------------------------------------------------------------
-for mod in vpc eks rds; do
-  touch "$TERRAFORM_ROOT/modules/$mod/main.tf"
-  touch "$TERRAFORM_ROOT/modules/$mod/variables.tf"
-  touch "$TERRAFORM_ROOT/modules/$mod/outputs.tf"
+  touch "$TF_BACKEND/environments/$env/main.tf"
+  touch "$TF_BACKEND/environments/$env/outputs.tf"
 done
 
 log_ok "Estructura Terraform creada en $TERRAFORM_ROOT."
