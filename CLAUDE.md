@@ -24,15 +24,37 @@ The skills must be invoked in order. Each skill auto-discovers the previous phas
 /technical-design-sdd → docs/design/SDD-[name]-system.md
                         docs/design/SDD-[name]-design.md
                         docs/design/SDD-[name]-infrastructure.md
+                        docs/design/diagrams/SDD-[name]-c4-context.mmd
+                        docs/design/diagrams/SDD-[name]-c4-container.mmd
+                        docs/design/api/SDD-[name]-openapi.yaml
+                        docs/design/database/SDD-[name]-schema.sql   ← relational
+                        docs/design/database/SDD-[name]-collections.js ← MongoDB
 ```
 
 **Input templates:**
 - `/plan-pid` — fill `.claude/formatos/input-template.md` and pass it as the argument.
-- `/strategic-design-sdd` — optionally provide an ADC (Architectural Decision Context) from `.claude/formatos/input-adc-template.md` to constrain stack, infra model, quality attributes, and team capacity. Without it the skill infers defaults from the SRS.
+- `/strategic-design-sdd` — optionally provide an ADC (Architectural Decision Context) by filling `.claude/formatos/input-adc-template.md`, saving it as `docs/planning/ADC-[name].md`, and passing it as a second argument. Without it the skill infers defaults from the SRS.
+
+```
+/strategic-design-sdd                                                         # auto-discovers SRS, no ADC
+/strategic-design-sdd docs/requirements/SRS-[name].md                        # explicit SRS, no ADC
+/strategic-design-sdd docs/requirements/SRS-[name].md docs/planning/ADC-[name].md  # SRS + ADC
+```
 
 **Skill chain dependency:** Skills do not skip phases. `/requirements-srs` requires a PID, `/strategic-design-sdd` requires an SRS, `/technical-design-sdd` requires all three Strategic Design documents.
 
-**Skill output constraints:** No UML diagrams, no code blocks inside documents. Functional requirement IDs use `RF-001` format; non-functional use `RNF-001`. Architecture Decision Records use `ADR-001` format.
+**Skill output constraints:** No UML diagrams, no code blocks inside documents. ID formats used across documents:
+
+| ID Format | Used For |
+|-----------|----------|
+| `RF-001`  | Functional requirements (SRS) |
+| `RNF-001` | Non-functional requirements (SRS) |
+| `RN-001`  | Business rules (SRS) |
+| `CU-001`  | Use cases (SRS) |
+| `DE-001`  | Domain events (Strategic Design — domain) |
+| `TH-001`  | STRIDE threats (Strategic Design — security) |
+| `DS-001`  | Strategic decisions (Strategic Design — architecture) |
+| `ADR-001` | Architecture Decision Records (Technical Design — infrastructure) |
 
 ## Scaffolding Scripts
 
@@ -82,7 +104,7 @@ npm run test:e2e     # Playwright E2E tests
 bash .claude/scripts/base-infrastructure-builder.sh
 ```
 
-Generates a full Terraform directory tree for the project. Requires Docker and Terraform. Creates multi-environment (`dev`/`staging`/`prod`) infrastructure modules for:
+Generates a full Terraform directory tree for the project. Requires Docker and Terraform, and a pre-existing Docker network named `floci-net` (`docker network create floci-net`). **Warning:** the script stops and removes ALL currently running Docker containers and images on the machine before starting. Creates multi-environment (`dev`/`staging`/`prod`) infrastructure modules for:
 
 - **Frontend**: Vercel project and deployments (via `vercel` Terraform provider).
 - **Backend**: AWS EKS cluster, RDS (PostgreSQL), IAM roles, Cognito user pool, API Gateway, Secrets Manager, ECR repositories.
