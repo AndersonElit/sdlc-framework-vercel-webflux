@@ -1898,7 +1898,7 @@ def get_jenkinsfile() -> str:
     """Jenkinsfile del frontend: calidad + build + deploy a Vercel vía CLI + E2E.
 
     Jenkins es el único disparador de despliegues; la Git integration de Vercel
-    se desactiva (ver vercel.json / dashboard). Ref: PLAN-CICD-Jenkins.md §5.
+    se desactiva (ver vercel.json / dashboard).
     """
     return """\
 @Library('jenkins-shared-library@main') _
@@ -1906,11 +1906,11 @@ def get_jenkinsfile() -> str:
 // ───────────────────────────────────────────────────────────────────────────
 // Jenkinsfile (frontend Next.js) — deploy a Vercel vía CLI controlado por Jenkins.
 // La Git integration de Vercel está desactivada: el único disparador de
-// despliegues es este pipeline. Ref: PLAN-CICD-Jenkins.md §5.
+// despliegues es este pipeline.
 // ───────────────────────────────────────────────────────────────────────────
 
 pipeline {
-    agent { label 'agent-node' }   // Node 20 + npm + Playwright (§2)
+    agent { label 'agent-node' }   // Node 20 + npm + Playwright
 
     options {
         timestamps()
@@ -1928,7 +1928,7 @@ pipeline {
     }
 
     environment {
-        // Tokens de servicio desde el Jenkins Credentials Store (rotables, no personales). §5
+        // Tokens de servicio desde el Jenkins Credentials Store (rotables, no personales).
         VERCEL_TOKEN      = credentials('vercel-token')
         VERCEL_ORG_ID     = credentials('vercel-org-id')
         VERCEL_PROJECT_ID = credentials('vercel-project-id')
@@ -1984,7 +1984,7 @@ pipeline {
             }
         }
 
-        // 10 — Promote/Alias a producción tras E2E y aprobación manual (§5/§6).
+        // 10 — Promote/Alias a producción tras E2E y aprobación manual.
         stage('Promote / Alias (prod)') {
             when { expression { params.DEPLOY_ENV == 'prod' } }
             steps {
@@ -2011,7 +2011,7 @@ def get_vercel_json() -> str:
     """vercel.json con la Git integration DESACTIVADA.
 
     Garantiza que el único disparador de despliegues sea Jenkins (deploy vía
-    Vercel CLI). Ref: PLAN-CICD-Jenkins.md §5 y criterio de aceptación §13.
+    Vercel CLI).
     """
     return """\
 {

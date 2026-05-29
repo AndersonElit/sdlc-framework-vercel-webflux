@@ -5,8 +5,6 @@
 #   - maven_hexagonal_scaffold.py  (backend)
 #   - nextjs_feature_scaffold.py   (frontend, reutiliza notify)
 #
-# Ref: docs/cicd/PLAN-CICD-Jenkins.md §3.1 y §4.
-#
 # Uso:
 #   bash .claude/scripts/jenkins-shared-library-builder.sh [-o DIR] [--no-git]
 #
@@ -48,9 +46,9 @@ mkdir -p "$OUT_DIR/vars" "$OUT_DIR/src/org/flexicredit" "$OUT_DIR/resources"
 # vars/ — pasos reutilizables (cada archivo define call(...))
 # ---------------------------------------------------------------------------
 
-# computeImageTag — <version-maven>-<git-sha-corto> (§3.3)
+# computeImageTag — <version-maven>-<git-sha-corto>
 cat > "$OUT_DIR/vars/computeImageTag.groovy" <<'EOF'
-// Calcula un tag inmutable: <version-maven>-<git-sha-corto>. Ref: §3.3.
+// Calcula un tag inmutable: <version-maven>-<git-sha-corto>.
 def call() {
     def version = sh(
         script: 'mvn -q -DforceStdout help:evaluate -Dexpression=project.version',
@@ -61,19 +59,19 @@ def call() {
 }
 EOF
 
-# buildBackendService — build + unit tests Maven multimódulo (§4 stage 2)
+# buildBackendService — build + unit tests Maven multimódulo
 cat > "$OUT_DIR/vars/buildBackendService.groovy" <<'EOF'
 // Build + tests unitarios respetando la regla de dependencias hexagonal
-// (domain -> application -> infrastructure -> entrypoints). Ref: §4 stage 2.
+// (domain -> application -> infrastructure -> entrypoints).
 def call(Map args = [:]) {
     sh 'mvn -B --no-transfer-progress clean verify -DskipITs'
     junit testResults: '**/target/surefire-reports/*.xml', allowEmptyResults: true
 }
 EOF
 
-# runIntegrationTests — Testcontainers (§4 stage 3)
+# runIntegrationTests — Testcontainers
 cat > "$OUT_DIR/vars/runIntegrationTests.groovy" <<'EOF'
-// Tests de integración (R2DBC/Mongo/Kafka) con Testcontainers. Ref: §4 stage 3.
+// Tests de integración (R2DBC/Mongo/Kafka) con Testcontainers.
 def call(Map args = [:]) {
     def dbType = args.dbType ?: 'postgres'
     sh "mvn -B --no-transfer-progress failsafe:integration-test failsafe:verify -Ddb.type=${dbType}"
@@ -81,9 +79,9 @@ def call(Map args = [:]) {
 }
 EOF
 
-# runQualityGates — SonarQube + quality gate (§4 stage 4)
+# runQualityGates — SonarQube + quality gate
 cat > "$OUT_DIR/vars/runQualityGates.groovy" <<'EOF'
-// Análisis estático + espera del quality gate. Falla si el gate = ERROR. Ref: §4 stage 4.
+// Análisis estático + espera del quality gate. Falla si el gate = ERROR.
 def call(Map args = [:]) {
     def sonarEnv = args.sonarEnv ?: 'sonarqube'
     withSonarQubeEnv(sonarEnv) {
@@ -98,21 +96,21 @@ def call(Map args = [:]) {
 }
 EOF
 
-# runSecurityScans — OWASP Dependency Check + escaneo de secretos (§4 stage 5)
+# runSecurityScans — OWASP Dependency Check + escaneo de secretos
 cat > "$OUT_DIR/vars/runSecurityScans.groovy" <<'EOF'
-// OWASP Dependency Check (CVEs) + escaneo de secretos. Falla ante hallazgo crítico. Ref: §4 stage 5.
+// OWASP Dependency Check (CVEs) + escaneo de secretos. Falla ante hallazgo crítico.
 def call(Map args = [:]) {
     def failOnCvss = args.failOnCvss ?: '9'
     sh "mvn -B --no-transfer-progress org.owasp:dependency-check-maven:check -DfailBuildOnCVSS=${failOnCvss}"
-    // Escaneo de secretos (gitleaks). Sustituible por trufflehog según §11.
+    // Escaneo de secretos (gitleaks). Sustituible por trufflehog.
     sh 'gitleaks detect --source . --no-banner --redact --exit-code 1'
 }
 EOF
 
-# buildAndPushImage — Kaniko build + push a ECR (§4 stage 6)
+# buildAndPushImage — Kaniko build + push a ECR
 cat > "$OUT_DIR/vars/buildAndPushImage.groovy" <<'EOF'
 // Construye la imagen multi-stage con Kaniko y la publica en ECR.
-// Producción usa solo el tag inmutable; otros ambientes añaden 'latest'. Ref: §3.3 / §4 stage 6.
+// Producción usa solo el tag inmutable; otros ambientes añaden 'latest'.
 def call(Map args = [:]) {
     def ecrRepo  = args.ecrRepo  ?: error('buildAndPushImage: falta ecrRepo')
     def imageTag = args.imageTag ?: error('buildAndPushImage: falta imageTag')
@@ -134,9 +132,9 @@ def call(Map args = [:]) {
 }
 EOF
 
-# scanImage — Trivy (§4 stage 7)
+# scanImage — Trivy
 cat > "$OUT_DIR/vars/scanImage.groovy" <<'EOF'
-// Escaneo de la imagen publicada con Trivy. Falla ante CVE crítico. Ref: §4 stage 7.
+// Escaneo de la imagen publicada con Trivy. Falla ante CVE crítico.
 def call(Map args = [:]) {
     def ecrRepo  = args.ecrRepo  ?: error('scanImage: falta ecrRepo')
     def imageTag = args.imageTag ?: error('scanImage: falta imageTag')
@@ -146,9 +144,9 @@ def call(Map args = [:]) {
 }
 EOF
 
-# deployToEks — helm upgrade --install por ambiente (§4 stage 8)
+# deployToEks — helm upgrade --install por ambiente
 cat > "$OUT_DIR/vars/deployToEks.groovy" <<'EOF'
-// Despliegue a EKS con Helm usando los valores del ambiente. Ref: §4 stage 8 / §7.
+// Despliegue a EKS con Helm usando los valores del ambiente.
 def call(Map args = [:]) {
     def service   = args.service   ?: error('deployToEks: falta service')
     def namespace = args.namespace ?: error('deployToEks: falta namespace')
@@ -169,9 +167,9 @@ def call(Map args = [:]) {
 }
 EOF
 
-# runSmokeTests — verificación post-deploy (§4 stage 9)
+# runSmokeTests — verificación post-deploy
 cat > "$OUT_DIR/vars/runSmokeTests.groovy" <<'EOF'
-// Verifica readiness del servicio desplegado. Ref: §4 stage 9 / §7.
+// Verifica readiness del servicio desplegado.
 def call(Map args = [:]) {
     def service   = args.service   ?: error('runSmokeTests: falta service')
     def namespace = args.namespace ?: error('runSmokeTests: falta namespace')
@@ -186,9 +184,9 @@ def call(Map args = [:]) {
 }
 EOF
 
-# notify — notificaciones Slack/email (§4 stage 10 / §9). Reutilizado por frontend.
+# notify — notificaciones Slack/email. Reutilizado por frontend.
 cat > "$OUT_DIR/vars/notify.groovy" <<'EOF'
-// Notificación de resultado a Slack (con fallback a log). Ref: §4 stage 10 / §9.
+// Notificación de resultado a Slack (con fallback a log).
 def call(Map args = [:]) {
     def status  = args.status  ?: currentBuild.currentResult
     def service = args.service ?: env.JOB_NAME
@@ -207,7 +205,7 @@ EOF
 log_ok "Pasos vars/ generados (10 archivos)."
 
 # ---------------------------------------------------------------------------
-# src/ — clases auxiliares (§3.1)
+# src/ — clases auxiliares
 # ---------------------------------------------------------------------------
 cat > "$OUT_DIR/src/org/flexicredit/PipelineDefaults.groovy" <<'EOF'
 package org.flexicredit
@@ -216,7 +214,7 @@ package org.flexicredit
 class PipelineDefaults implements Serializable {
     static final String SLACK_CHANNEL   = '#cicd'
     static final String SONAR_ENV       = 'sonarqube'
-    static final String SECRETS_TOOL    = 'gitleaks'   // alternativa: trufflehog (§11)
+    static final String SECRETS_TOOL    = 'gitleaks'   // alternativa: trufflehog
     static final int    QG_TIMEOUT_MIN  = 10
     static final List<String> ENVIRONMENTS = ['dev', 'staging', 'prod']
 
@@ -234,7 +232,7 @@ log_ok "Clase auxiliar src/org/flexicredit/PipelineDefaults.groovy generada."
 # ---------------------------------------------------------------------------
 mkdir -p "$OUT_DIR/resources/org/flexicredit"
 cat > "$OUT_DIR/resources/org/flexicredit/podTemplate.yaml" <<'EOF'
-# Plantilla de referencia para los pod templates de los agentes efímeros (§2).
+# Plantilla de referencia para los pod templates de los agentes efímeros.
 # La configuración real del controller se versiona con JCasC; esto documenta
 # los contenedores que los pasos vars/ esperan (container('kaniko'), etc.).
 apiVersion: v1
@@ -269,7 +267,6 @@ cat > "$OUT_DIR/README.md" <<'EOF'
 
 Shared Library de Jenkins con los pasos reutilizables del CI/CD de FlexiCredit.
 Encapsula la lógica común para mantener los `Jenkinsfile` mínimos.
-Ref: `docs/cicd/PLAN-CICD-Jenkins.md` §3.1.
 
 ## Uso desde un Jenkinsfile
 
@@ -282,7 +279,7 @@ con el nombre `jenkins-shared-library`, apuntando a este repositorio (rama `main
 
 ## Pasos disponibles (`vars/`)
 
-| Step | Stage del pipeline (§4) |
+| Step | Stage del pipeline |
 |---|---|
 | `computeImageTag()` | Checkout — tag inmutable `<version>-<sha>` |
 | `buildBackendService()` | Build & Unit Tests |

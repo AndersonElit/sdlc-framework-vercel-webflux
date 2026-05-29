@@ -144,7 +144,7 @@ def get_jenkinsfile_content(project_name: str, database: str) -> str:
 
     Delega en la Shared Library `jenkins-shared-library` y se mantiene mínimo:
     el mismo pipeline sirve para todos los microservicios cambiando solo los
-    parámetros (PLAN-CICD-Jenkins.md §3.2 y §4).
+    parámetros.
     """
     db_type = "mongo" if database.lower() == "mongo" else "postgres"
 
@@ -155,7 +155,7 @@ def get_jenkinsfile_content(project_name: str, database: str) -> str:
 // Jenkinsfile genérico (backend) — parametrizado por servicio.
 // El mismo pipeline sirve para todos los microservicios; solo cambian los
 // parámetros, que se resuelven en runtime. La lógica vive en la Shared Library
-// (vars/) para mantener este archivo mínimo. Ref: PLAN-CICD-Jenkins.md §3 y §4.
+// (vars/) para mantener este archivo mínimo.
 //
 // Modelo de agentes: Amazon ECS plugin (EC2 launch type).
 // Cada grupo de stages comparte un ECS task; entre grupos se usa stash/unstash
@@ -200,7 +200,7 @@ pipeline {
         stage('CI') {
             agent { label 'agent-maven' }
             stages {
-                // 1 — Checkout + metadatos de versión/SHA → IMAGE_TAG inmutable (§3.3).
+                // 1 — Checkout + metadatos de versión/SHA → IMAGE_TAG inmutable.
                 stage('Checkout') {
                     steps {
                         checkout scm
@@ -266,7 +266,7 @@ pipeline {
             }
         }
 
-        // ── Aprobación manual antes de producción (§6) ───────────────────────
+        // ── Aprobación manual antes de producción ────────────────────────────
         stage('Approval (prod)') {
             when { expression { env.DEPLOY_ENV == 'prod' } }
             steps {
