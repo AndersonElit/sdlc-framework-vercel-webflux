@@ -77,6 +77,8 @@ mkdir -p \
   "$TF_BACKEND/modules/api-gateway" \
   "$TF_BACKEND/modules/secrets-manager" \
   "$TF_BACKEND/modules/ecr" \
+  "$TF_BACKEND/modules/mongodb" \
+  "$TF_BACKEND/modules/jenkins" \
   "$TF_BACKEND/environments/dev" \
   "$TF_BACKEND/environments/staging" \
   "$TF_BACKEND/environments/prod"
@@ -86,14 +88,11 @@ mkdir -p \
 # ===========================================================================
 
 cat > "$TF_FRONTEND/modules/vercel-project/main.tf" << 'EOF'
+# Sin git_repository: Jenkins es el único disparador de despliegues (vercel.json
+# tiene "deploymentEnabled": false). Terraform solo provee el proyecto y sus vars.
 resource "vercel_project" "this" {
   name      = var.project_name
   framework = var.framework
-
-  git_repository {
-    type = var.git_type
-    repo = var.git_repo
-  }
 }
 
 resource "vercel_project_environment_variable" "api_url" {
@@ -114,17 +113,6 @@ variable "framework" {
   description = "Framework del proyecto (nextjs, create-react-app, etc.)"
   type        = string
   default     = "nextjs"
-}
-
-variable "git_type" {
-  description = "Proveedor Git: github | gitlab | bitbucket"
-  type        = string
-  default     = "github"
-}
-
-variable "git_repo" {
-  description = "Repositorio Git (owner/repo)"
-  type        = string
 }
 
 variable "api_url" {
@@ -176,11 +164,6 @@ variable "vercel_team" {
   default     = ""
 }
 
-variable "git_repo" {
-  description = "Repositorio Git (owner/repo)"
-  type        = string
-}
-
 variable "api_url" {
   description = "URL del backend (dev usa Floci en localhost)"
   type        = string
@@ -192,7 +175,6 @@ cat > "$TF_FRONTEND/environments/dev/main.tf" << 'EOF'
 module "frontend" {
   source       = "../../modules/vercel-project"
   project_name = "my-app-dev"
-  git_repo     = var.git_repo
   api_url      = var.api_url
 }
 EOF
@@ -231,11 +213,6 @@ variable "vercel_team" {
   default     = ""
 }
 
-variable "git_repo" {
-  description = "Repositorio Git (owner/repo)"
-  type        = string
-}
-
 variable "api_url" {
   description = "URL del backend"
   type        = string
@@ -246,7 +223,6 @@ cat > "$TF_FRONTEND/environments/$env/main.tf" << EOF
 module "frontend" {
   source       = "../../modules/vercel-project"
   project_name = "my-app-${env}"
-  git_repo     = var.git_repo
   api_url      = var.api_url
 }
 EOF
@@ -1078,6 +1054,1017 @@ EOF
 log_ok "Módulo ECR listo."
 
 # ===========================================================================
+# BACKEND — módulo MongoDB (EC2 + EBS, auto-managed)
+# ===========================================================================
+
+log "Escribiendo módulo MongoDB (EC2 + EBS)..."
+
+cat > "$TF_BACKEND/modules/mongodb/main.tf" << 'EOF'
+# --- Security Group ---
+# Puerto 27017 accesible solo desde la VPC; la SG es el control de acceso.
+
+resource "aws_security_group" "mongodb" {
+  name        = "${var.project_name}-${var.environment}-mongodb"
+  description = "Security group para la instancia EC2 de MongoDB"
+  vpc_id      = var.vpc_id
+
+  ingress {
+    from_port   = 27017
+    to_port     = 27017
+    protocol    = "tcp"
+    cidr_blocks = [var.vpc_cidr]
+    description = "MongoDB desde la VPC"
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Environment = var.environment
+    Project     = var.project_name
+  }
+}
+
+# --- EBS (datos de MongoDB en /var/lib/mongodb) ---
+# La AZ se deriva de subnet_ids[0] para que coincida con la instancia EC2.
+
+data "aws_subnet" "mongodb_primary" {
+  id = var.subnet_ids[0]
+}
+
+resource "aws_ebs_volume" "mongodb_data" {
+  availability_zone = data.aws_subnet.mongodb_primary.availability_zone
+  size              = var.volume_size_gb
+  type              = var.volume_type
+  encrypted         = true
+
+  tags = {
+    Name        = "${var.project_name}-${var.environment}-mongodb-data"
+    Environment = var.environment
+    Project     = var.project_name
+  }
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+# --- Credenciales en Secrets Manager ---
+
+resource "aws_secretsmanager_secret" "mongodb_admin" {
+  name        = "/${var.environment}/mongodb/admin"
+  description = "Credenciales del usuario admin de MongoDB"
+
+  tags = {
+    Environment = var.environment
+    Project     = var.project_name
+  }
+}
+
+resource "aws_secretsmanager_secret_version" "mongodb_admin" {
+  secret_id = aws_secretsmanager_secret.mongodb_admin.id
+  secret_string = jsonencode({
+    username = "admin"
+    password = var.mongodb_admin_password
+  })
+}
+
+# --- IAM ---
+
+data "aws_iam_policy_document" "mongodb_assume_role" {
+  statement {
+    actions = ["sts:AssumeRole"]
+    principals {
+      type        = "Service"
+      identifiers = ["ec2.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "mongodb_ec2" {
+  name               = "${var.project_name}-${var.environment}-mongodb-ec2"
+  assume_role_policy = data.aws_iam_policy_document.mongodb_assume_role.json
+}
+
+# SSM Session Manager para acceso operacional sin SSH
+resource "aws_iam_role_policy_attachment" "mongodb_ssm" {
+  role       = aws_iam_role.mongodb_ec2.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+resource "aws_iam_policy" "mongodb_ec2" {
+  name        = "${var.project_name}-${var.environment}-mongodb-ec2"
+  description = "Permite adjuntar EBS, leer credenciales y escribir logs"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid      = "EBSAttach"
+        Effect   = "Allow"
+        Action   = ["ec2:AttachVolume", "ec2:DescribeVolumes", "ec2:DescribeVolumeStatus"]
+        Resource = "*"
+      },
+      {
+        Sid      = "SecretsRead"
+        Effect   = "Allow"
+        Action   = ["secretsmanager:GetSecretValue"]
+        Resource = aws_secretsmanager_secret.mongodb_admin.arn
+      },
+      {
+        Sid    = "CloudWatchLogs"
+        Effect = "Allow"
+        Action = [
+          "logs:CreateLogGroup",
+          "logs:CreateLogStream",
+          "logs:PutLogEvents",
+          "logs:DescribeLogStreams"
+        ]
+        Resource = "${aws_cloudwatch_log_group.mongodb.arn}:*"
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "mongodb_ec2" {
+  role       = aws_iam_role.mongodb_ec2.name
+  policy_arn = aws_iam_policy.mongodb_ec2.arn
+}
+
+resource "aws_iam_instance_profile" "mongodb_ec2" {
+  name = "${var.project_name}-${var.environment}-mongodb-ec2"
+  role = aws_iam_role.mongodb_ec2.name
+}
+
+# --- CloudWatch Log Group ---
+
+resource "aws_cloudwatch_log_group" "mongodb" {
+  name              = "/ec2/${var.project_name}-${var.environment}-mongodb"
+  retention_in_days = 30
+
+  tags = {
+    Environment = var.environment
+    Project     = var.project_name
+  }
+}
+
+# --- Launch Template + ASG (instancia EC2 singleton) ---
+
+resource "aws_launch_template" "mongodb" {
+  name_prefix   = "${var.project_name}-${var.environment}-mongodb-"
+  image_id      = var.ami_id
+  instance_type = var.instance_type
+
+  iam_instance_profile {
+    arn = aws_iam_instance_profile.mongodb_ec2.arn
+  }
+
+  network_interfaces {
+    associate_public_ip_address = false
+    security_groups             = [aws_security_group.mongodb.id]
+  }
+
+  # Terraform expande ${...} en apply time; $VAR (sin llaves) queda como variable bash.
+  # ${aws_ebs_volume.mongodb_data.id}          → ID del volumen al aplicar Terraform
+  # ${aws_secretsmanager_secret.mongodb_admin.arn} → ARN del secret al aplicar Terraform
+  # ${var.mongodb_version} dentro de << 'REPO' → versión inyectada por Terraform
+  # $INSTANCE_ID, $REGION, $DEVICE, etc.       → variables bash expandidas en runtime EC2
+  user_data = base64encode(<<-USERDATA
+    #!/bin/bash
+    set -euo pipefail
+
+    INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+    REGION=$(curl -s http://169.254.169.254/latest/meta-data/placement/region)
+    VOLUME_ID="${aws_ebs_volume.mongodb_data.id}"
+    SECRET_ARN="${aws_secretsmanager_secret.mongodb_admin.arn}"
+
+    # --- Adjuntar y montar volumen EBS ---
+    aws ec2 attach-volume \
+      --volume-id "$VOLUME_ID" \
+      --instance-id "$INSTANCE_ID" \
+      --device /dev/xvdf \
+      --region "$REGION"
+
+    for i in $(seq 1 30); do
+      { [ -e /dev/xvdf ] || [ -e /dev/nvme1n1 ]; } && break
+      sleep 2
+    done
+
+    DEVICE=$([ -e /dev/nvme1n1 ] && echo /dev/nvme1n1 || echo /dev/xvdf)
+    IS_NEW=0
+
+    if ! blkid "$DEVICE" &>/dev/null; then
+      mkfs -t xfs "$DEVICE"
+      IS_NEW=1
+    fi
+
+    mkdir -p /var/lib/mongodb
+    mount "$DEVICE" /var/lib/mongodb
+    echo "$DEVICE /var/lib/mongodb xfs defaults,nofail 0 2" >> /etc/fstab
+
+    # --- Instalar MongoDB ${var.mongodb_version} ---
+    cat > /etc/yum.repos.d/mongodb-org.repo << 'REPO'
+[mongodb-org-${var.mongodb_version}]
+name=MongoDB Repository
+baseurl=https://repo.mongodb.org/yum/amazon/2/mongodb-org/${var.mongodb_version}/x86_64/
+gpgcheck=1
+enabled=1
+gpgkey=https://www.mongodb.org/static/pgp/server-${var.mongodb_version}.asc
+REPO
+
+    yum install -y mongodb-org
+
+    # --- Configurar mongod.conf ---
+    chown -R mongod:mongod /var/lib/mongodb
+
+    cat > /etc/mongod.conf << 'MONGOCFG'
+storage:
+  dbPath: /var/lib/mongodb
+net:
+  port: 27017
+  bindIp: 0.0.0.0
+security:
+  authorization: enabled
+systemLog:
+  destination: file
+  path: /var/log/mongodb/mongod.log
+  logAppend: true
+MONGOCFG
+
+    systemctl enable mongod
+    systemctl start mongod
+
+    # --- Crear usuario admin (solo primer arranque, volumen nuevo) ---
+    if [ "$IS_NEW" -eq 1 ]; then
+      sleep 5
+      ADMIN_PASS=$(aws secretsmanager get-secret-value \
+        --secret-id "$SECRET_ARN" \
+        --region "$REGION" \
+        --query SecretString \
+        --output text | python3 -c "import sys,json; print(json.load(sys.stdin)['password'])")
+
+      mongosh --quiet admin --eval "
+        db.createUser({
+          user: 'admin',
+          pwd: '$ADMIN_PASS',
+          roles: [{ role: 'root', db: 'admin' }]
+        })
+      "
+    fi
+  USERDATA
+  )
+
+  tag_specifications {
+    resource_type = "instance"
+    tags = {
+      Name        = "${var.project_name}-${var.environment}-mongodb"
+      Environment = var.environment
+      Project     = var.project_name
+    }
+  }
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+# Singleton: desired/min/max = 1, fijado a la AZ del volumen EBS.
+resource "aws_autoscaling_group" "mongodb" {
+  name                = "${var.project_name}-${var.environment}-mongodb"
+  vpc_zone_identifier = [var.subnet_ids[0]]
+  desired_capacity    = 1
+  min_size            = 1
+  max_size            = 1
+
+  launch_template {
+    id      = aws_launch_template.mongodb.id
+    version = "$Latest"
+  }
+
+  tag {
+    key                 = "Environment"
+    value               = var.environment
+    propagate_at_launch = true
+  }
+
+  lifecycle {
+    ignore_changes = [desired_capacity]
+  }
+}
+EOF
+
+cat > "$TF_BACKEND/modules/mongodb/variables.tf" << 'EOF'
+variable "project_name" {
+  description = "Prefijo del proyecto"
+  type        = string
+}
+
+variable "environment" {
+  description = "Nombre del ambiente (dev/staging/prod)"
+  type        = string
+}
+
+variable "vpc_id" {
+  description = "ID de la VPC"
+  type        = string
+}
+
+variable "vpc_cidr" {
+  description = "CIDR de la VPC (permite acceso al puerto 27017)"
+  type        = string
+}
+
+variable "subnet_ids" {
+  description = "Subnets privadas; subnet_ids[0] determina la AZ del volumen EBS"
+  type        = list(string)
+}
+
+variable "ami_id" {
+  description = "AMI Amazon Linux 2 para la instancia MongoDB"
+  type        = string
+}
+
+variable "instance_type" {
+  description = "Tipo de instancia EC2"
+  type        = string
+  default     = "t3.medium"
+}
+
+variable "volume_size_gb" {
+  description = "Tamaño del volumen EBS para los datos de MongoDB en GB"
+  type        = number
+  default     = 20
+}
+
+variable "volume_type" {
+  description = "Tipo de volumen EBS"
+  type        = string
+  default     = "gp3"
+}
+
+variable "mongodb_version" {
+  description = "Versión mayor de MongoDB a instalar (p. ej. 7.0)"
+  type        = string
+  default     = "7.0"
+}
+
+variable "mongodb_admin_password" {
+  description = "Contraseña del usuario admin de MongoDB (se almacena en Secrets Manager)"
+  type        = string
+  sensitive   = true
+}
+EOF
+
+cat > "$TF_BACKEND/modules/mongodb/outputs.tf" << 'EOF'
+output "secret_arn" {
+  description = "ARN del secret con las credenciales admin de MongoDB"
+  value       = aws_secretsmanager_secret.mongodb_admin.arn
+}
+
+output "secret_name" {
+  description = "Nombre del secret (para referencia en microservicios)"
+  value       = aws_secretsmanager_secret.mongodb_admin.name
+}
+
+output "security_group_id" {
+  description = "ID del SG de MongoDB (añadir a los microservicios que necesiten acceso)"
+  value       = aws_security_group.mongodb.id
+}
+
+output "ebs_volume_id" {
+  description = "ID del volumen EBS con los datos de MongoDB"
+  value       = aws_ebs_volume.mongodb_data.id
+}
+
+output "cloudwatch_log_group" {
+  description = "Nombre del log group de CloudWatch para MongoDB"
+  value       = aws_cloudwatch_log_group.mongodb.name
+}
+EOF
+
+log_ok "Módulo MongoDB listo."
+
+# ===========================================================================
+# BACKEND — módulo Jenkins (ECS + Fargate)
+# ===========================================================================
+
+log "Escribiendo módulo Jenkins (ECS)..."
+
+cat > "$TF_BACKEND/modules/jenkins/main.tf" << 'EOF'
+# --- Security Groups ---
+
+resource "aws_security_group" "alb" {
+  name        = "${var.project_name}-${var.environment}-jenkins-alb"
+  description = "Security group para el ALB de Jenkins"
+  vpc_id      = var.vpc_id
+
+  ingress {
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = var.allowed_cidr_blocks
+  }
+
+  ingress {
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = var.allowed_cidr_blocks
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Environment = var.environment
+    Project     = var.project_name
+  }
+}
+
+resource "aws_security_group" "jenkins_ec2" {
+  name        = "${var.project_name}-${var.environment}-jenkins-ec2"
+  description = "Security group para la instancia EC2 del controller Jenkins"
+  vpc_id      = var.vpc_id
+
+  ingress {
+    from_port       = 8080
+    to_port         = 8080
+    protocol        = "tcp"
+    security_groups = [aws_security_group.alb.id]
+    description     = "UI Jenkins desde ALB"
+  }
+
+  ingress {
+    from_port   = 50000
+    to_port     = 50000
+    protocol    = "tcp"
+    cidr_blocks = [var.vpc_cidr]
+    description = "Agentes JNLP"
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Environment = var.environment
+    Project     = var.project_name
+  }
+}
+
+# --- EBS (persistencia de JENKINS_HOME) ---
+# La AZ del volumen se deriva de subnet_ids[0] para coincidir con la instancia EC2.
+
+data "aws_subnet" "jenkins_primary" {
+  id = var.subnet_ids[0]
+}
+
+resource "aws_ebs_volume" "jenkins_home" {
+  availability_zone = data.aws_subnet.jenkins_primary.availability_zone
+  size              = var.volume_size_gb
+  type              = var.volume_type
+  encrypted         = true
+
+  tags = {
+    Name        = "${var.project_name}-${var.environment}-jenkins-home"
+    Environment = var.environment
+    Project     = var.project_name
+  }
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+# --- IAM para instancias EC2 del cluster ECS ---
+
+data "aws_iam_policy_document" "ec2_assume_role" {
+  statement {
+    actions = ["sts:AssumeRole"]
+    principals {
+      type        = "Service"
+      identifiers = ["ec2.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "jenkins_ec2" {
+  name               = "${var.project_name}-${var.environment}-jenkins-ec2"
+  assume_role_policy = data.aws_iam_policy_document.ec2_assume_role.json
+}
+
+resource "aws_iam_role_policy_attachment" "jenkins_ec2_ecs" {
+  role       = aws_iam_role.jenkins_ec2.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role"
+}
+
+resource "aws_iam_policy" "jenkins_ec2_ebs" {
+  name        = "${var.project_name}-${var.environment}-jenkins-ec2-ebs"
+  description = "Permite adjuntar el volumen EBS de JENKINS_HOME al arrancar"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["ec2:AttachVolume", "ec2:DescribeVolumes", "ec2:DescribeVolumeStatus"]
+      Resource = "*"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "jenkins_ec2_ebs" {
+  role       = aws_iam_role.jenkins_ec2.name
+  policy_arn = aws_iam_policy.jenkins_ec2_ebs.arn
+}
+
+resource "aws_iam_instance_profile" "jenkins_ec2" {
+  name = "${var.project_name}-${var.environment}-jenkins-ec2"
+  role = aws_iam_role.jenkins_ec2.name
+}
+
+# --- IAM para el task ECS de Jenkins ---
+
+data "aws_iam_policy_document" "jenkins_task_assume_role" {
+  statement {
+    actions = ["sts:AssumeRole"]
+    principals {
+      type        = "Service"
+      identifiers = ["ecs-tasks.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "jenkins_execution" {
+  name               = "${var.project_name}-${var.environment}-jenkins-execution"
+  assume_role_policy = data.aws_iam_policy_document.jenkins_task_assume_role.json
+}
+
+resource "aws_iam_role_policy_attachment" "jenkins_execution_managed" {
+  role       = aws_iam_role.jenkins_execution.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+}
+
+resource "aws_iam_role" "jenkins_task" {
+  name               = "${var.project_name}-${var.environment}-jenkins-task"
+  assume_role_policy = data.aws_iam_policy_document.jenkins_task_assume_role.json
+}
+
+resource "aws_iam_policy" "jenkins_task" {
+  name        = "${var.project_name}-${var.environment}-jenkins-task"
+  description = "Permisos Jenkins: lanzar agentes ECS, push/pull ECR, leer Secrets Manager, describir EKS"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "ECSAgents"
+        Effect = "Allow"
+        Action = [
+          "ecs:RunTask",
+          "ecs:StopTask",
+          "ecs:DescribeTasks",
+          "ecs:ListTasks",
+          "ecs:DescribeTaskDefinition",
+          "ecs:RegisterTaskDefinition",
+          "iam:PassRole"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "ECRPushPull"
+        Effect = "Allow"
+        Action = [
+          "ecr:GetAuthorizationToken",
+          "ecr:BatchCheckLayerAvailability",
+          "ecr:GetDownloadUrlForLayer",
+          "ecr:BatchGetImage",
+          "ecr:PutImage",
+          "ecr:InitiateLayerUpload",
+          "ecr:UploadLayerPart",
+          "ecr:CompleteLayerUpload"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "SecretsManager"
+        Effect = "Allow"
+        Action = [
+          "secretsmanager:GetSecretValue",
+          "secretsmanager:DescribeSecret",
+          "secretsmanager:ListSecrets"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "EKSDescribe"
+        Effect = "Allow"
+        Action = [
+          "eks:DescribeCluster",
+          "eks:ListClusters"
+        ]
+        Resource = "*"
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "jenkins_task" {
+  role       = aws_iam_role.jenkins_task.name
+  policy_arn = aws_iam_policy.jenkins_task.arn
+}
+
+# --- ECS Cluster ---
+
+resource "aws_ecs_cluster" "jenkins" {
+  name = "${var.project_name}-${var.environment}-jenkins"
+
+  setting {
+    name  = "containerInsights"
+    value = var.environment == "prod" ? "enabled" : "disabled"
+  }
+
+  tags = {
+    Environment = var.environment
+    Project     = var.project_name
+  }
+}
+
+# --- CloudWatch Logs ---
+
+resource "aws_cloudwatch_log_group" "jenkins" {
+  name              = "/ecs/${var.project_name}-${var.environment}-jenkins"
+  retention_in_days = 30
+
+  tags = {
+    Environment = var.environment
+    Project     = var.project_name
+  }
+}
+
+# --- Launch Template + ASG (instancia EC2 singleton del cluster) ---
+
+resource "aws_launch_template" "jenkins" {
+  name_prefix   = "${var.project_name}-${var.environment}-jenkins-"
+  image_id      = var.ecs_ami_id
+  instance_type = var.instance_type
+
+  iam_instance_profile {
+    arn = aws_iam_instance_profile.jenkins_ec2.arn
+  }
+
+  network_interfaces {
+    associate_public_ip_address = false
+    security_groups             = [aws_security_group.jenkins_ec2.id]
+  }
+
+  # $INSTANCE_ID/$REGION/$DEVICE/$i son variables bash (runtime en EC2).
+  # ${aws_ecs_cluster.jenkins.name} y ${aws_ebs_volume.jenkins_home.id} son
+  # interpolaciones Terraform expandidas en apply time.
+  user_data = base64encode(<<-USERDATA
+    #!/bin/bash
+    echo "ECS_CLUSTER=${aws_ecs_cluster.jenkins.name}" >> /etc/ecs/ecs.config
+
+    INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+    REGION=$(curl -s http://169.254.169.254/latest/meta-data/placement/region)
+    VOLUME_ID="${aws_ebs_volume.jenkins_home.id}"
+
+    aws ec2 attach-volume \
+      --volume-id "$VOLUME_ID" \
+      --instance-id "$INSTANCE_ID" \
+      --device /dev/xvdf \
+      --region "$REGION"
+
+    for i in $(seq 1 30); do
+      { [ -e /dev/xvdf ] || [ -e /dev/nvme1n1 ]; } && break
+      sleep 2
+    done
+
+    DEVICE=$([ -e /dev/nvme1n1 ] && echo /dev/nvme1n1 || echo /dev/xvdf)
+
+    if ! blkid "$DEVICE" &>/dev/null; then
+      mkfs -t ext4 "$DEVICE"
+    fi
+
+    mkdir -p /var/jenkins_home
+    mount "$DEVICE" /var/jenkins_home
+    chown -R 1000:1000 /var/jenkins_home
+    echo "$DEVICE /var/jenkins_home ext4 defaults,nofail 0 2" >> /etc/fstab
+  USERDATA
+  )
+
+  tag_specifications {
+    resource_type = "instance"
+    tags = {
+      Name        = "${var.project_name}-${var.environment}-jenkins"
+      Environment = var.environment
+      Project     = var.project_name
+    }
+  }
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+# Singleton: desired/min/max = 1. Fijado a subnet_ids[0] para que la AZ
+# coincida con el volumen EBS.
+resource "aws_autoscaling_group" "jenkins" {
+  name                = "${var.project_name}-${var.environment}-jenkins"
+  vpc_zone_identifier = [var.subnet_ids[0]]
+  desired_capacity    = 1
+  min_size            = 1
+  max_size            = 1
+
+  launch_template {
+    id      = aws_launch_template.jenkins.id
+    version = "$Latest"
+  }
+
+  tag {
+    key                 = "AmazonECSManaged"
+    value               = ""
+    propagate_at_launch = true
+  }
+
+  tag {
+    key                 = "Environment"
+    value               = var.environment
+    propagate_at_launch = true
+  }
+
+  lifecycle {
+    ignore_changes = [desired_capacity]
+  }
+}
+
+# --- ECS Task Definition (EC2 launch type, bridge mode) ---
+
+resource "aws_ecs_task_definition" "jenkins" {
+  family             = "${var.project_name}-${var.environment}-jenkins"
+  network_mode       = "bridge"
+  task_role_arn      = aws_iam_role.jenkins_task.arn
+  execution_role_arn = aws_iam_role.jenkins_execution.arn
+
+  volume {
+    name      = "jenkins-home"
+    host_path = "/var/jenkins_home"
+  }
+
+  container_definitions = jsonencode([{
+    name      = "jenkins"
+    image     = "jenkins/jenkins:${var.jenkins_image_tag}"
+    essential = true
+    cpu       = var.cpu
+    memory    = var.memory
+
+    portMappings = [
+      { containerPort = 8080, hostPort = 8080, protocol = "tcp" },
+      { containerPort = 50000, hostPort = 50000, protocol = "tcp" }
+    ]
+
+    mountPoints = [{
+      sourceVolume  = "jenkins-home"
+      containerPath = "/var/jenkins_home"
+      readOnly      = false
+    }]
+
+    environment = [{
+      name  = "JAVA_OPTS"
+      value = "-Djenkins.install.runSetupWizard=false"
+    }]
+
+    logConfiguration = {
+      logDriver = "awslogs"
+      options = {
+        "awslogs-group"         = aws_cloudwatch_log_group.jenkins.name
+        "awslogs-region"        = var.aws_region
+        "awslogs-stream-prefix" = "jenkins"
+      }
+    }
+  }])
+
+  tags = {
+    Environment = var.environment
+    Project     = var.project_name
+  }
+}
+
+# --- ALB ---
+
+resource "aws_lb" "jenkins" {
+  name               = "${var.project_name}-${var.environment}-jenkins"
+  internal           = var.alb_internal
+  load_balancer_type = "application"
+  security_groups    = [aws_security_group.alb.id]
+  subnets            = var.public_subnet_ids
+
+  tags = {
+    Environment = var.environment
+    Project     = var.project_name
+  }
+}
+
+resource "aws_lb_target_group" "jenkins" {
+  name        = "${var.project_name}-${var.environment}-jenkins"
+  port        = 8080
+  protocol    = "HTTP"
+  vpc_id      = var.vpc_id
+  target_type = "instance"
+
+  health_check {
+    path                = "/login"
+    healthy_threshold   = 2
+    unhealthy_threshold = 3
+    timeout             = 10
+    interval            = 30
+    matcher             = "200"
+  }
+
+  tags = {
+    Environment = var.environment
+    Project     = var.project_name
+  }
+}
+
+resource "aws_lb_listener" "jenkins" {
+  load_balancer_arn = aws_lb.jenkins.arn
+  port              = 80
+  protocol          = "HTTP"
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.jenkins.arn
+  }
+}
+
+# Registra el ASG como target del ALB (bridge mode requiere target_type = instance)
+resource "aws_autoscaling_attachment" "jenkins" {
+  autoscaling_group_name = aws_autoscaling_group.jenkins.name
+  lb_target_group_arn    = aws_lb_target_group.jenkins.arn
+}
+
+# --- ECS Service (EC2 launch type) ---
+
+resource "aws_ecs_service" "jenkins" {
+  name            = "${var.project_name}-${var.environment}-jenkins"
+  cluster         = aws_ecs_cluster.jenkins.id
+  task_definition = aws_ecs_task_definition.jenkins.arn
+  desired_count   = 1
+  launch_type     = "EC2"
+
+  depends_on = [
+    aws_autoscaling_group.jenkins,
+    aws_lb_listener.jenkins,
+  ]
+
+  lifecycle {
+    ignore_changes = [task_definition]
+  }
+
+  tags = {
+    Environment = var.environment
+    Project     = var.project_name
+  }
+}
+EOF
+
+cat > "$TF_BACKEND/modules/jenkins/variables.tf" << 'EOF'
+variable "project_name" {
+  description = "Prefijo del proyecto"
+  type        = string
+}
+
+variable "environment" {
+  description = "Nombre del ambiente (dev/staging/prod)"
+  type        = string
+}
+
+variable "vpc_id" {
+  description = "ID de la VPC donde se despliega Jenkins"
+  type        = string
+}
+
+variable "vpc_cidr" {
+  description = "CIDR de la VPC (regla de entrada para agentes JNLP port 50000)"
+  type        = string
+}
+
+variable "subnet_ids" {
+  description = "Subnets privadas; subnet_ids[0] determina la AZ del volumen EBS"
+  type        = list(string)
+}
+
+variable "public_subnet_ids" {
+  description = "Subnets públicas para el ALB"
+  type        = list(string)
+}
+
+variable "ecs_ami_id" {
+  description = "AMI ECS-optimized para la instancia EC2 (amazon-linux-2 ECS)"
+  type        = string
+}
+
+variable "instance_type" {
+  description = "Tipo de instancia EC2 para el controller Jenkins"
+  type        = string
+  default     = "t3.medium"
+}
+
+variable "volume_size_gb" {
+  description = "Tamaño del volumen EBS para JENKINS_HOME en GB"
+  type        = number
+  default     = 30
+}
+
+variable "volume_type" {
+  description = "Tipo de volumen EBS"
+  type        = string
+  default     = "gp3"
+}
+
+variable "aws_region" {
+  description = "Región AWS (CloudWatch Logs)"
+  type        = string
+  default     = "us-east-1"
+}
+
+variable "cpu" {
+  description = "CPU reservada para el container Jenkins en unidades ECS (1024 = 1 vCPU)"
+  type        = number
+  default     = 1024
+}
+
+variable "memory" {
+  description = "Memoria reservada para el container Jenkins en MB"
+  type        = number
+  default     = 2048
+}
+
+variable "jenkins_image_tag" {
+  description = "Tag de la imagen jenkins/jenkins"
+  type        = string
+  default     = "lts-jdk21"
+}
+
+variable "allowed_cidr_blocks" {
+  description = "CIDRs con acceso HTTP/HTTPS a la UI de Jenkins vía ALB"
+  type        = list(string)
+  default     = ["0.0.0.0/0"]
+}
+
+variable "alb_internal" {
+  description = "Si true el ALB es interno (solo accesible desde la VPC)"
+  type        = bool
+  default     = false
+}
+EOF
+
+cat > "$TF_BACKEND/modules/jenkins/outputs.tf" << 'EOF'
+output "jenkins_url" {
+  description = "URL de acceso a la UI de Jenkins vía ALB"
+  value       = "http://${aws_lb.jenkins.dns_name}"
+}
+
+output "alb_dns_name" {
+  description = "DNS name del ALB de Jenkins"
+  value       = aws_lb.jenkins.dns_name
+}
+
+output "cluster_name" {
+  description = "Nombre del cluster ECS de Jenkins"
+  value       = aws_ecs_cluster.jenkins.name
+}
+
+output "task_role_arn" {
+  description = "ARN del IAM task role de Jenkins (para asignar permisos adicionales)"
+  value       = aws_iam_role.jenkins_task.arn
+}
+
+output "ebs_volume_id" {
+  description = "ID del volumen EBS que persiste JENKINS_HOME"
+  value       = aws_ebs_volume.jenkins_home.id
+}
+
+output "ec2_security_group_id" {
+  description = "ID del security group de la instancia EC2 Jenkins (para agentes ECS)"
+  value       = aws_security_group.jenkins_ec2.id
+}
+EOF
+
+log_ok "Módulo Jenkins listo."
+
+# ===========================================================================
 # BACKEND — entorno dev (Floci)
 # ===========================================================================
 
@@ -1112,8 +2099,9 @@ provider "aws" {
     cognitoidp     = "http://localhost:4566"
     apigateway     = "http://localhost:4566"
     apigatewayv2   = "http://localhost:4566"
-    secretsmanager = "http://localhost:4566"
-    ecr            = "http://localhost:4566"
+    secretsmanager       = "http://localhost:4566"
+    ecr                  = "http://localhost:4566"
+    elasticloadbalancing = "http://localhost:4566"
   }
 }
 EOF
@@ -1123,6 +2111,36 @@ variable "aws_region" {
   description = "Región AWS"
   type        = string
   default     = "us-east-1"
+}
+
+variable "vpc_id" {
+  description = "ID de la VPC (floci: valor de prueba)"
+  type        = string
+  default     = "vpc-00000000"
+}
+
+variable "vpc_cidr" {
+  description = "CIDR de la VPC"
+  type        = string
+  default     = "10.0.0.0/16"
+}
+
+variable "subnet_ids" {
+  description = "Subnets privadas (floci: valores de prueba)"
+  type        = list(string)
+  default     = ["subnet-00000001", "subnet-00000002"]
+}
+
+variable "public_subnet_ids" {
+  description = "Subnets públicas para el ALB (floci: mismas que privadas)"
+  type        = list(string)
+  default     = ["subnet-00000001", "subnet-00000002"]
+}
+
+variable "ecs_ami_id" {
+  description = "AMI ECS-optimized (floci: valor de prueba)"
+  type        = string
+  default     = "ami-00000000"
 }
 EOF
 
@@ -1167,6 +2185,19 @@ module "ecr" {
   project_name = local.project_name
   services     = local.services
 }
+
+module "jenkins" {
+  source            = "../../modules/jenkins"
+  environment       = local.environment
+  project_name      = local.project_name
+  vpc_id            = var.vpc_id
+  vpc_cidr          = var.vpc_cidr
+  subnet_ids        = var.subnet_ids
+  public_subnet_ids = var.public_subnet_ids
+  ecs_ami_id        = var.ecs_ami_id
+  aws_region        = var.aws_region
+  alb_internal      = true
+}
 EOF
 
 cat > "$TF_BACKEND/environments/dev/outputs.tf" << 'EOF'
@@ -1204,6 +2235,16 @@ output "task_execution_role_arn" {
 output "task_role_arn" {
   description = "ARN del ECS task role"
   value       = module.iam.task_role_arn
+}
+
+output "jenkins_url" {
+  description = "URL de acceso a la UI de Jenkins"
+  value       = module.jenkins.jenkins_url
+}
+
+output "jenkins_ebs_volume_id" {
+  description = "ID del volumen EBS que persiste JENKINS_HOME"
+  value       = module.jenkins.ebs_volume_id
 }
 EOF
 
@@ -1244,6 +2285,31 @@ variable "project_name" {
 variable "services" {
   description = "Lista de microservicios del proyecto"
   type        = list(string)
+}
+
+variable "vpc_id" {
+  description = "ID de la VPC donde se despliega la infraestructura"
+  type        = string
+}
+
+variable "vpc_cidr" {
+  description = "CIDR de la VPC"
+  type        = string
+}
+
+variable "subnet_ids" {
+  description = "Subnets privadas (ECS tasks, RDS)"
+  type        = list(string)
+}
+
+variable "public_subnet_ids" {
+  description = "Subnets públicas para el ALB de Jenkins"
+  type        = list(string)
+}
+
+variable "ecs_ami_id" {
+  description = "AMI ECS-optimized para la instancia EC2 del cluster Jenkins"
+  type        = string
 }
 EOF
 
@@ -1286,6 +2352,19 @@ module "ecr" {
   project_name = var.project_name
   services     = var.services
 }
+
+module "jenkins" {
+  source            = "../../modules/jenkins"
+  environment       = local.environment
+  project_name      = var.project_name
+  vpc_id            = var.vpc_id
+  vpc_cidr          = var.vpc_cidr
+  subnet_ids        = var.subnet_ids
+  public_subnet_ids = var.public_subnet_ids
+  ecs_ami_id        = var.ecs_ami_id
+  aws_region        = var.aws_region
+  alb_internal      = true
+}
 EOF
 
 cat > "$TF_BACKEND/environments/$env/outputs.tf" << 'EOF'
@@ -1323,6 +2402,16 @@ output "task_execution_role_arn" {
 output "task_role_arn" {
   description = "ARN del ECS task role"
   value       = module.iam.task_role_arn
+}
+
+output "jenkins_url" {
+  description = "URL de acceso a la UI de Jenkins"
+  value       = module.jenkins.jenkins_url
+}
+
+output "jenkins_ebs_volume_id" {
+  description = "ID del volumen EBS que persiste JENKINS_HOME"
+  value       = module.jenkins.ebs_volume_id
 }
 EOF
 

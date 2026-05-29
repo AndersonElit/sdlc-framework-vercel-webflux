@@ -2007,6 +2007,23 @@ pipeline {
 """
 
 
+def get_vercel_json() -> str:
+    """vercel.json con la Git integration DESACTIVADA.
+
+    Garantiza que el único disparador de despliegues sea Jenkins (deploy vía
+    Vercel CLI). Ref: PLAN-CICD-Jenkins.md §5 y criterio de aceptación §13.
+    """
+    return """\
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": "nextjs",
+  "git": {
+    "deploymentEnabled": false
+  }
+}
+"""
+
+
 def get_dockerignore() -> str:
     return """\
 node_modules
@@ -2123,6 +2140,7 @@ def scaffold(project_name: str) -> None:
         "Dockerfile": get_dockerfile(),
         ".dockerignore": get_dockerignore(),
         "Jenkinsfile": get_jenkinsfile(),
+        "vercel.json": get_vercel_json(),
 
         # Middleware (Next.js root)
         "src/middleware.ts": get_middleware(),

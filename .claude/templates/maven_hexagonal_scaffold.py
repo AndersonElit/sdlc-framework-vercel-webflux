@@ -156,6 +156,10 @@ def get_jenkinsfile_content(project_name: str, database: str) -> str:
 // El mismo pipeline sirve para todos los microservicios; solo cambian los
 // parámetros, que se resuelven en runtime. La lógica vive en la Shared Library
 // (vars/) para mantener este archivo mínimo. Ref: PLAN-CICD-Jenkins.md §3 y §4.
+//
+// Modelo de agentes: Amazon ECS plugin (EC2 launch type).
+// Cada grupo de stages comparte un ECS task; entre grupos se usa stash/unstash
+// para transferir el workspace (Dockerfile + fuentes + helm charts).
 // ───────────────────────────────────────────────────────────────────────────
 
 pipeline {
@@ -190,62 +194,79 @@ pipeline {
     }
 
     stages {
-        // 1 — Checkout + metadatos de versión/SHA → IMAGE_TAG inmutable (§3.3).
-        stage('Checkout') {
+        // ── Stages 1-5: CI completo en un único ECS task agent-maven ──────────
+        // Workspace compartido dentro del grupo; se stashea al terminar para
+        // que los grupos siguientes (agent-kaniko, agent-deploy) lo recuperen.
+        stage('CI') {
             agent { label 'agent-maven' }
-            steps {
-                checkout scm
-                script {
-                    // <version-maven>-<git-sha-corto>
-                    env.IMAGE_TAG = computeImageTag()
-                    echo "IMAGE_TAG=${env.IMAGE_TAG}"
+            stages {
+                // 1 — Checkout + metadatos de versión/SHA → IMAGE_TAG inmutable (§3.3).
+                stage('Checkout') {
+                    steps {
+                        checkout scm
+                        script {
+                            env.IMAGE_TAG = computeImageTag()
+                            echo "IMAGE_TAG=${env.IMAGE_TAG}"
+                        }
+                    }
+                }
+
+                // 2 — Build + unit tests respetando la regla de dependencias hexagonal.
+                stage('Build & Unit Tests') {
+                    steps { buildBackendService() }
+                }
+
+                // 3 — Tests de integración (R2DBC/Mongo/Kafka) con Testcontainers.
+                stage('Integration Tests') {
+                    steps { runIntegrationTests(dbType: env.DB_TYPE) }
+                }
+
+                // 4 — Análisis estático + quality gate (SonarQube). Falla si gate = ERROR.
+                stage('Quality Gate (SonarQube)') {
+                    steps { runQualityGates() }
+                }
+
+                // 5 — OWASP Dependency Check + escaneo de secretos.
+                stage('Security Scans') {
+                    steps { runSecurityScans() }
+                }
+            }
+            // Stash fuentes + Dockerfile + helm charts (excluye .git y target compilado).
+            // El siguiente grupo (agent-kaniko) lo recupera para construir la imagen.
+            post {
+                success {
+                    stash name: 'workspace',
+                          includes: '**/*',
+                          excludes: '.git/**,**/target/**'
                 }
             }
         }
 
-        // 2 — Build + unit tests respetando la regla de dependencias hexagonal.
-        stage('Build & Unit Tests') {
-            agent { label 'agent-maven' }
-            steps { buildBackendService() }
-        }
+        // ── Stages 6-7: imagen Docker en ECS task agent-kaniko ───────────────
+        // Kaniko construye desde el Dockerfile (multi-stage Maven dentro de Docker).
+        stage('Image') {
+            agent { label 'agent-kaniko' }
+            stages {
+                // 6 — Imagen Docker multi-stage vía Kaniko → push a Amazon ECR.
+                stage('Build & Push Image') {
+                    steps {
+                        unstash 'workspace'
+                        buildAndPushImage(
+                            service:  env.SERVICE_NAME,
+                            ecrRepo:  env.ECR_REPO,
+                            imageTag: env.IMAGE_TAG
+                        )
+                    }
+                }
 
-        // 3 — Tests de integración (R2DBC/Mongo/Kafka) con Testcontainers.
-        stage('Integration Tests') {
-            agent { label 'agent-maven' }
-            steps { runIntegrationTests(dbType: env.DB_TYPE) }
-        }
-
-        // 4 — Análisis estático + quality gate (SonarQube). Falla si gate = ERROR.
-        stage('Quality Gate (SonarQube)') {
-            agent { label 'agent-maven' }
-            steps { runQualityGates() }
-        }
-
-        // 5 — OWASP Dependency Check + escaneo de secretos.
-        stage('Security Scans') {
-            agent { label 'agent-maven' }
-            steps { runSecurityScans() }
-        }
-
-        // 6 — Imagen Docker multi-stage vía Kaniko → push a Amazon ECR.
-        stage('Build & Push Image') {
-            agent { label 'agent-docker' }
-            steps {
-                buildAndPushImage(
-                    service:  env.SERVICE_NAME,
-                    ecrRepo:  env.ECR_REPO,
-                    imageTag: env.IMAGE_TAG
-                )
+                // 7 — Escaneo de la imagen publicada (Trivy). Falla ante CVE crítico.
+                stage('Image Scan (Trivy)') {
+                    steps { scanImage(ecrRepo: env.ECR_REPO, imageTag: env.IMAGE_TAG) }
+                }
             }
         }
 
-        // 7 — Escaneo de la imagen publicada (Trivy). Falla ante CVE crítico.
-        stage('Image Scan (Trivy)') {
-            agent { label 'agent-docker' }
-            steps { scanImage(ecrRepo: env.ECR_REPO, imageTag: env.IMAGE_TAG) }
-        }
-
-        // Aprobación manual obligatoria antes de desplegar a producción (§6).
+        // ── Aprobación manual antes de producción (§6) ───────────────────────
         stage('Approval (prod)') {
             when { expression { env.DEPLOY_ENV == 'prod' } }
             steps {
@@ -257,27 +278,33 @@ pipeline {
             }
         }
 
-        // 8 — helm upgrade --install con valores por ambiente. ≥ 2 réplicas en prod.
-        stage('Deploy a EKS') {
+        // ── Stages 8-9: despliegue en ECS task agent-deploy ──────────────────
+        // Necesita los helm charts del workspace; IMAGE_TAG viene del env global.
+        stage('Deploy') {
             agent { label 'agent-deploy' }
-            steps {
-                deployToEks(
-                    service:   env.SERVICE_NAME,
-                    namespace: env.K8S_NAMESPACE,
-                    env:       env.DEPLOY_ENV,
-                    imageTag:  env.IMAGE_TAG
-                )
-            }
-        }
+            stages {
+                // 8 — helm upgrade --install con valores por ambiente. ≥ 2 réplicas en prod.
+                stage('Deploy a EKS') {
+                    steps {
+                        unstash 'workspace'
+                        deployToEks(
+                            service:   env.SERVICE_NAME,
+                            namespace: env.K8S_NAMESPACE,
+                            env:       env.DEPLOY_ENV,
+                            imageTag:  env.IMAGE_TAG
+                        )
+                    }
+                }
 
-        // 9 — Verificación post-deploy contra /actuator/health/readiness.
-        stage('Smoke Tests') {
-            agent { label 'agent-deploy' }
-            steps {
-                runSmokeTests(
-                    service:   env.SERVICE_NAME,
-                    namespace: env.K8S_NAMESPACE
-                )
+                // 9 — Verificación post-deploy contra /actuator/health/readiness.
+                stage('Smoke Tests') {
+                    steps {
+                        runSmokeTests(
+                            service:   env.SERVICE_NAME,
+                            namespace: env.K8S_NAMESPACE
+                        )
+                    }
+                }
             }
         }
     }
