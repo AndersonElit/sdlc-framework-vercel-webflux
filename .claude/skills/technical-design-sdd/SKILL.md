@@ -186,6 +186,25 @@ Describir:
 - Mantener enfoque práctico.
 - Evitar teoría innecesaria.
 
+# DIAGRAMAS C4 (ARCHIVOS INDEPENDIENTES)
+
+En esta sección debes generar dos diagramas C4 en formato **Mermaid**, cada uno como archivo independiente:
+
+1. **Diagrama de Contexto (C4 nivel 1)** — `docs/design/diagrams/SDD-[proyecto]-c4-context.mmd`
+   Representa el sistema como una caja única en relación con sus usuarios (actores) y sistemas externos (centrales de riesgo, proveedores de identidad, pasarelas, etc.).
+
+2. **Diagrama de Contenedores (C4 nivel 2)** — `docs/design/diagrams/SDD-[proyecto]-c4-container.mmd`
+   Representa los contenedores internos del sistema (frontend, backend/microservicios, bases de datos, mensajería, funciones serverless, etc.) y sus relaciones.
+
+# REGLAS PARA LOS DIAGRAMAS C4
+
+- Usar sintaxis Mermaid válida para C4 (`C4Context` y `C4Container`).
+- El contenido de cada `.mmd` es ÚNICAMENTE el diagrama Mermaid (sin texto adicional ni markdown alrededor).
+- Derivar actores, sistemas externos y contenedores de los bounded contexts, trust boundaries y decisiones del Strategic Design.
+- Mantener los diagramas consistentes con el stack y los componentes descritos en este documento.
+- En el cuerpo del documento `system.md`, referenciar ambos diagramas mediante enlaces relativos (por ejemplo: `Ver diagrama de contexto: [SDD-[proyecto]-c4-context.mmd](diagrams/SDD-[proyecto]-c4-context.mmd)`) y describir brevemente en prosa qué muestra cada uno.
+- NO incrustar el contenido completo del diagrama dentro del `.md`; solo referenciarlo y resumirlo.
+
 ---
 
 ### 3. Stack Tecnológico
@@ -263,29 +282,41 @@ Definir módulos internos del sistema.
 
 ### 1. Diseño de APIs
 
-Documentar endpoints y contratos principales.
+El diseño de APIs se documenta como una **especificación Swagger/OpenAPI** en un archivo independiente, y se referencia desde este documento.
 
-# FORMATO OBLIGATORIO
+# ARCHIVO INDEPENDIENTE OBLIGATORIO
 
-## [MÉTODO] /api/[recurso]
+Genera la especificación completa en formato **OpenAPI 3.0 (YAML)**:
 
-Descripción:
-[Qué hace este endpoint.]
+- `docs/design/api/SDD-[proyecto]-openapi.yaml`
 
-Request:
-- [campo 1]: [tipo]
-- [campo 2]: [tipo]
+# CONTENIDO DE LA ESPECIFICACIÓN OPENAPI
 
-Response:
-- [campo 1]: [tipo]
-- [campo 2]: [tipo]
+- `openapi: 3.0.3` y bloque `info` (título, versión, descripción del proyecto).
+- `servers` con los ambientes relevantes (dev/staging/prod) según la infraestructura.
+- `tags` que agrupen los endpoints por bounded context o módulo.
+- `paths` con los endpoints principales: método, descripción, parámetros, `requestBody` y `responses` (incluyendo códigos de error relevantes).
+- `components/schemas` con los modelos de request/response derivados de las entidades del dominio.
+- `components/securitySchemes` coherente con el diseño de seguridad técnica (por ejemplo JWT/Bearer, OAuth2).
 
-# REGLAS
+# REGLAS PARA EL ARCHIVO OPENAPI
 
-- Mantener nivel high-level.
-- NO generar OpenAPI completo.
-- NO generar código.
-- Agrupar endpoints por bounded context o módulo.
+- El archivo `.yaml` contiene ÚNICAMENTE la especificación OpenAPI válida (sin markdown ni texto externo).
+- Agrupar endpoints por bounded context o módulo usando `tags`.
+- Alinear los `securitySchemes` con el modelo de autenticación/autorización del Strategic Design.
+- Mantener nivel de diseño (contratos), no incluir implementación.
+
+# REFERENCIA EN EL DOCUMENTO
+
+En el cuerpo de `design.md`, esta sección debe:
+
+- enlazar la especificación mediante ruta relativa (por ejemplo: `Especificación completa: [SDD-[proyecto]-openapi.yaml](api/SDD-[proyecto]-openapi.yaml)`),
+- resumir en una tabla los endpoints principales agrupados por bounded context.
+
+# FORMATO DE LA TABLA RESUMEN
+
+| Bounded Context | Método | Ruta | Descripción |
+|---|---|---|---|
 
 ---
 
@@ -384,6 +415,24 @@ Describir:
 - Mantener enfoque práctico.
 - No entrar en configuración excesiva.
 
+# INFRAESTRUCTURA BASE COMO CÓDIGO (TERRAFORM)
+
+Esta sección debe indicar que la infraestructura base del proyecto se aprovisiona con el script de Terraform del repositorio:
+
+- `.claude/scripts/base-infrastructure-builder.sh`
+
+Este script genera el árbol Terraform multi-ambiente (`dev`/`staging`/`prod`) para:
+
+- **Frontend**: proyecto y despliegues en Vercel (provider `vercel`).
+- **Backend (AWS)**: EKS, RDS (PostgreSQL), IAM, Cognito, API Gateway, Secrets Manager y ECR.
+
+# REGLAS PARA LA REFERENCIA AL SCRIPT
+
+- Referenciar el script por su ruta relativa: `.claude/scripts/base-infrastructure-builder.sh`.
+- Indicar que se ejecuta tras completar la etapa de Diseño Técnico, usando las decisiones de este documento (`infrastructure.md`) como insumos.
+- Documentar en la tabla de componentes la correspondencia entre las decisiones de infraestructura del diseño y los recursos que genera el script (Vercel, EKS, RDS, Cognito, API Gateway, Secrets Manager, ECR).
+- Si una decisión técnica del diseño difiere de lo que provisiona el script por defecto, indicarlo explícitamente como ajuste requerido.
+
 ---
 
 ### 2. Observabilidad y Monitoreo
@@ -480,16 +529,23 @@ Concluir:
 Indicar que la siguiente etapa del SDLC es:
 Desarrollo / Implementación.
 
+Incluir como paso operativo el aprovisionamiento de la infraestructura base mediante el script de Terraform del repositorio:
+- `.claude/scripts/base-infrastructure-builder.sh`
+
+ejecutado con las decisiones de infraestructura definidas en `infrastructure.md` como insumos.
+
 ---
 
 # REGLAS IMPORTANTES
 
-- NO generar UML excesivo.
-- NO generar diagramas gráficos.
+- SÍ generar los diagramas C4 de contexto y de contenedores en formato Mermaid, como archivos `.mmd` independientes.
+- SÍ generar la especificación de APIs en formato Swagger/OpenAPI 3.0 (YAML), como archivo independiente.
+- NO incrustar el contenido de los diagramas Mermaid ni de la especificación OpenAPI dentro de los `.md`; solo referenciarlos.
+- NO generar UML excesivo ni otros diagramas gráficos fuera de los C4 indicados.
 - NO generar código.
 - NO generar implementación detallada.
 - NO generar configuración DevOps completa.
-- NO generar schemas exhaustivos.
+- NO generar schemas exhaustivos más allá de los necesarios para el contrato OpenAPI.
 - NO generar documentación burocrática innecesaria.
 
 # EXPECTATIVAS DE CALIDAD
@@ -512,16 +568,21 @@ El resultado debe parecer escrito por:
 
 # REQUERIMIENTOS DE SALIDA
 
-- Genera ÚNICAMENTE contenido Markdown para cada documento.
+- Genera contenido Markdown limpio para los tres documentos `.md`.
+- Los archivos `.mmd` contienen ÚNICAMENTE el diagrama Mermaid; el archivo `.yaml` contiene ÚNICAMENTE la especificación OpenAPI.
 - No incluyas explicaciones externas entre documentos.
 - No envuelvas la salida en bloques de código salvo que se solicite explícitamente.
 - Mantén Markdown limpio y correctamente estructurado en cada archivo.
-- Guarda los tres documentos en la carpeta `docs/design/` usando la herramienta Write:
+- Guarda los documentos y artefactos usando la herramienta Write:
   - `docs/design/SDD-[nombre-proyecto]-system.md`
   - `docs/design/SDD-[nombre-proyecto]-design.md`
   - `docs/design/SDD-[nombre-proyecto]-infrastructure.md`
-- Genera los tres documentos en ese orden.
-- Al finalizar, informa al usuario las tres rutas donde fueron guardados los documentos.
+  - `docs/design/diagrams/SDD-[nombre-proyecto]-c4-context.mmd`
+  - `docs/design/diagrams/SDD-[nombre-proyecto]-c4-container.mmd`
+  - `docs/design/api/SDD-[nombre-proyecto]-openapi.yaml`
+- Genera primero los archivos independientes (`.mmd` y `.yaml`) y luego los tres documentos `.md`, asegurando que las referencias relativas a los artefactos sean correctas.
+- Verifica que `system.md` referencie ambos diagramas C4 y que `design.md` referencie la especificación OpenAPI.
+- Al finalizar, informa al usuario todas las rutas donde fueron guardados los documentos y artefactos.
 
 ---
 
