@@ -25,6 +25,28 @@ def get_yaml_content(database: str, messaging_system: str) -> str:
             "    password: ${RABBITMQ_PASSWORD}",
         ]
 
+    if messaging_system.lower() in ("kafka-producer", "kafka-consumer"):
+        lines += [
+            "  kafka:",
+            "    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS}",
+        ]
+        if messaging_system.lower() == "kafka-producer":
+            lines += [
+                "    producer:",
+                "      key-serializer: org.apache.kafka.common.serialization.StringSerializer",
+                "      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer",
+            ]
+        else:
+            lines += [
+                "    consumer:",
+                "      group-id: ${KAFKA_CONSUMER_GROUP_ID}",
+                "      auto-offset-reset: earliest",
+                "      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer",
+                "      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer",
+                "      properties:",
+                "        spring.json.trusted.packages: '*'",
+            ]
+
     lines += ["server:", "  port: ${SERVER_PORT}"]
     return "\n".join(lines) + "\n"
 
@@ -60,6 +82,20 @@ def get_env_content(project_name: str, database: str, messaging_system: str) -> 
             "RABBITMQ_PASSWORD=guest",
         ]
 
+    if messaging_system.lower() == "kafka-producer":
+        lines += [
+            "",
+            "# Kafka",
+            "KAFKA_BOOTSTRAP_SERVERS=localhost:9092",
+        ]
+    elif messaging_system.lower() == "kafka-consumer":
+        lines += [
+            "",
+            "# Kafka",
+            "KAFKA_BOOTSTRAP_SERVERS=localhost:9092",
+            "KAFKA_CONSUMER_GROUP_ID=my-group",
+        ]
+
     return "\n".join(lines) + "\n"
 
 
@@ -92,6 +128,20 @@ def get_env_example_content(project_name: str, database: str, messaging_system: 
             "RABBITMQ_PASSWORD=",
         ]
 
+    if messaging_system.lower() == "kafka-producer":
+        lines += [
+            "",
+            "# Kafka",
+            "KAFKA_BOOTSTRAP_SERVERS=localhost:9092",
+        ]
+    elif messaging_system.lower() == "kafka-consumer":
+        lines += [
+            "",
+            "# Kafka",
+            "KAFKA_BOOTSTRAP_SERVERS=localhost:9092",
+            "KAFKA_CONSUMER_GROUP_ID=",
+        ]
+
     return "\n".join(lines) + "\n"
 
 
@@ -112,6 +162,14 @@ def get_dockerfile_content(database: str, messaging_system: str) -> str:
     elif messaging_system.lower() == "rabbit-consumer":
         copy_poms.append(
             "COPY infrastructure/entry-points/rabbit-consumer/pom.xml infrastructure/entry-points/rabbit-consumer/"
+        )
+    elif messaging_system.lower() == "kafka-producer":
+        copy_poms.append(
+            "COPY infrastructure/driven-adapters/kafka-producer/pom.xml infrastructure/driven-adapters/kafka-producer/"
+        )
+    elif messaging_system.lower() == "kafka-consumer":
+        copy_poms.append(
+            "COPY infrastructure/entry-points/kafka-consumer/pom.xml infrastructure/entry-points/kafka-consumer/"
         )
 
     copy_poms_str = "\n".join(copy_poms)
@@ -161,7 +219,10 @@ def get_jenkinsfile_content(project_name: str, database: str) -> str:
 // efímero en EKS (definido en org/flexicredit/podBackend.yaml de la Shared
 // Library), por lo que el workspace se comparte entre stages sin stash/unstash.
 // El pod usa el ServiceAccount 'jenkins-agent' (IRSA) para autenticar kaniko
-// (push a ECR) y el deploy (aws eks get-token → helm/kubectl).
+// (push a ECR). El despliegue NO ocurre aquí: este pipeline es CI y su frontera
+// con el CD es escribir el nuevo image tag en Git (bumpImageTag). El CD lo hace
+// ArgoCD por GitOps (auto-sync en dev/staging; sync manual en prod). Ver el
+// módulo Terraform 'argocd'.
 // ───────────────────────────────────────────────────────────────────────────
 
 pipeline {
@@ -249,36 +310,30 @@ pipeline {
             steps { scanImage(ecrRepo: env.ECR_REPO, imageTag: env.IMAGE_TAG) }
         }
 
-        // 8 — Aprobación manual antes de producción.
-        stage('Approval (prod)') {
-            when { expression { env.DEPLOY_ENV == 'prod' } }
+        // 8 — Frontera CI → CD. Escribe image.repository/tag en
+        //     helm/<service>/values-<env>.yaml y commitea (GitOps). NO despliega:
+        //     ArgoCD detecta el commit y sincroniza el cluster. La aprobación de
+        //     prod ya no vive aquí, sino como sync manual en la UI de ArgoCD.
+        stage('Update GitOps (image tag)') {
             steps {
-                timeout(time: 30, unit: 'MINUTES') {
-                    input message: "Aprobar despliegue de ${env.SERVICE_NAME}:${env.IMAGE_TAG} a PROD",
-                          ok: 'Desplegar',
-                          submitter: 'release-managers'
-                }
-            }
-        }
-
-        // 9 — helm upgrade --install con valores por ambiente. ≥ 2 réplicas en prod.
-        stage('Deploy a EKS') {
-            steps {
-                deployToEks(
-                    service:   env.SERVICE_NAME,
-                    namespace: env.K8S_NAMESPACE,
-                    env:       env.DEPLOY_ENV,
-                    imageTag:  env.IMAGE_TAG
+                bumpImageTag(
+                    service:  env.SERVICE_NAME,
+                    env:      env.DEPLOY_ENV,
+                    imageTag: env.IMAGE_TAG
                 )
             }
         }
 
-        // 10 — Verificación post-deploy contra /actuator/health/readiness.
+        // 9 — Verificación post-sync contra /actuator/health/readiness. Solo en
+        //     ambientes con auto-sync (dev/staging); en prod el sync es manual en
+        //     ArgoCD, así que el pipeline no espera el despliegue aquí.
         stage('Smoke Tests') {
+            when { expression { env.DEPLOY_ENV != 'prod' } }
             steps {
                 runSmokeTests(
                     service:   env.SERVICE_NAME,
-                    namespace: env.K8S_NAMESPACE
+                    namespace: env.K8S_NAMESPACE,
+                    imageTag:  env.IMAGE_TAG
                 )
             }
         }
@@ -323,12 +378,13 @@ appVersion: "0.1.0"
 """
 
     values_yaml = """\
-# Valores base. image.repository e image.tag los inyecta el pipeline (--set).
+# Valores base. En GitOps, image.repository/tag se fijan por ambiente en
+# values-<env>.yaml (los escribe el paso bumpImageTag de Jenkins y los lee ArgoCD).
 replicaCount: 1
 
 image:
-  repository: ""   # <registry>/<service> (inyectado por Jenkins)
-  tag: ""          # <version>-<sha> inmutable (inyectado por Jenkins)
+  repository: ""   # <registry>/<service> — definido en values-<env>.yaml
+  tag: ""          # <version>-<sha> inmutable — definido en values-<env>.yaml
   pullPolicy: IfNotPresent
 
 service:
@@ -352,7 +408,15 @@ env: []
 """
 
     # Overrides por ambiente. prod escala a >=2 réplicas (alta disponibilidad).
-    values_dev = """\
+    # El bloque image es la fuente de verdad de GitOps: bumpImageTag (Jenkins)
+    # reescribe repository/tag y ArgoCD sincroniza el cluster con estos valores.
+    image_block = """\
+# image.repository / image.tag los fija el pipeline (bumpImageTag); ArgoCD los lee.
+image:
+  repository: ""
+  tag: ""
+"""
+    values_dev = image_block + """\
 replicaCount: 1
 resources:
   requests:
@@ -362,10 +426,10 @@ resources:
     cpu: 500m
     memory: 512Mi
 """
-    values_staging = """\
+    values_staging = image_block + """\
 replicaCount: 2
 """
-    values_prod = """\
+    values_prod = image_block + """\
 replicaCount: 3
 resources:
   requests:
@@ -469,6 +533,10 @@ def get_root_pom(project_name: str, database: str, messaging_system: str) -> str
         modules.append("infrastructure/driven-adapters/rabbit-producer")
     elif messaging_system.lower() == "rabbit-consumer":
         modules.append("infrastructure/entry-points/rabbit-consumer")
+    elif messaging_system.lower() == "kafka-producer":
+        modules.append("infrastructure/driven-adapters/kafka-producer")
+    elif messaging_system.lower() == "kafka-consumer":
+        modules.append("infrastructure/entry-points/kafka-consumer")
 
     modules_xml = "\n".join(f"                <module>{m}</module>" for m in modules)
 
@@ -571,6 +639,17 @@ def get_module_pom(parent_artifact_id: str, safe_project_name: str, module_path:
     <artifactId>spring-boot-starter-webflux</artifactId>
 </dependency>
 """
+        elif module_path.endswith("/kafka-producer"):
+            deps = """\
+<dependency>
+    <groupId>org.springframework.kafka</groupId>
+    <artifactId>spring-kafka</artifactId>
+</dependency>
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-webflux</artifactId>
+</dependency>
+"""
         else:
             deps = """\
 <dependency>
@@ -603,6 +682,17 @@ def get_module_pom(parent_artifact_id: str, safe_project_name: str, module_path:
 <dependency>
     <groupId>org.springframework.boot</groupId>
     <artifactId>spring-boot-starter-amqp</artifactId>
+</dependency>
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-webflux</artifactId>
+</dependency>
+"""
+    elif module_path == "infrastructure/entry-points/kafka-consumer":
+        deps = """\
+<dependency>
+    <groupId>org.springframework.kafka</groupId>
+    <artifactId>spring-kafka</artifactId>
 </dependency>
 <dependency>
     <groupId>org.springframework.boot</groupId>
@@ -777,6 +867,174 @@ public class MessageListener {{
     logger.info("Módulo rabbit-consumer generado")
 
 
+def create_kafka_producer_files(root: Path, safe_project_name: str) -> None:
+    module_path = "infrastructure/driven-adapters/kafka-producer"
+    module_name = "kafkaproducer"
+    base_package = f"com.{safe_project_name}.{module_name}"
+    package_path = "/src/main/java/" + base_package.replace(".", "/")
+
+    logger.debug("Generando archivos Kafka producer en: %s", module_path)
+
+    config_class = f"""\
+package {base_package};
+
+import org.apache.kafka.clients.producer.ProducerConfig;
+import org.apache.kafka.common.serialization.StringSerializer;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.kafka.core.DefaultKafkaProducerFactory;
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.kafka.core.ProducerFactory;
+import org.springframework.kafka.support.serializer.JsonSerializer;
+
+import java.util.HashMap;
+import java.util.Map;
+
+@Configuration
+public class KafkaProducerConfig {{
+
+    @Value("${{spring.kafka.bootstrap-servers}}")
+    private String bootstrapServers;
+
+    @Bean
+    public ProducerFactory<String, Object> producerFactory() {{
+        Map<String, Object> props = new HashMap<>();
+        props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
+        props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
+        props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, JsonSerializer.class);
+        return new DefaultKafkaProducerFactory<>(props);
+    }}
+
+    @Bean
+    public KafkaTemplate<String, Object> kafkaTemplate() {{
+        return new KafkaTemplate<>(producerFactory());
+    }}
+}}
+"""
+
+    publisher = f"""\
+package {base_package};
+
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.stereotype.Component;
+import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Schedulers;
+
+@Component
+public class MessageProducer {{
+
+    public static final String TOPIC = "messages";
+
+    private final KafkaTemplate<String, Object> kafkaTemplate;
+
+    public MessageProducer(KafkaTemplate<String, Object> kafkaTemplate) {{
+        this.kafkaTemplate = kafkaTemplate;
+    }}
+
+    public Mono<Void> send(Object message) {{
+        return Mono.fromFuture(() -> kafkaTemplate.send(TOPIC, message).toCompletableFuture())
+                .subscribeOn(Schedulers.boundedElastic())
+                .then();
+    }}
+}}
+"""
+
+    pkg_dir = root / (module_path + package_path)
+    pkg_dir.mkdir(parents=True, exist_ok=True)
+    (pkg_dir / "KafkaProducerConfig.java").write_text(config_class)
+    logger.debug("Archivo creado: %s/KafkaProducerConfig.java", pkg_dir)
+    (pkg_dir / "MessageProducer.java").write_text(publisher)
+    logger.debug("Archivo creado: %s/MessageProducer.java", pkg_dir)
+    logger.info("Módulo kafka-producer generado")
+
+
+def create_kafka_consumer_files(root: Path, safe_project_name: str) -> None:
+    module_path = "infrastructure/entry-points/kafka-consumer"
+    module_name = "kafkaconsumer"
+    base_package = f"com.{safe_project_name}.{module_name}"
+    package_path = "/src/main/java/" + base_package.replace(".", "/")
+
+    logger.debug("Generando archivos Kafka consumer en: %s", module_path)
+
+    config_class = f"""\
+package {base_package};
+
+import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.apache.kafka.common.serialization.StringDeserializer;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.kafka.annotation.EnableKafka;
+import org.springframework.kafka.config.ConcurrentKafkaListenerContainerFactory;
+import org.springframework.kafka.core.ConsumerFactory;
+import org.springframework.kafka.core.DefaultKafkaConsumerFactory;
+import org.springframework.kafka.support.serializer.JsonDeserializer;
+
+import java.util.HashMap;
+import java.util.Map;
+
+@EnableKafka
+@Configuration
+public class KafkaConsumerConfig {{
+
+    @Value("${{spring.kafka.bootstrap-servers}}")
+    private String bootstrapServers;
+
+    @Value("${{spring.kafka.consumer.group-id}}")
+    private String groupId;
+
+    @Bean
+    public ConsumerFactory<String, Object> consumerFactory() {{
+        Map<String, Object> props = new HashMap<>();
+        props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
+        props.put(ConsumerConfig.GROUP_ID_CONFIG, groupId);
+        props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
+        props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
+        props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, JsonDeserializer.class);
+        props.put(JsonDeserializer.TRUSTED_PACKAGES, "*");
+        return new DefaultKafkaConsumerFactory<>(props);
+    }}
+
+    @Bean
+    public ConcurrentKafkaListenerContainerFactory<String, Object> kafkaListenerContainerFactory() {{
+        ConcurrentKafkaListenerContainerFactory<String, Object> factory =
+                new ConcurrentKafkaListenerContainerFactory<>();
+        factory.setConsumerFactory(consumerFactory());
+        return factory;
+    }}
+}}
+"""
+
+    listener = f"""\
+package {base_package};
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.kafka.annotation.KafkaListener;
+import org.springframework.stereotype.Component;
+
+@Component
+public class MessageConsumer {{
+
+    private static final Logger log = LoggerFactory.getLogger(MessageConsumer.class);
+
+    @KafkaListener(topics = "messages", groupId = "${{spring.kafka.consumer.group-id}}")
+    public void handleMessage(Object message) {{
+        log.info("Mensaje recibido: {{}}", message);
+    }}
+}}
+"""
+
+    pkg_dir = root / (module_path + package_path)
+    pkg_dir.mkdir(parents=True, exist_ok=True)
+    (pkg_dir / "KafkaConsumerConfig.java").write_text(config_class)
+    logger.debug("Archivo creado: %s/KafkaConsumerConfig.java", pkg_dir)
+    (pkg_dir / "MessageConsumer.java").write_text(listener)
+    logger.debug("Archivo creado: %s/MessageConsumer.java", pkg_dir)
+    logger.info("Módulo kafka-consumer generado")
+
+
 def scaffold(project_name: str, database: str, messaging_system: str) -> None:
     safe_name = project_name.replace("-", "")
     root = Path(project_name)
@@ -802,6 +1060,12 @@ def scaffold(project_name: str, database: str, messaging_system: str) -> None:
     elif messaging_system.lower() == "rabbit-consumer":
         modules.append("infrastructure/entry-points/rabbit-consumer")
         logger.debug("Mensajería habilitada: rabbit-consumer")
+    elif messaging_system.lower() == "kafka-producer":
+        modules.append("infrastructure/driven-adapters/kafka-producer")
+        logger.debug("Mensajería habilitada: kafka-producer")
+    elif messaging_system.lower() == "kafka-consumer":
+        modules.append("infrastructure/entry-points/kafka-consumer")
+        logger.debug("Mensajería habilitada: kafka-consumer")
 
     logger.info("Módulos a generar: %d", len(modules))
 
@@ -898,6 +1162,10 @@ public class ApplicationConfig {{
         create_rabbit_producer_files(root, safe_name)
     elif messaging_system.lower() == "rabbit-consumer":
         create_rabbit_consumer_files(root, safe_name)
+    elif messaging_system.lower() == "kafka-producer":
+        create_kafka_producer_files(root, safe_name)
+    elif messaging_system.lower() == "kafka-consumer":
+        create_kafka_consumer_files(root, safe_name)
 
     (root / ".env").write_text(get_env_content(project_name, database, messaging_system))
     logger.debug(".env creado")
@@ -956,6 +1224,8 @@ def _print_run_instructions(project_name: str, root: Path, messaging_system: str
     rabbit_note = ""
     if messaging_system.lower() in ("rabbit-producer", "rabbit-consumer"):
         rabbit_note = "\n  # Asegúrate de tener RabbitMQ corriendo antes de iniciar:\n  docker run -d --name rabbitmq -p 5672:5672 -p 15672:15672 rabbitmq:3-management\n"
+    elif messaging_system.lower() in ("kafka-producer", "kafka-consumer"):
+        rabbit_note = "\n  # Asegúrate de tener Kafka corriendo antes de iniciar:\n  docker run -d --name kafka -p 9092:9092 -e KAFKA_CFG_NODE_ID=0 -e KAFKA_CFG_PROCESS_ROLES=controller,broker -e KAFKA_CFG_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093 -e KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT -e KAFKA_CFG_CONTROLLER_QUORUM_VOTERS=0@kafka:9093 -e KAFKA_CFG_CONTROLLER_LISTENER_NAMES=CONTROLLER bitnami/kafka:latest\n"
 
     instructions = f"""
 ╔══════════════════════════════════════════════════════════════════════╗
@@ -1013,7 +1283,7 @@ def main() -> None:
     parser.add_argument("-d", "--database", required=True, default="postgres",
                         choices=["postgres", "mongo"], help="Base de datos a configurar")
     parser.add_argument("-m", "--messaging-system", default="none",
-                        choices=["none", "rabbit-producer", "rabbit-consumer"],
+                        choices=["none", "rabbit-producer", "rabbit-consumer", "kafka-producer", "kafka-consumer"],
                         help="Sistema de mensajería a configurar")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Mostrar logs detallados (DEBUG)")

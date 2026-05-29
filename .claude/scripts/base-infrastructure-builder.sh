@@ -79,9 +79,13 @@ mkdir -p \
   "$TF_BACKEND/modules/ecr" \
   "$TF_BACKEND/modules/mongodb" \
   "$TF_BACKEND/modules/jenkins" \
+  "$TF_BACKEND/modules/msk" \
+  "$TF_BACKEND/modules/argocd" \
   "$TF_BACKEND/environments/dev" \
   "$TF_BACKEND/environments/staging" \
-  "$TF_BACKEND/environments/prod"
+  "$TF_BACKEND/environments/staging/argocd-bootstrap" \
+  "$TF_BACKEND/environments/prod" \
+  "$TF_BACKEND/environments/prod/argocd-bootstrap"
 
 # ===========================================================================
 # FRONTEND — provider Vercel
@@ -2117,6 +2121,396 @@ EOF
 log_ok "Módulo Jenkins listo."
 
 # ===========================================================================
+# BACKEND — módulo MSK (Amazon Managed Streaming for Apache Kafka)
+# ===========================================================================
+
+log "Escribiendo módulo MSK..."
+
+cat > "$TF_BACKEND/modules/msk/main.tf" << 'EOF'
+locals {
+  replication_factor  = var.number_of_broker_nodes > 1 ? 2 : 1
+  min_insync_replicas = var.environment == "prod" ? 2 : 1
+  log_retention_days  = var.environment == "dev" ? 7 : 30
+}
+
+resource "aws_security_group" "msk" {
+  name        = "${var.project_name}-${var.environment}-msk"
+  description = "Security group para el cluster MSK"
+  vpc_id      = var.vpc_id
+
+  ingress {
+    from_port   = 9092
+    to_port     = 9092
+    protocol    = "tcp"
+    cidr_blocks = [var.vpc_cidr]
+    description = "Kafka plaintext desde la VPC"
+  }
+
+  ingress {
+    from_port   = 9094
+    to_port     = 9094
+    protocol    = "tcp"
+    cidr_blocks = [var.vpc_cidr]
+    description = "Kafka TLS desde la VPC"
+  }
+
+  ingress {
+    from_port   = 9096
+    to_port     = 9096
+    protocol    = "tcp"
+    cidr_blocks = [var.vpc_cidr]
+    description = "Kafka SASL/SCRAM desde la VPC"
+  }
+
+  ingress {
+    from_port   = 2181
+    to_port     = 2181
+    protocol    = "tcp"
+    cidr_blocks = [var.vpc_cidr]
+    description = "ZooKeeper desde la VPC"
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Environment = var.environment
+    Project     = var.project_name
+  }
+}
+
+resource "aws_cloudwatch_log_group" "msk_broker" {
+  name              = "/aws/msk/${var.project_name}-${var.environment}/broker"
+  retention_in_days = local.log_retention_days
+
+  tags = {
+    Environment = var.environment
+    Project     = var.project_name
+  }
+}
+
+resource "aws_msk_configuration" "main" {
+  name           = "${var.project_name}-${var.environment}"
+  kafka_versions = [var.kafka_version]
+  description    = "Configuración broker MSK para ${var.project_name} ${var.environment}"
+
+  server_properties = <<-PROPS
+auto.create.topics.enable=false
+default.replication.factor=${local.replication_factor}
+min.insync.replicas=${local.min_insync_replicas}
+num.partitions=3
+log.retention.hours=${var.environment == "dev" ? 24 : 168}
+PROPS
+}
+
+resource "aws_msk_cluster" "main" {
+  cluster_name           = "${var.project_name}-${var.environment}"
+  kafka_version          = var.kafka_version
+  number_of_broker_nodes = var.number_of_broker_nodes
+
+  broker_node_group_info {
+    # Un broker por subnet; las subnets deben estar en AZs distintas.
+    instance_type  = var.broker_instance_type
+    client_subnets = slice(var.subnet_ids, 0, var.number_of_broker_nodes)
+    storage_info {
+      ebs_storage_info {
+        volume_size = var.broker_ebs_volume_size
+      }
+    }
+    security_groups = [aws_security_group.msk.id]
+  }
+
+  encryption_info {
+    encryption_in_transit {
+      client_broker = var.environment == "dev" ? "TLS_PLAINTEXT" : "TLS"
+      in_cluster    = true
+    }
+  }
+
+  configuration_info {
+    arn      = aws_msk_configuration.main.arn
+    revision = aws_msk_configuration.main.latest_revision
+  }
+
+  logging_info {
+    broker_logs {
+      cloudwatch_logs {
+        enabled   = true
+        log_group = aws_cloudwatch_log_group.msk_broker.name
+      }
+    }
+  }
+
+  open_monitoring {
+    prometheus {
+      jmx_exporter { enabled_in_broker = true }
+      node_exporter { enabled_in_broker = true }
+    }
+  }
+
+  tags = {
+    Environment = var.environment
+    Project     = var.project_name
+  }
+}
+
+# Política IAM para producir/consumir desde microservicios vía autenticación IAM.
+resource "aws_iam_policy" "msk_access" {
+  name        = "${var.project_name}-${var.environment}-msk-access"
+  description = "Permite a los microservicios producir y consumir en el cluster MSK"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "MSKClusterConnect"
+        Effect = "Allow"
+        Action = [
+          "kafka-cluster:Connect",
+          "kafka-cluster:DescribeCluster"
+        ]
+        Resource = aws_msk_cluster.main.arn
+      },
+      {
+        Sid    = "MSKTopicReadWrite"
+        Effect = "Allow"
+        Action = [
+          "kafka-cluster:CreateTopic",
+          "kafka-cluster:DescribeTopic",
+          "kafka-cluster:WriteData",
+          "kafka-cluster:ReadData"
+        ]
+        Resource = "arn:aws:kafka:*:*:topic/${aws_msk_cluster.main.cluster_name}/*/*"
+      },
+      {
+        Sid    = "MSKConsumerGroup"
+        Effect = "Allow"
+        Action = [
+          "kafka-cluster:AlterGroup",
+          "kafka-cluster:DescribeGroup"
+        ]
+        Resource = "arn:aws:kafka:*:*:group/${aws_msk_cluster.main.cluster_name}/*/*"
+      }
+    ]
+  })
+}
+EOF
+
+cat > "$TF_BACKEND/modules/msk/variables.tf" << 'EOF'
+variable "project_name" {
+  description = "Prefijo del proyecto"
+  type        = string
+}
+
+variable "environment" {
+  description = "Nombre del ambiente (dev/staging/prod)"
+  type        = string
+}
+
+variable "vpc_id" {
+  description = "ID de la VPC"
+  type        = string
+}
+
+variable "vpc_cidr" {
+  description = "CIDR de la VPC (acceso a los puertos Kafka/ZooKeeper)"
+  type        = string
+}
+
+variable "subnet_ids" {
+  description = "Subnets privadas; se necesita una por broker node (AZs distintas)"
+  type        = list(string)
+}
+
+variable "kafka_version" {
+  description = "Versión de Apache Kafka"
+  type        = string
+  default     = "3.7.x"
+}
+
+variable "number_of_broker_nodes" {
+  description = "Número de brokers del cluster (debe ser múltiplo del número de AZs)"
+  type        = number
+  default     = 2
+}
+
+variable "broker_instance_type" {
+  description = "Tipo de instancia MSK para los brokers"
+  type        = string
+  default     = "kafka.t3.small"
+}
+
+variable "broker_ebs_volume_size" {
+  description = "Tamaño del volumen EBS por broker en GB"
+  type        = number
+  default     = 20
+}
+EOF
+
+cat > "$TF_BACKEND/modules/msk/outputs.tf" << 'EOF'
+output "cluster_arn" {
+  description = "ARN del cluster MSK"
+  value       = aws_msk_cluster.main.arn
+}
+
+output "cluster_name" {
+  description = "Nombre del cluster MSK"
+  value       = aws_msk_cluster.main.cluster_name
+}
+
+output "bootstrap_brokers" {
+  description = "Lista de brokers Kafka en texto plano (para conexiones internas en dev)"
+  value       = aws_msk_cluster.main.bootstrap_brokers
+}
+
+output "bootstrap_brokers_tls" {
+  description = "Lista de brokers Kafka con TLS"
+  value       = aws_msk_cluster.main.bootstrap_brokers_tls
+}
+
+output "zookeeper_connect_string" {
+  description = "String de conexión a ZooKeeper"
+  value       = aws_msk_cluster.main.zookeeper_connect_string
+}
+
+output "security_group_id" {
+  description = "ID del SG del cluster MSK (añadir a los microservicios que lo consuman)"
+  value       = aws_security_group.msk.id
+}
+
+output "msk_access_policy_arn" {
+  description = "ARN de la política IAM para producir/consumir en MSK (adjuntar al task role)"
+  value       = aws_iam_policy.msk_access.arn
+}
+
+output "cloudwatch_log_group" {
+  description = "Nombre del log group de CloudWatch para los brokers MSK"
+  value       = aws_cloudwatch_log_group.msk_broker.name
+}
+EOF
+
+log_ok "Módulo MSK listo."
+
+# ===========================================================================
+# BACKEND — módulo ArgoCD (CD por GitOps sobre EKS)
+# ===========================================================================
+#
+# Instala ArgoCD en el cluster EKS vía Helm (provider helm). El CD es GitOps:
+# ArgoCD observa helm/<service>/values-<env>.yaml en los repos de los servicios
+# y sincroniza el cluster. Jenkins solo escribe el image tag (bumpImageTag).
+#
+# Los AppProject/ApplicationSet y las credenciales de repo se entregan como
+# manifiestos en environments/<env>/argocd-bootstrap/ (se aplican con kubectl
+# una vez que el cluster + ArgoCD están arriba), igual que el bootstrap RBAC de
+# Jenkins. Solo aplica a staging/prod (clusters EKS reales); dev usa Floci.
+
+log "Escribiendo módulo ArgoCD..."
+
+cat > "$TF_BACKEND/modules/argocd/main.tf" << 'EOF'
+# Instalación de ArgoCD con el chart oficial argo-helm.
+# Los providers helm/kubernetes se configuran en el entorno (apuntando al EKS).
+resource "helm_release" "argocd" {
+  name             = "argocd"
+  repository       = "https://argoproj.github.io/argo-helm"
+  chart            = "argo-cd"
+  version          = var.argocd_chart_version
+  namespace        = var.namespace
+  create_namespace = true
+
+  # TLS terminado en el LoadBalancer; el server corre en modo insecure detrás de él.
+  values = [yamlencode({
+    global = {
+      domain = var.argocd_domain
+    }
+    configs = {
+      params = {
+        "server.insecure" = true
+      }
+    }
+    server = {
+      service = {
+        type = var.server_service_type
+      }
+    }
+    # En prod conviene HA; en otros ambientes, instalación mínima.
+    controller = {
+      replicas = var.environment == "prod" ? 1 : 1
+    }
+    redis-ha = {
+      enabled = var.environment == "prod"
+    }
+    repoServer = {
+      replicas = var.environment == "prod" ? 2 : 1
+    }
+  })]
+}
+EOF
+
+cat > "$TF_BACKEND/modules/argocd/variables.tf" << 'EOF'
+variable "project_name" {
+  description = "Prefijo del proyecto"
+  type        = string
+}
+
+variable "environment" {
+  description = "Nombre del ambiente (staging/prod)"
+  type        = string
+}
+
+variable "namespace" {
+  description = "Namespace donde se instala ArgoCD"
+  type        = string
+  default     = "argocd"
+}
+
+variable "argocd_chart_version" {
+  description = "Versión del chart argo-cd (argo-helm)"
+  type        = string
+  default     = "7.6.12"
+}
+
+variable "argocd_domain" {
+  description = "Dominio público de la UI de ArgoCD (informativo si se usa LoadBalancer)"
+  type        = string
+  default     = "argocd.example.com"
+}
+
+variable "server_service_type" {
+  description = "Tipo de Service del argocd-server (LoadBalancer expone una URL)"
+  type        = string
+  default     = "LoadBalancer"
+}
+EOF
+
+cat > "$TF_BACKEND/modules/argocd/outputs.tf" << 'EOF'
+output "namespace" {
+  description = "Namespace donde quedó instalado ArgoCD"
+  value       = helm_release.argocd.namespace
+}
+
+output "release_name" {
+  description = "Nombre del Helm release de ArgoCD"
+  value       = helm_release.argocd.name
+}
+
+output "admin_password_cmd" {
+  description = "Comando para leer la contraseña inicial del admin de ArgoCD"
+  value       = "kubectl -n ${helm_release.argocd.namespace} get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d"
+}
+
+output "server_url_cmd" {
+  description = "Comando para obtener la URL (hostname del LoadBalancer) del argocd-server"
+  value       = "kubectl -n ${helm_release.argocd.namespace} get svc argocd-server -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'"
+}
+EOF
+
+log_ok "Módulo ArgoCD listo."
+
+# ===========================================================================
 # BACKEND — entorno dev (Floci)
 # ===========================================================================
 
@@ -2158,6 +2552,7 @@ provider "aws" {
     secretsmanager       = "http://localhost:4566"
     ecr                  = "http://localhost:4566"
     elasticloadbalancing = "http://localhost:4566"
+    kafka                = "http://localhost:4566"
   }
 }
 EOF
@@ -2265,6 +2660,15 @@ module "jenkins" {
   eks_oidc_provider_arn = module.eks.oidc_provider_arn
   eks_oidc_issuer_host  = module.eks.oidc_issuer_host
 }
+
+module "msk" {
+  source       = "../../modules/msk"
+  environment  = local.environment
+  project_name = local.project_name
+  vpc_id       = var.vpc_id
+  vpc_cidr     = var.vpc_cidr
+  subnet_ids   = var.subnet_ids
+}
 EOF
 
 cat > "$TF_BACKEND/environments/dev/outputs.tf" << 'EOF'
@@ -2313,6 +2717,26 @@ output "jenkins_ebs_volume_id" {
   description = "ID del volumen EBS que persiste JENKINS_HOME"
   value       = module.jenkins.ebs_volume_id
 }
+
+output "msk_cluster_arn" {
+  description = "ARN del cluster MSK"
+  value       = module.msk.cluster_arn
+}
+
+output "msk_bootstrap_brokers" {
+  description = "Bootstrap brokers Kafka (plaintext, dev)"
+  value       = module.msk.bootstrap_brokers
+}
+
+output "msk_bootstrap_brokers_tls" {
+  description = "Bootstrap brokers Kafka (TLS)"
+  value       = module.msk.bootstrap_brokers_tls
+}
+
+output "msk_access_policy_arn" {
+  description = "ARN de la política IAM para adjuntar al task role de los microservicios"
+  value       = module.msk.msk_access_policy_arn
+}
 EOF
 
 # ===========================================================================
@@ -2333,11 +2757,50 @@ terraform {
       source  = "hashicorp/tls"
       version = "~> 4.0"
     }
+    helm = {
+      source  = "hashicorp/helm"
+      version = "~> 2.12"
+    }
+    kubernetes = {
+      source  = "hashicorp/kubernetes"
+      version = "~> 2.30"
+    }
   }
 }
 
 provider "aws" {
   region = var.aws_region
+}
+
+# Providers Kubernetes/Helm apuntando al cluster EKS de este ambiente (lo crea
+# module.eks). Autenticación vía exec (aws eks get-token).
+#
+# NOTA (orden de bootstrap): host/CA provienen de outputs de un recurso creado
+# en este mismo apply. En el PRIMER apply de un ambiente nuevo, crea primero el
+# cluster y luego el resto:
+#   terraform apply -target=module.eks
+#   terraform apply
+# Los applies posteriores ya no necesitan -target.
+provider "kubernetes" {
+  host                   = module.eks.cluster_endpoint
+  cluster_ca_certificate = base64decode(module.eks.cluster_ca_certificate)
+  exec {
+    api_version = "client.authentication.k8s.io/v1beta1"
+    command     = "aws"
+    args        = ["eks", "get-token", "--cluster-name", module.eks.cluster_name, "--region", var.aws_region]
+  }
+}
+
+provider "helm" {
+  kubernetes {
+    host                   = module.eks.cluster_endpoint
+    cluster_ca_certificate = base64decode(module.eks.cluster_ca_certificate)
+    exec {
+      api_version = "client.authentication.k8s.io/v1beta1"
+      command     = "aws"
+      args        = ["eks", "get-token", "--cluster-name", module.eks.cluster_name, "--region", var.aws_region]
+    }
+  }
 }
 EOF
 
@@ -2447,6 +2910,25 @@ module "jenkins" {
   eks_oidc_provider_arn = module.eks.oidc_provider_arn
   eks_oidc_issuer_host  = module.eks.oidc_issuer_host
 }
+
+module "msk" {
+  source       = "../../modules/msk"
+  environment  = local.environment
+  project_name = var.project_name
+  vpc_id       = var.vpc_id
+  vpc_cidr     = var.vpc_cidr
+  subnet_ids   = var.subnet_ids
+}
+
+# ArgoCD (CD por GitOps). Se instala en el cluster EKS de este ambiente; los
+# ApplicationSet/AppProject se aplican desde environments/$env/argocd-bootstrap/.
+module "argocd" {
+  source       = "../../modules/argocd"
+  environment  = local.environment
+  project_name = var.project_name
+
+  depends_on = [module.eks]
+}
 EOF
 
 cat > "$TF_BACKEND/environments/$env/outputs.tf" << 'EOF'
@@ -2495,6 +2977,142 @@ output "jenkins_ebs_volume_id" {
   description = "ID del volumen EBS que persiste JENKINS_HOME"
   value       = module.jenkins.ebs_volume_id
 }
+
+output "msk_cluster_arn" {
+  description = "ARN del cluster MSK"
+  value       = module.msk.cluster_arn
+}
+
+output "msk_bootstrap_brokers" {
+  description = "Bootstrap brokers Kafka (plaintext)"
+  value       = module.msk.bootstrap_brokers
+}
+
+output "msk_bootstrap_brokers_tls" {
+  description = "Bootstrap brokers Kafka (TLS)"
+  value       = module.msk.bootstrap_brokers_tls
+}
+
+output "msk_access_policy_arn" {
+  description = "ARN de la política IAM para adjuntar al task role de los microservicios"
+  value       = module.msk.msk_access_policy_arn
+}
+
+output "argocd_namespace" {
+  description = "Namespace donde quedó instalado ArgoCD"
+  value       = module.argocd.namespace
+}
+
+output "argocd_admin_password_cmd" {
+  description = "Comando para leer la contraseña inicial del admin de ArgoCD"
+  value       = module.argocd.admin_password_cmd
+}
+
+output "argocd_server_url_cmd" {
+  description = "Comando para obtener la URL (LoadBalancer) del argocd-server"
+  value       = module.argocd.server_url_cmd
+}
+EOF
+
+# --- Manifiestos bootstrap de ArgoCD por ambiente ----------------------------
+# AppProject + ApplicationSet + credenciales de repo. Se aplican una vez que el
+# cluster + ArgoCD están arriba:  kubectl apply -f environments/$env/argocd-bootstrap/
+# El syncPolicy depende del ambiente: staging = automated; prod = manual.
+
+if [ "$env" = "prod" ]; then
+  SYNC_POLICY_BLOCK="      # prod: SIN automated → sync MANUAL desde la UI de ArgoCD (gate de release).
+      syncPolicy:
+        syncOptions:
+          - CreateNamespace=true"
+else
+  SYNC_POLICY_BLOCK="      # $env: auto-sync con prune + selfHeal (corrige drift automáticamente).
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=true"
+fi
+
+cat > "$TF_BACKEND/environments/$env/argocd-bootstrap/appproject.yaml" << EOF
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: flexicredit
+  namespace: argocd
+spec:
+  description: Microservicios FlexiCredit ($env)
+  sourceRepos:
+    - '*'              # restringe a los repos de tus servicios en producción
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: '*'
+  clusterResourceWhitelist:
+    - group: '*'
+      kind: '*'
+  namespaceResourceWhitelist:
+    - group: '*'
+      kind: '*'
+EOF
+
+# ApplicationSet: una Application por servicio. Cada servicio vive en su propio
+# repo (misma fuente que el código), y ArgoCD lee helm/<service>/values-$env.yaml.
+# AÑADE un elemento por servicio (name + repoURL del repo del servicio).
+cat > "$TF_BACKEND/environments/$env/argocd-bootstrap/applicationset.yaml" << EOF
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: flexicredit-$env
+  namespace: argocd
+spec:
+  goTemplate: true
+  generators:
+    - list:
+        elements:
+          # ── Un elemento por microservicio ──────────────────────────────
+          - service: auth-svc
+            repoURL: https://github.com/<org>/auth-svc.git
+            revision: main
+          - service: user-svc
+            repoURL: https://github.com/<org>/user-svc.git
+            revision: main
+          - service: order-svc
+            repoURL: https://github.com/<org>/order-svc.git
+            revision: main
+  template:
+    metadata:
+      name: '{{.service}}-$env'
+    spec:
+      project: flexicredit
+      source:
+        repoURL: '{{.repoURL}}'
+        targetRevision: '{{.revision}}'
+        path: 'helm/{{.service}}'
+        helm:
+          valueFiles:
+            - 'values-$env.yaml'
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: $env
+$SYNC_POLICY_BLOCK
+EOF
+
+cat > "$TF_BACKEND/environments/$env/argocd-bootstrap/repo-credentials.example.yaml" << 'EOF'
+# OPCIONAL — solo si los repos de los servicios son privados.
+# Crea un Secret por repo (o usa un secret de credenciales por organización).
+# Rellena los placeholders y aplica con kubectl. ArgoCD solo necesita LECTURA.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: repo-auth-svc
+  namespace: argocd
+  labels:
+    argocd.argoproj.io/secret-type: repository
+stringData:
+  type: git
+  url: https://github.com/<org>/auth-svc.git
+  username: <git-username>
+  password: <git-token-readonly>
 EOF
 
 done

@@ -5,6 +5,12 @@
 #   - maven_hexagonal_scaffold.py  (backend)
 #   - nextjs_feature_scaffold.py   (frontend, reutiliza notify)
 #
+# Modelo CI/CD: Jenkins hace CI (build, test, scan, build & push de imagen a ECR)
+# y, en lugar de desplegar, escribe el nuevo image tag en Git (bumpImageTag).
+# ArgoCD hace CD por GitOps: observa helm/<service>/values-<env>.yaml y sincroniza
+# el cluster EKS contra el estado deseado. La instalación de ArgoCD vive en el
+# módulo Terraform 'argocd' (ver base-infrastructure-builder.sh).
+#
 # Uso:
 #   bash .claude/scripts/jenkins-shared-library-builder.sh [-o DIR] [--no-git]
 #
@@ -149,45 +155,83 @@ def call(Map args = [:]) {
 }
 EOF
 
-# deployToEks — helm upgrade --install por ambiente
-cat > "$OUT_DIR/vars/deployToEks.groovy" <<'EOF'
-// Despliegue a EKS con Helm usando los valores del ambiente.
+# bumpImageTag — actualiza el estado deseado en Git (GitOps). NO despliega.
+cat > "$OUT_DIR/vars/bumpImageTag.groovy" <<'EOF'
+// Frontera CI → CD. Tras publicar la imagen en ECR, este paso reescribe
+// image.repository / image.tag en helm/<service>/values-<env>.yaml y commitea
+// el cambio al repo del servicio. ArgoCD observa ese path y sincroniza el
+// cluster contra el nuevo estado deseado (auto-sync en dev/staging; sync manual
+// en prod). Jenkins nunca ejecuta helm/kubectl de despliegue: el CD vive en ArgoCD.
 def call(Map args = [:]) {
-    def service   = args.service   ?: error('deployToEks: falta service')
-    def namespace = args.namespace ?: error('deployToEks: falta namespace')
-    def envName   = args.env       ?: error('deployToEks: falta env')
-    def imageTag  = args.imageTag  ?: error('deployToEks: falta imageTag')
-    def registry  = env.ECR_REGISTRY    ?: error('deployToEks: falta env.ECR_REGISTRY')
-    def cluster   = env.EKS_CLUSTER_NAME ?: error('deployToEks: falta env.EKS_CLUSTER_NAME')
-    def region    = env.AWS_REGION ?: 'us-east-1'
+    def service    = args.service  ?: error('bumpImageTag: falta service')
+    def envName    = args.env      ?: error('bumpImageTag: falta env')
+    def imageTag   = args.imageTag ?: error('bumpImageTag: falta imageTag')
+    def registry   = env.ECR_REGISTRY ?: error('bumpImageTag: falta env.ECR_REGISTRY')
+    def credId     = args.credentialsId ?: env.GITOPS_CREDENTIALS_ID ?: 'gitops-git-credentials'
+    def valuesFile = "helm/${service}/values-${envName}.yaml"
 
-    container('deploy') {
-        // El acceso al API server lo autoriza el access entry del rol IRSA
-        // del agente; 'update-kubeconfig' configura el exec auth (aws eks get-token).
-        sh "aws eks update-kubeconfig --name ${cluster} --region ${region}"
-        sh """
-            helm upgrade --install ${service} ./helm/${service} \\
-              --namespace ${namespace} --create-namespace \\
-              --values ./helm/${service}/values-${envName}.yaml \\
-              --set image.repository=${registry}/${service} \\
-              --set image.tag=${imageTag} \\
-              --wait --timeout 5m
-        """
+    // Rama destino: la del build (multibranch) o la derivada de GIT_BRANCH.
+    def branch = env.BRANCH_NAME
+    if (!branch) { branch = (env.GIT_BRANCH ?: 'main').replaceFirst(/^origin\//, '') }
+
+    // yq estático: edita el YAML sin alterar el resto del archivo.
+    sh '''
+        if ! command -v yq >/dev/null 2>&1 && [ ! -x /tmp/yq ]; then
+          curl -fsSL https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -o /tmp/yq
+          chmod +x /tmp/yq
+        fi
+    '''
+    withEnv(["REPO_IMAGE=${registry}/${service}", "IMG_TAG=${imageTag}", "VALUES_FILE=${valuesFile}"]) {
+        sh '''
+            YQ=$(command -v yq || echo /tmp/yq)
+            "$YQ" -i '.image.repository = strenv(REPO_IMAGE) | .image.tag = strenv(IMG_TAG)' "$VALUES_FILE"
+        '''
+    }
+
+    withCredentials([usernamePassword(credentialsId: credId, usernameVariable: 'GIT_USER', passwordVariable: 'GIT_TOKEN')]) {
+        withEnv(["VALUES_FILE=${valuesFile}", "SVC=${service}", "ENVN=${envName}", "TAG=${imageTag}", "TARGET_BRANCH=${branch}"]) {
+            sh '''
+                git config user.email "cicd@flexicredit.local"
+                git config user.name  "FlexiCredit CI"
+                git add "$VALUES_FILE"
+                if git diff --cached --quiet; then
+                  echo "Sin cambios en $VALUES_FILE (tag ya fijado); nada que commitear."
+                  exit 0
+                fi
+                # '[skip ci]' evita que este commit de configuración re-dispare el pipeline.
+                git commit -m "ci(deploy): $SVC -> $ENVN @ $TAG [skip ci]"
+                AUTH_URL=$(git remote get-url origin | sed -E "s#https://#https://${GIT_USER}:${GIT_TOKEN}@#")
+                git push "$AUTH_URL" "HEAD:${TARGET_BRANCH}"
+            '''
+        }
     }
 }
 EOF
 
-# runSmokeTests — verificación post-deploy
+# runSmokeTests — verificación post-sync (ambientes con auto-sync)
 cat > "$OUT_DIR/vars/runSmokeTests.groovy" <<'EOF'
-// Verifica readiness del servicio desplegado.
+// Verifica readiness DESPUÉS de que ArgoCD haya sincronizado el nuevo tag.
+// Solo aplica a ambientes con auto-sync (dev/staging): primero espera a que la
+// imagen viva del deployment coincida con imageTag (evita validar la revisión
+// anterior), luego confirma el rollout y prueba el endpoint de readiness.
+// En prod el sync es manual en ArgoCD, así que el pipeline no ejecuta smoke aquí.
 def call(Map args = [:]) {
     def service   = args.service   ?: error('runSmokeTests: falta service')
     def namespace = args.namespace ?: error('runSmokeTests: falta namespace')
+    def imageTag  = args.imageTag  ?: error('runSmokeTests: falta imageTag')
     def cluster   = env.EKS_CLUSTER_NAME ?: error('runSmokeTests: falta env.EKS_CLUSTER_NAME')
     def region    = env.AWS_REGION ?: 'us-east-1'
     container('deploy') {
         sh "aws eks update-kubeconfig --name ${cluster} --region ${region}"
         sh """
+            # Espera a que ArgoCD aplique el nuevo tag (imagen viva == *:${imageTag}).
+            for i in \$(seq 1 60); do
+              CURRENT=\$(kubectl get deploy/${service} -n ${namespace} \\
+                -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true)
+              echo "Esperando sync de ArgoCD — imagen actual: \${CURRENT:-<none>} (objetivo *:${imageTag})"
+              case "\$CURRENT" in *:${imageTag}) break ;; esac
+              sleep 5
+            done
             kubectl rollout status deployment/${service} -n ${namespace} --timeout=180s
             kubectl run smoke-${BUILD_NUMBER} --rm -i --restart=Never -n ${namespace} \\
               --image=curlimages/curl:8.8.0 -- \\
@@ -433,6 +477,13 @@ credentials:
               id: "eks-kubeconfig"
               fileName: "kubeconfig"
               secretBytes: "${base64:${readFile:/var/jenkins_home/.kube/config}}"
+          # Credencial git (usuario + token) que usa bumpImageTag para hacer push
+          # del image tag al repo del servicio (estado deseado que ArgoCD observa).
+          - usernamePassword:
+              scope: GLOBAL
+              id: "gitops-git-credentials"
+              username: "${GITOPS_GIT_USERNAME}"
+              password: "${GITOPS_GIT_TOKEN}"
 
 unclassified:
   location:
@@ -488,9 +539,21 @@ con el nombre `jenkins-shared-library`, apuntando a este repositorio (rama `main
 | `runSecurityScans()` | Security Scans (OWASP + secretos) |
 | `buildAndPushImage(ecrRepo:, imageTag:)` | Build & Push Image (Kaniko → ECR) |
 | `scanImage(ecrRepo:, imageTag:)` | Image Scan (Trivy) |
-| `deployToEks(service:, namespace:, env:, imageTag:)` | Deploy a EKS (Helm) |
-| `runSmokeTests(service:, namespace:)` | Smoke Tests (readiness) |
+| `bumpImageTag(service:, env:, imageTag:)` | Update GitOps — escribe el tag en `values-<env>.yaml` y commitea (frontera CI→CD) |
+| `runSmokeTests(service:, namespace:, imageTag:)` | Smoke Tests (post-sync ArgoCD; solo no-prod) |
 | `notify(status:, service:, env:)` | Notify (Slack/email) — también usado por el frontend |
+
+## Modelo CI/CD (Jenkins = CI, ArgoCD = CD)
+
+Jenkins **no despliega**. El pipeline termina su parte de CD escribiendo el nuevo
+`image.tag` en `helm/<service>/values-<env>.yaml` (paso `bumpImageTag`) y commiteándolo
+al repo del servicio. ArgoCD observa ese path y sincroniza el cluster:
+
+- **dev/staging** → `syncPolicy.automated` (prune + selfHeal): se aplica solo al detectar el commit.
+- **prod** → sync manual en ArgoCD (reemplaza el antiguo approval de Jenkins).
+
+La instalación de ArgoCD y los `ApplicationSet`/`AppProject` los provee el módulo
+Terraform `argocd` y los manifiestos `argocd-bootstrap/` (ver `base-infrastructure-builder.sh`).
 
 ## Modelo de ejecución
 
@@ -500,12 +563,17 @@ con el nombre `jenkins-shared-library`, apuntando a este repositorio (rama `main
   el pod con `agent { kubernetes { yaml libraryResource('org/flexicredit/podBackend.yaml') } }`
   (frontend: `podFrontend.yaml`).
 - **Autenticación**: el ServiceAccount `jenkins-agent` usa IRSA. kaniko hace push
-  a ECR y `deploy` ejecuta `aws eks update-kubeconfig` (exec auth) para helm/kubectl.
+  a ECR; `bumpImageTag` hace push a Git con la credencial `gitops-git-credentials`;
+  `runSmokeTests` usa el contenedor `deploy` (`aws eks update-kubeconfig` + kubectl).
 
-## Variables de entorno esperadas (inyectadas por JCasC / infra)
+## Variables de entorno / credenciales esperadas (inyectadas por JCasC / infra)
 
 - `ECR_REGISTRY` — `<acct>.dkr.ecr.<region>.amazonaws.com`.
-- `EKS_CLUSTER_NAME`, `AWS_REGION` — usados por `deployToEks` / `runSmokeTests`.
+- `EKS_CLUSTER_NAME`, `AWS_REGION` — usados por `runSmokeTests`.
+- `gitops-git-credentials` — credencial git (usuario + token con permiso de push al
+  repo del servicio) usada por `bumpImageTag`. En el JCasC se alimenta de
+  `GITOPS_GIT_USERNAME` / `GITOPS_GIT_TOKEN`. Opcional: `GITOPS_CREDENTIALS_ID`
+  para sobreescribir el id por defecto.
 
 ## Puesta en marcha
 
@@ -514,7 +582,10 @@ con el nombre `jenkins-shared-library`, apuntando a este repositorio (rama `main
 2. Aplica `bootstrap/jenkins-agent-rbac.yaml` en el cluster (sustituyendo
    `<JENKINS_AGENT_ROLE_ARN>` por el output `agent_role_arn`).
 3. Provee las credenciales referenciadas por el JCasC: `sonar-token`,
-   `slack-token`, `vercel-*` y el kubeconfig `eks-kubeconfig`.
+   `slack-token`, `vercel-*`, el kubeconfig `eks-kubeconfig` y
+   `gitops-git-credentials` (token git con permiso de push para `bumpImageTag`).
+4. Instala ArgoCD (módulo Terraform `argocd`) y aplica los manifiestos
+   `argocd-bootstrap/` del ambiente; ArgoCD se encarga del CD por GitOps.
 
 ## Pods de agentes (`resources/org/flexicredit/`)
 
