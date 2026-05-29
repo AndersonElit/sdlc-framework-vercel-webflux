@@ -335,11 +335,65 @@ Definir:
 - consideraciones de consistencia,
 - estrategia de migraciones.
 
+# MODELO DE DATOS (ARCHIVO INDEPENDIENTE OBLIGATORIO)
+
+Además de la descripción conceptual en el cuerpo del documento, debes generar el modelo de datos como un **archivo independiente** dentro de `docs/design/database/`. El formato del artefacto depende del tipo de base de datos definido en el Strategic Design / Stack Tecnológico:
+
+## Caso A — Base de datos relacional (PostgreSQL, MySQL, etc.)
+
+Genera un script SQL de definición de esquema (DDL):
+
+- `docs/design/database/SDD-[proyecto]-schema.sql`
+
+Contenido del archivo:
+- sentencias `CREATE TABLE` para las entidades principales del dominio,
+- tipos de columna apropiados (alineados al motor: PostgreSQL, MySQL, etc.),
+- claves primarias (`PRIMARY KEY`) y claves foráneas (`FOREIGN KEY`) que reflejen las relaciones entre entidades,
+- restricciones relevantes (`NOT NULL`, `UNIQUE`, `CHECK`, defaults),
+- índices (`CREATE INDEX`) para los accesos más frecuentes,
+- comentarios SQL breves (`--`) que separen las tablas por bounded context.
+
+## Caso B — Base de datos documental (MongoDB)
+
+Genera un modelo de documentos con validadores de esquema:
+
+- `docs/design/database/SDD-[proyecto]-collections.js`
+
+Contenido del archivo:
+- una sentencia `db.createCollection("<nombre>", { ... })` por cada colección principal del dominio,
+- un validador `$jsonSchema` por colección con `bsonType`, `required` y la definición de `properties` (tipos, descripciones, enums donde aplique),
+- estrategia de referencias vs. documentos embebidos coherente con los aggregates del dominio,
+- sentencias `db.<colección>.createIndex(...)` para los accesos frecuentes y restricciones de unicidad,
+- comentarios JS breves (`//`) que separen las colecciones por bounded context.
+
+## Caso C — Persistencia poliglota
+
+Si el diseño usa más de un motor (por ejemplo PostgreSQL para un contexto y MongoDB para otro), genera ambos artefactos (`.sql` y `.js`), cada uno con solo las entidades/colecciones que le correspondan.
+
+# REGLAS PARA EL ARCHIVO DE MODELO DE DATOS
+
+- El archivo `.sql` contiene ÚNICAMENTE sentencias SQL válidas (sin markdown ni texto externo); el archivo `.js` contiene ÚNICAMENTE sentencias válidas de mongosh/MongoDB.
+- Derivar las tablas/colecciones de las entidades y aggregates del dominio definidos en el Strategic Design.
+- Reflejar las relaciones y trust boundaries del dominio (referencias, foreign keys, embedding).
+- Elegir el formato (`.sql`, `.js` o ambos) según el tipo de base de datos decidido en el Stack Tecnológico de `system.md`.
+- Mantener nivel de diseño: esquema y estructura, sin datos de prueba ni lógica de aplicación.
+
+# REFERENCIA EN EL DOCUMENTO
+
+En el cuerpo de `design.md`, esta sección debe:
+
+- enlazar el modelo de datos mediante ruta relativa (por ejemplo: `Modelo de datos: [SDD-[proyecto]-schema.sql](database/SDD-[proyecto]-schema.sql)` o `[SDD-[proyecto]-collections.js](database/SDD-[proyecto]-collections.js)`),
+- resumir en una tabla las entidades/colecciones principales agrupadas por bounded context.
+
+# FORMATO DE LA TABLA RESUMEN
+
+| Bounded Context | Entidad / Colección | Tipo de almacenamiento | Descripción |
+|---|---|---|---|
+
 # REGLAS
 
-- NO generar SQL completo.
-- NO generar schemas exhaustivos.
-- Mantener enfoque conceptual/técnico.
+- Mantener enfoque conceptual/técnico en el cuerpo del `.md`; el detalle del esquema vive en el archivo independiente.
+- NO incrustar el contenido completo del `.sql` o `.js` dentro del `.md`; solo referenciarlo y resumirlo.
 
 ---
 
@@ -540,12 +594,12 @@ ejecutado con las decisiones de infraestructura definidas en `infrastructure.md`
 
 - SÍ generar los diagramas C4 de contexto y de contenedores en formato Mermaid, como archivos `.mmd` independientes.
 - SÍ generar la especificación de APIs en formato Swagger/OpenAPI 3.0 (YAML), como archivo independiente.
-- NO incrustar el contenido de los diagramas Mermaid ni de la especificación OpenAPI dentro de los `.md`; solo referenciarlos.
+- SÍ generar el modelo de datos como archivo independiente: `.sql` (DDL) para bases relacionales o `.js` (colecciones con validadores `$jsonSchema`) para MongoDB, según el tipo de base de datos definido en el stack.
+- NO incrustar el contenido de los diagramas Mermaid, de la especificación OpenAPI ni del modelo de datos dentro de los `.md`; solo referenciarlos.
 - NO generar UML excesivo ni otros diagramas gráficos fuera de los C4 indicados.
-- NO generar código.
-- NO generar implementación detallada.
+- NO generar código de aplicación ni implementación detallada (el modelo de datos es esquema/DDL, no lógica de negocio).
 - NO generar configuración DevOps completa.
-- NO generar schemas exhaustivos más allá de los necesarios para el contrato OpenAPI.
+- NO generar schemas exhaustivos más allá de los necesarios para el contrato OpenAPI y el modelo de datos.
 - NO generar documentación burocrática innecesaria.
 
 # EXPECTATIVAS DE CALIDAD
@@ -569,7 +623,7 @@ El resultado debe parecer escrito por:
 # REQUERIMIENTOS DE SALIDA
 
 - Genera contenido Markdown limpio para los tres documentos `.md`.
-- Los archivos `.mmd` contienen ÚNICAMENTE el diagrama Mermaid; el archivo `.yaml` contiene ÚNICAMENTE la especificación OpenAPI.
+- Los archivos `.mmd` contienen ÚNICAMENTE el diagrama Mermaid; el archivo `.yaml` contiene ÚNICAMENTE la especificación OpenAPI; el archivo de modelo de datos (`.sql` / `.js`) contiene ÚNICAMENTE sentencias válidas del motor correspondiente.
 - No incluyas explicaciones externas entre documentos.
 - No envuelvas la salida en bloques de código salvo que se solicite explícitamente.
 - Mantén Markdown limpio y correctamente estructurado en cada archivo.
@@ -580,8 +634,12 @@ El resultado debe parecer escrito por:
   - `docs/design/diagrams/SDD-[nombre-proyecto]-c4-context.mmd`
   - `docs/design/diagrams/SDD-[nombre-proyecto]-c4-container.mmd`
   - `docs/design/api/SDD-[nombre-proyecto]-openapi.yaml`
-- Genera primero los archivos independientes (`.mmd` y `.yaml`) y luego los tres documentos `.md`, asegurando que las referencias relativas a los artefactos sean correctas.
-- Verifica que `system.md` referencie ambos diagramas C4 y que `design.md` referencie la especificación OpenAPI.
+  - Modelo de datos según el tipo de base de datos:
+    - relacional → `docs/design/database/SDD-[nombre-proyecto]-schema.sql`
+    - MongoDB → `docs/design/database/SDD-[nombre-proyecto]-collections.js`
+    - persistencia poliglota → ambos archivos
+- Genera primero los archivos independientes (`.mmd`, `.yaml` y el modelo de datos `.sql`/`.js`) y luego los tres documentos `.md`, asegurando que las referencias relativas a los artefactos sean correctas.
+- Verifica que `system.md` referencie ambos diagramas C4, que `design.md` referencie la especificación OpenAPI y que `design.md` referencie el modelo de datos.
 - Al finalizar, informa al usuario todas las rutas donde fueron guardados los documentos y artefactos.
 
 ---
