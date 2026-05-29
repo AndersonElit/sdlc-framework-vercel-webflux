@@ -1894,6 +1894,119 @@ CMD ["node", "server.js"]
 """
 
 
+def get_jenkinsfile() -> str:
+    """Jenkinsfile del frontend: calidad + build + deploy a Vercel vía CLI + E2E.
+
+    Jenkins es el único disparador de despliegues; la Git integration de Vercel
+    se desactiva (ver vercel.json / dashboard). Ref: PLAN-CICD-Jenkins.md §5.
+    """
+    return """\
+@Library('jenkins-shared-library@main') _
+
+// ───────────────────────────────────────────────────────────────────────────
+// Jenkinsfile (frontend Next.js) — deploy a Vercel vía CLI controlado por Jenkins.
+// La Git integration de Vercel está desactivada: el único disparador de
+// despliegues es este pipeline. Ref: PLAN-CICD-Jenkins.md §5.
+// ───────────────────────────────────────────────────────────────────────────
+
+pipeline {
+    agent { label 'agent-node' }   // Node 20 + npm + Playwright (§2)
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        timeout(time: 30, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '30'))
+    }
+
+    parameters {
+        choice(
+            name: 'DEPLOY_ENV',
+            choices: ['dev', 'staging', 'prod'],
+            description: 'Ambiente destino del despliegue en Vercel.'
+        )
+    }
+
+    environment {
+        // Tokens de servicio desde el Jenkins Credentials Store (rotables, no personales). §5
+        VERCEL_TOKEN      = credentials('vercel-token')
+        VERCEL_ORG_ID     = credentials('vercel-org-id')
+        VERCEL_PROJECT_ID = credentials('vercel-project-id')
+        // dev/staging → preview ; prod → production
+        VERCEL_ENV = "${params.DEPLOY_ENV == 'prod' ? 'production' : 'preview'}"
+        PROD_FLAG  = "${params.DEPLOY_ENV == 'prod' ? '--prod' : ''}"
+    }
+
+    stages {
+        // 1 — Checkout.
+        stage('Checkout') { steps { checkout scm } }
+
+        // 2 — Install.
+        stage('Install') { steps { sh 'npm ci' } }
+
+        // 3 — Type Check.
+        stage('Type Check') { steps { sh 'npm run type-check' } }
+
+        // 4 — Lint.
+        stage('Lint') { steps { sh 'npm run lint' } }
+
+        // 5 — Unit Tests (Vitest).
+        stage('Unit Tests') { steps { sh 'npm run test' } }
+
+        // 6 — Pull de la configuración del proyecto desde Vercel.
+        stage('Pull config Vercel') {
+            steps { sh 'vercel pull --yes --environment=$VERCEL_ENV --token=$VERCEL_TOKEN' }
+        }
+
+        // 7 — Build (prebuilt artifact).
+        stage('Build') {
+            steps { sh 'vercel build $PROD_FLAG --token=$VERCEL_TOKEN' }
+        }
+
+        // 8 — Deploy del artefacto prebuilt → captura la deployment URL.
+        stage('Deploy (prebuilt)') {
+            steps {
+                script {
+                    env.DEPLOYMENT_URL = sh(
+                        script: 'vercel deploy --prebuilt $PROD_FLAG --token=$VERCEL_TOKEN',
+                        returnStdout: true
+                    ).trim()
+                    echo "DEPLOYMENT_URL=${env.DEPLOYMENT_URL}"
+                }
+            }
+        }
+
+        // 9 — E2E (Playwright) contra la URL desplegada por Jenkins.
+        stage('E2E Tests') {
+            steps {
+                sh 'npx playwright install --with-deps'
+                sh "PLAYWRIGHT_TEST_BASE_URL=${env.DEPLOYMENT_URL} npm run test:e2e"
+            }
+        }
+
+        // 10 — Promote/Alias a producción tras E2E y aprobación manual (§5/§6).
+        stage('Promote / Alias (prod)') {
+            when { expression { params.DEPLOY_ENV == 'prod' } }
+            steps {
+                timeout(time: 30, unit: 'MINUTES') {
+                    input message: "Promover ${env.DEPLOYMENT_URL} a producción",
+                          ok: 'Promover',
+                          submitter: 'release-managers'
+                }
+                sh "vercel promote ${env.DEPLOYMENT_URL} --token=$VERCEL_TOKEN"
+            }
+        }
+    }
+
+    // 11 — Notificación de resultado (Slack/email), reutilizando la Shared Library.
+    post {
+        success { notify(status: 'SUCCESS', service: 'frontend', env: params.DEPLOY_ENV) }
+        failure { notify(status: 'FAILURE', service: 'frontend', env: params.DEPLOY_ENV) }
+    }
+}
+"""
+
+
 def get_dockerignore() -> str:
     return """\
 node_modules
@@ -2009,6 +2122,7 @@ def scaffold(project_name: str) -> None:
         ".husky/pre-commit": get_husky_pre_commit(),
         "Dockerfile": get_dockerfile(),
         ".dockerignore": get_dockerignore(),
+        "Jenkinsfile": get_jenkinsfile(),
 
         # Middleware (Next.js root)
         "src/middleware.ts": get_middleware(),

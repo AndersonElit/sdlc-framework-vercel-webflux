@@ -139,6 +139,159 @@ ENTRYPOINT ["java", "-jar", "app.jar"]
 """
 
 
+def get_jenkinsfile_content(project_name: str, database: str) -> str:
+    """Jenkinsfile declarativo genérico parametrizado por servicio.
+
+    Delega en la Shared Library `jenkins-shared-library` y se mantiene mínimo:
+    el mismo pipeline sirve para todos los microservicios cambiando solo los
+    parámetros (PLAN-CICD-Jenkins.md §3.2 y §4).
+    """
+    db_type = "mongo" if database.lower() == "mongo" else "postgres"
+
+    template = """\
+@Library('jenkins-shared-library@main') _
+
+// ───────────────────────────────────────────────────────────────────────────
+// Jenkinsfile genérico (backend) — parametrizado por servicio.
+// El mismo pipeline sirve para todos los microservicios; solo cambian los
+// parámetros, que se resuelven en runtime. La lógica vive en la Shared Library
+// (vars/) para mantener este archivo mínimo. Ref: PLAN-CICD-Jenkins.md §3 y §4.
+// ───────────────────────────────────────────────────────────────────────────
+
+pipeline {
+    agent none
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        timeout(time: 60, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '30'))
+    }
+
+    parameters {
+        string(
+            name: 'SERVICE_NAME',
+            defaultValue: '__SERVICE_NAME__',
+            description: 'Nombre del microservicio (deriva el repo ECR y el deployment).'
+        )
+        choice(
+            name: 'DEPLOY_ENV',
+            choices: ['dev', 'staging', 'prod'],
+            description: 'Ambiente destino del despliegue.'
+        )
+    }
+
+    environment {
+        SERVICE_NAME  = "${params.SERVICE_NAME}"
+        DEPLOY_ENV    = "${params.DEPLOY_ENV}"
+        ECR_REPO      = "${params.SERVICE_NAME}"
+        K8S_NAMESPACE = "${params.DEPLOY_ENV}"
+        DB_TYPE       = '__DB_TYPE__'
+    }
+
+    stages {
+        // 1 — Checkout + metadatos de versión/SHA → IMAGE_TAG inmutable (§3.3).
+        stage('Checkout') {
+            agent { label 'agent-maven' }
+            steps {
+                checkout scm
+                script {
+                    // <version-maven>-<git-sha-corto>
+                    env.IMAGE_TAG = computeImageTag()
+                    echo "IMAGE_TAG=${env.IMAGE_TAG}"
+                }
+            }
+        }
+
+        // 2 — Build + unit tests respetando la regla de dependencias hexagonal.
+        stage('Build & Unit Tests') {
+            agent { label 'agent-maven' }
+            steps { buildBackendService() }
+        }
+
+        // 3 — Tests de integración (R2DBC/Mongo/Kafka) con Testcontainers.
+        stage('Integration Tests') {
+            agent { label 'agent-maven' }
+            steps { runIntegrationTests(dbType: env.DB_TYPE) }
+        }
+
+        // 4 — Análisis estático + quality gate (SonarQube). Falla si gate = ERROR.
+        stage('Quality Gate (SonarQube)') {
+            agent { label 'agent-maven' }
+            steps { runQualityGates() }
+        }
+
+        // 5 — OWASP Dependency Check + escaneo de secretos.
+        stage('Security Scans') {
+            agent { label 'agent-maven' }
+            steps { runSecurityScans() }
+        }
+
+        // 6 — Imagen Docker multi-stage vía Kaniko → push a Amazon ECR.
+        stage('Build & Push Image') {
+            agent { label 'agent-docker' }
+            steps {
+                buildAndPushImage(
+                    service:  env.SERVICE_NAME,
+                    ecrRepo:  env.ECR_REPO,
+                    imageTag: env.IMAGE_TAG
+                )
+            }
+        }
+
+        // 7 — Escaneo de la imagen publicada (Trivy). Falla ante CVE crítico.
+        stage('Image Scan (Trivy)') {
+            agent { label 'agent-docker' }
+            steps { scanImage(ecrRepo: env.ECR_REPO, imageTag: env.IMAGE_TAG) }
+        }
+
+        // Aprobación manual obligatoria antes de desplegar a producción (§6).
+        stage('Approval (prod)') {
+            when { expression { env.DEPLOY_ENV == 'prod' } }
+            steps {
+                timeout(time: 30, unit: 'MINUTES') {
+                    input message: "Aprobar despliegue de ${env.SERVICE_NAME}:${env.IMAGE_TAG} a PROD",
+                          ok: 'Desplegar',
+                          submitter: 'release-managers'
+                }
+            }
+        }
+
+        // 8 — helm upgrade --install con valores por ambiente. ≥ 2 réplicas en prod.
+        stage('Deploy a EKS') {
+            agent { label 'agent-deploy' }
+            steps {
+                deployToEks(
+                    service:   env.SERVICE_NAME,
+                    namespace: env.K8S_NAMESPACE,
+                    env:       env.DEPLOY_ENV,
+                    imageTag:  env.IMAGE_TAG
+                )
+            }
+        }
+
+        // 9 — Verificación post-deploy contra /actuator/health/readiness.
+        stage('Smoke Tests') {
+            agent { label 'agent-deploy' }
+            steps {
+                runSmokeTests(
+                    service:   env.SERVICE_NAME,
+                    namespace: env.K8S_NAMESPACE
+                )
+            }
+        }
+    }
+
+    // 10 — Notificación de resultado (Slack/email).
+    post {
+        success { notify(status: 'SUCCESS', service: env.SERVICE_NAME, env: env.DEPLOY_ENV) }
+        failure { notify(status: 'FAILURE', service: env.SERVICE_NAME, env: env.DEPLOY_ENV) }
+    }
+}
+"""
+    return template.replace("__SERVICE_NAME__", project_name).replace("__DB_TYPE__", db_type)
+
+
 def get_dockerignore_content() -> str:
     return """\
 target/
@@ -634,6 +787,9 @@ bin/
     logger.debug("Dockerfile creado")
     (root / ".dockerignore").write_text(get_dockerignore_content())
     logger.debug(".dockerignore creado")
+
+    (root / "Jenkinsfile").write_text(get_jenkinsfile_content(project_name, database))
+    logger.debug("Jenkinsfile creado")
     logger.info("Proyecto creado exitosamente en: %s", root.resolve())
     _print_run_instructions(project_name, root, messaging_system)
 
