@@ -157,13 +157,20 @@ def get_jenkinsfile_content(project_name: str, database: str) -> str:
 // parámetros, que se resuelven en runtime. La lógica vive en la Shared Library
 // (vars/) para mantener este archivo mínimo.
 //
-// Modelo de agentes: Amazon ECS plugin (EC2 launch type).
-// Cada grupo de stages comparte un ECS task; entre grupos se usa stash/unstash
-// para transferir el workspace (Dockerfile + fuentes + helm charts).
+// Modelo de agentes: Kubernetes plugin. Todo el pipeline corre en un único pod
+// efímero en EKS (definido en org/flexicredit/podBackend.yaml de la Shared
+// Library), por lo que el workspace se comparte entre stages sin stash/unstash.
+// El pod usa el ServiceAccount 'jenkins-agent' (IRSA) para autenticar kaniko
+// (push a ECR) y el deploy (aws eks get-token → helm/kubectl).
 // ───────────────────────────────────────────────────────────────────────────
 
 pipeline {
-    agent none
+    agent {
+        kubernetes {
+            defaultContainer 'maven'
+            yaml libraryResource('org/flexicredit/podBackend.yaml')
+        }
+    }
 
     options {
         timestamps()
@@ -194,79 +201,55 @@ pipeline {
     }
 
     stages {
-        // ── Stages 1-5: CI completo en un único ECS task agent-maven ──────────
-        // Workspace compartido dentro del grupo; se stashea al terminar para
-        // que los grupos siguientes (agent-kaniko, agent-deploy) lo recuperen.
-        stage('CI') {
-            agent { label 'agent-maven' }
-            stages {
-                // 1 — Checkout + metadatos de versión/SHA → IMAGE_TAG inmutable.
-                stage('Checkout') {
-                    steps {
-                        checkout scm
-                        script {
-                            env.IMAGE_TAG = computeImageTag()
-                            echo "IMAGE_TAG=${env.IMAGE_TAG}"
-                        }
-                    }
-                }
-
-                // 2 — Build + unit tests respetando la regla de dependencias hexagonal.
-                stage('Build & Unit Tests') {
-                    steps { buildBackendService() }
-                }
-
-                // 3 — Tests de integración (R2DBC/Mongo/Kafka) con Testcontainers.
-                stage('Integration Tests') {
-                    steps { runIntegrationTests(dbType: env.DB_TYPE) }
-                }
-
-                // 4 — Análisis estático + quality gate (SonarQube). Falla si gate = ERROR.
-                stage('Quality Gate (SonarQube)') {
-                    steps { runQualityGates() }
-                }
-
-                // 5 — OWASP Dependency Check + escaneo de secretos.
-                stage('Security Scans') {
-                    steps { runSecurityScans() }
-                }
-            }
-            // Stash fuentes + Dockerfile + helm charts (excluye .git y target compilado).
-            // El siguiente grupo (agent-kaniko) lo recupera para construir la imagen.
-            post {
-                success {
-                    stash name: 'workspace',
-                          includes: '**/*',
-                          excludes: '.git/**,**/target/**'
+        // 1 — Checkout + metadatos de versión/SHA → IMAGE_TAG inmutable.
+        stage('Checkout') {
+            steps {
+                checkout scm
+                script {
+                    env.IMAGE_TAG = computeImageTag()
+                    echo "IMAGE_TAG=${env.IMAGE_TAG}"
                 }
             }
         }
 
-        // ── Stages 6-7: imagen Docker en ECS task agent-kaniko ───────────────
-        // Kaniko construye desde el Dockerfile (multi-stage Maven dentro de Docker).
-        stage('Image') {
-            agent { label 'agent-kaniko' }
-            stages {
-                // 6 — Imagen Docker multi-stage vía Kaniko → push a Amazon ECR.
-                stage('Build & Push Image') {
-                    steps {
-                        unstash 'workspace'
-                        buildAndPushImage(
-                            service:  env.SERVICE_NAME,
-                            ecrRepo:  env.ECR_REPO,
-                            imageTag: env.IMAGE_TAG
-                        )
-                    }
-                }
+        // 2 — Build + unit tests respetando la regla de dependencias hexagonal.
+        stage('Build & Unit Tests') {
+            steps { buildBackendService() }
+        }
 
-                // 7 — Escaneo de la imagen publicada (Trivy). Falla ante CVE crítico.
-                stage('Image Scan (Trivy)') {
-                    steps { scanImage(ecrRepo: env.ECR_REPO, imageTag: env.IMAGE_TAG) }
-                }
+        // 3 — Tests de integración (R2DBC/Mongo/Kafka) con Testcontainers.
+        //     Usa el sidecar dind del pod (DOCKER_HOST) para levantar contenedores.
+        stage('Integration Tests') {
+            steps { runIntegrationTests(dbType: env.DB_TYPE) }
+        }
+
+        // 4 — Análisis estático + quality gate (SonarQube). Falla si gate = ERROR.
+        stage('Quality Gate (SonarQube)') {
+            steps { runQualityGates() }
+        }
+
+        // 5 — OWASP Dependency Check + escaneo de secretos (gitleaks).
+        stage('Security Scans') {
+            steps { runSecurityScans() }
+        }
+
+        // 6 — Imagen Docker multi-stage vía Kaniko → push a Amazon ECR.
+        stage('Build & Push Image') {
+            steps {
+                buildAndPushImage(
+                    service:  env.SERVICE_NAME,
+                    ecrRepo:  env.ECR_REPO,
+                    imageTag: env.IMAGE_TAG
+                )
             }
         }
 
-        // ── Aprobación manual antes de producción ────────────────────────────
+        // 7 — Escaneo de la imagen publicada (Trivy). Falla ante CVE crítico.
+        stage('Image Scan (Trivy)') {
+            steps { scanImage(ecrRepo: env.ECR_REPO, imageTag: env.IMAGE_TAG) }
+        }
+
+        // 8 — Aprobación manual antes de producción.
         stage('Approval (prod)') {
             when { expression { env.DEPLOY_ENV == 'prod' } }
             steps {
@@ -278,38 +261,30 @@ pipeline {
             }
         }
 
-        // ── Stages 8-9: despliegue en ECS task agent-deploy ──────────────────
-        // Necesita los helm charts del workspace; IMAGE_TAG viene del env global.
-        stage('Deploy') {
-            agent { label 'agent-deploy' }
-            stages {
-                // 8 — helm upgrade --install con valores por ambiente. ≥ 2 réplicas en prod.
-                stage('Deploy a EKS') {
-                    steps {
-                        unstash 'workspace'
-                        deployToEks(
-                            service:   env.SERVICE_NAME,
-                            namespace: env.K8S_NAMESPACE,
-                            env:       env.DEPLOY_ENV,
-                            imageTag:  env.IMAGE_TAG
-                        )
-                    }
-                }
+        // 9 — helm upgrade --install con valores por ambiente. ≥ 2 réplicas en prod.
+        stage('Deploy a EKS') {
+            steps {
+                deployToEks(
+                    service:   env.SERVICE_NAME,
+                    namespace: env.K8S_NAMESPACE,
+                    env:       env.DEPLOY_ENV,
+                    imageTag:  env.IMAGE_TAG
+                )
+            }
+        }
 
-                // 9 — Verificación post-deploy contra /actuator/health/readiness.
-                stage('Smoke Tests') {
-                    steps {
-                        runSmokeTests(
-                            service:   env.SERVICE_NAME,
-                            namespace: env.K8S_NAMESPACE
-                        )
-                    }
-                }
+        // 10 — Verificación post-deploy contra /actuator/health/readiness.
+        stage('Smoke Tests') {
+            steps {
+                runSmokeTests(
+                    service:   env.SERVICE_NAME,
+                    namespace: env.K8S_NAMESPACE
+                )
             }
         }
     }
 
-    // 10 — Notificación de resultado (Slack/email).
+    // 11 — Notificación de resultado (Slack/email).
     post {
         success { notify(status: 'SUCCESS', service: env.SERVICE_NAME, env: env.DEPLOY_ENV) }
         failure { notify(status: 'FAILURE', service: env.SERVICE_NAME, env: env.DEPLOY_ENV) }
@@ -330,6 +305,153 @@ target/
 **/*.log
 """
 
+
+def get_helm_chart_files(project_name: str) -> dict:
+    """Helm chart consumido por deployToEks() de la Shared Library.
+
+    Layout esperado por el step: helm/<service>/ con Chart.yaml, values.yaml y
+    un values-<env>.yaml por ambiente. El deploy hace
+    `--set image.repository=<registry>/<service> --set image.tag=<tag>`.
+    """
+    chart_yaml = f"""\
+apiVersion: v2
+name: {project_name}
+description: Chart del microservicio {project_name} (Spring Boot WebFlux)
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+"""
+
+    values_yaml = """\
+# Valores base. image.repository e image.tag los inyecta el pipeline (--set).
+replicaCount: 1
+
+image:
+  repository: ""   # <registry>/<service> (inyectado por Jenkins)
+  tag: ""          # <version>-<sha> inmutable (inyectado por Jenkins)
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 8080
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    cpu: "1"
+    memory: 1Gi
+
+# Sondas contra los endpoints de Spring Boot Actuator.
+probes:
+  readinessPath: /actuator/health/readiness
+  livenessPath: /actuator/health/liveness
+
+env: []
+"""
+
+    # Overrides por ambiente. prod escala a >=2 réplicas (alta disponibilidad).
+    values_dev = """\
+replicaCount: 1
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+"""
+    values_staging = """\
+replicaCount: 2
+"""
+    values_prod = """\
+replicaCount: 3
+resources:
+  requests:
+    cpu: 500m
+    memory: 1Gi
+  limits:
+    cpu: "2"
+    memory: 2Gi
+"""
+
+    deployment_tpl = """\
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Chart.Name }}
+  labels:
+    app: {{ .Chart.Name }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ .Chart.Name }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Chart.Name }}
+    spec:
+      containers:
+        - name: {{ .Chart.Name }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - containerPort: {{ .Values.service.port }}
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.probes.readinessPath }}
+              port: {{ .Values.service.port }}
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.probes.livenessPath }}
+              port: {{ .Values.service.port }}
+            initialDelaySeconds: 30
+            periodSeconds: 15
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          {{- with .Values.env }}
+          env:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+"""
+
+    service_tpl = """\
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Chart.Name }}
+  labels:
+    app: {{ .Chart.Name }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    app: {{ .Chart.Name }}
+  ports:
+    - port: {{ .Values.service.port }}
+      targetPort: {{ .Values.service.port }}
+      protocol: TCP
+"""
+
+    helmignore = """\
+.git
+*.tmp
+*.bak
+"""
+
+    return {
+        "Chart.yaml": chart_yaml,
+        "values.yaml": values_yaml,
+        "values-dev.yaml": values_dev,
+        "values-staging.yaml": values_staging,
+        "values-prod.yaml": values_prod,
+        ".helmignore": helmignore,
+        "templates/deployment.yaml": deployment_tpl,
+        "templates/service.yaml": service_tpl,
+    }
 
 
 def get_root_pom(project_name: str, database: str, messaging_system: str) -> str:
@@ -817,6 +939,15 @@ bin/
 
     (root / "Jenkinsfile").write_text(get_jenkinsfile_content(project_name, database))
     logger.debug("Jenkinsfile creado")
+
+    # Helm chart consumido por deployToEks() de la Shared Library.
+    helm_root = root / "helm" / project_name
+    for rel_path, content in get_helm_chart_files(project_name).items():
+        target = helm_root / rel_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content)
+    logger.debug("Helm chart creado en %s", helm_root)
+
     logger.info("Proyecto creado exitosamente en: %s", root.resolve())
     _print_run_instructions(project_name, root, messaging_system)
 

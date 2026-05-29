@@ -296,12 +296,36 @@ resource "aws_eks_cluster" "main" {
     subnet_ids = var.subnet_ids
   }
 
+  # Habilita EKS access entries (RBAC vía identidad IAM) además del aws-auth
+  # ConfigMap. Necesario para los access entries del controller/agente Jenkins.
+  access_config {
+    authentication_mode = "API_AND_CONFIG_MAP"
+  }
+
   tags = {
     Environment = var.environment
     Project     = var.project_name
   }
 
   depends_on = [aws_iam_role_policy_attachment.cluster_policy]
+}
+
+# --- OIDC provider (IRSA) ---
+# Permite que los ServiceAccounts del cluster (p. ej. jenkins-agent) asuman
+# roles IAM mediante web identity federation.
+data "tls_certificate" "oidc" {
+  url = aws_eks_cluster.main.identity[0].oidc[0].issuer
+}
+
+resource "aws_iam_openid_connect_provider" "main" {
+  url             = aws_eks_cluster.main.identity[0].oidc[0].issuer
+  client_id_list  = ["sts.amazonaws.com"]
+  thumbprint_list = [data.tls_certificate.oidc.certificates[0].sha1_fingerprint]
+
+  tags = {
+    Environment = var.environment
+    Project     = var.project_name
+  }
 }
 
 resource "aws_eks_node_group" "main" {
@@ -406,6 +430,16 @@ output "cluster_ca_certificate" {
 output "cluster_oidc_issuer_url" {
   description = "URL del OIDC issuer (para IRSA)"
   value       = aws_eks_cluster.main.identity[0].oidc[0].issuer
+}
+
+output "oidc_provider_arn" {
+  description = "ARN del IAM OIDC provider del cluster (para los roles IRSA)"
+  value       = aws_iam_openid_connect_provider.main.arn
+}
+
+output "oidc_issuer_host" {
+  description = "Host del OIDC issuer (sin https://) para las condiciones de confianza IRSA"
+  value       = replace(aws_eks_cluster.main.identity[0].oidc[0].issuer, "https://", "")
 }
 
 output "node_group_arn" {
@@ -1449,12 +1483,25 @@ EOF
 log_ok "Módulo MongoDB listo."
 
 # ===========================================================================
-# BACKEND — módulo Jenkins (ECS + Fargate)
+# BACKEND — módulo Jenkins (controller EC2 + Docker, agentes en EKS)
 # ===========================================================================
+#
+# Controller: contenedor Docker en una instancia EC2 singleton (ASG 1/1/1) con
+# JENKINS_HOME persistido en un volumen EBS. Expuesto vía ALB.
+# Agentes: pods efímeros en el cluster EKS (Kubernetes plugin). La autenticación
+# de kaniko (push ECR) y del deploy (helm/kubectl) usa IRSA sobre el
+# ServiceAccount 'jenkins-agent'. El acceso del controller (lanzar pods) y del
+# agente (desplegar) al API server se concede con EKS access entries.
 
-log "Escribiendo módulo Jenkins (ECS)..."
+log "Escribiendo módulo Jenkins (controller EC2 + agentes EKS)..."
 
 cat > "$TF_BACKEND/modules/jenkins/main.tf" << 'EOF'
+data "aws_caller_identity" "current" {}
+
+locals {
+  ecr_registry = "${data.aws_caller_identity.current.account_id}.dkr.ecr.${var.aws_region}.amazonaws.com"
+}
+
 # --- Security Groups ---
 
 resource "aws_security_group" "alb" {
@@ -1547,7 +1594,7 @@ resource "aws_ebs_volume" "jenkins_home" {
   }
 }
 
-# --- IAM para instancias EC2 del cluster ECS ---
+# --- IAM para la instancia EC2 del controller ---
 
 data "aws_iam_policy_document" "ec2_assume_role" {
   statement {
@@ -1564,28 +1611,40 @@ resource "aws_iam_role" "jenkins_ec2" {
   assume_role_policy = data.aws_iam_policy_document.ec2_assume_role.json
 }
 
-resource "aws_iam_role_policy_attachment" "jenkins_ec2_ecs" {
+# Permite a SSM administrar la instancia (sesiones sin SSH abierto).
+resource "aws_iam_role_policy_attachment" "jenkins_ec2_ssm" {
   role       = aws_iam_role.jenkins_ec2.name
-  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role"
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
-resource "aws_iam_policy" "jenkins_ec2_ebs" {
-  name        = "${var.project_name}-${var.environment}-jenkins-ec2-ebs"
-  description = "Permite adjuntar el volumen EBS de JENKINS_HOME al arrancar"
+resource "aws_iam_policy" "jenkins_ec2" {
+  name        = "${var.project_name}-${var.environment}-jenkins-ec2"
+  description = "Adjuntar el EBS de JENKINS_HOME y resolver el cluster EKS (kubeconfig)"
 
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [{
-      Effect   = "Allow"
-      Action   = ["ec2:AttachVolume", "ec2:DescribeVolumes", "ec2:DescribeVolumeStatus"]
-      Resource = "*"
-    }]
+    Statement = [
+      {
+        Sid      = "AttachJenkinsHome"
+        Effect   = "Allow"
+        Action   = ["ec2:AttachVolume", "ec2:DescribeVolumes", "ec2:DescribeVolumeStatus"]
+        Resource = "*"
+      },
+      {
+        # El Kubernetes plugin usa esta identidad para 'aws eks get-token' y
+        # lanzar los pods agente; el acceso RBAC lo concede el access entry.
+        Sid      = "DescribeEksCluster"
+        Effect   = "Allow"
+        Action   = ["eks:DescribeCluster"]
+        Resource = "*"
+      }
+    ]
   })
 }
 
-resource "aws_iam_role_policy_attachment" "jenkins_ec2_ebs" {
+resource "aws_iam_role_policy_attachment" "jenkins_ec2" {
   role       = aws_iam_role.jenkins_ec2.name
-  policy_arn = aws_iam_policy.jenkins_ec2_ebs.arn
+  policy_arn = aws_iam_policy.jenkins_ec2.arn
 }
 
 resource "aws_iam_instance_profile" "jenkins_ec2" {
@@ -1593,59 +1652,52 @@ resource "aws_iam_instance_profile" "jenkins_ec2" {
   role = aws_iam_role.jenkins_ec2.name
 }
 
-# --- IAM para el task ECS de Jenkins ---
+# --- IAM IRSA para los pods agente (ServiceAccount jenkins-agent) ---
+# Federación OIDC del cluster EKS: solo el SA jenkins:jenkins-agent puede asumir
+# este rol. kaniko lo usa para push a ECR; el deploy para 'aws eks get-token'.
 
-data "aws_iam_policy_document" "jenkins_task_assume_role" {
+data "aws_iam_policy_document" "jenkins_agent_assume_role" {
   statement {
-    actions = ["sts:AssumeRole"]
+    actions = ["sts:AssumeRoleWithWebIdentity"]
     principals {
-      type        = "Service"
-      identifiers = ["ecs-tasks.amazonaws.com"]
+      type        = "Federated"
+      identifiers = [var.eks_oidc_provider_arn]
+    }
+    condition {
+      test     = "StringEquals"
+      variable = "${var.eks_oidc_issuer_host}:sub"
+      values   = ["system:serviceaccount:${var.agent_namespace}:jenkins-agent"]
+    }
+    condition {
+      test     = "StringEquals"
+      variable = "${var.eks_oidc_issuer_host}:aud"
+      values   = ["sts.amazonaws.com"]
     }
   }
 }
 
-resource "aws_iam_role" "jenkins_execution" {
-  name               = "${var.project_name}-${var.environment}-jenkins-execution"
-  assume_role_policy = data.aws_iam_policy_document.jenkins_task_assume_role.json
+resource "aws_iam_role" "jenkins_agent" {
+  name               = "${var.project_name}-${var.environment}-jenkins-agent"
+  assume_role_policy = data.aws_iam_policy_document.jenkins_agent_assume_role.json
 }
 
-resource "aws_iam_role_policy_attachment" "jenkins_execution_managed" {
-  role       = aws_iam_role.jenkins_execution.name
-  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
-}
-
-resource "aws_iam_role" "jenkins_task" {
-  name               = "${var.project_name}-${var.environment}-jenkins-task"
-  assume_role_policy = data.aws_iam_policy_document.jenkins_task_assume_role.json
-}
-
-resource "aws_iam_policy" "jenkins_task" {
-  name        = "${var.project_name}-${var.environment}-jenkins-task"
-  description = "Permisos Jenkins: lanzar agentes ECS, push/pull ECR, leer Secrets Manager, describir EKS"
+resource "aws_iam_policy" "jenkins_agent" {
+  name        = "${var.project_name}-${var.environment}-jenkins-agent"
+  description = "Permisos del agente: push/pull ECR (kaniko), leer secrets y describir EKS (deploy)"
 
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
       {
-        Sid    = "ECSAgents"
-        Effect = "Allow"
-        Action = [
-          "ecs:RunTask",
-          "ecs:StopTask",
-          "ecs:DescribeTasks",
-          "ecs:ListTasks",
-          "ecs:DescribeTaskDefinition",
-          "ecs:RegisterTaskDefinition",
-          "iam:PassRole"
-        ]
+        Sid      = "ECRAuth"
+        Effect   = "Allow"
+        Action   = ["ecr:GetAuthorizationToken"]
         Resource = "*"
       },
       {
         Sid    = "ECRPushPull"
         Effect = "Allow"
         Action = [
-          "ecr:GetAuthorizationToken",
           "ecr:BatchCheckLayerAvailability",
           "ecr:GetDownloadUrlForLayer",
           "ecr:BatchGetImage",
@@ -1661,62 +1713,73 @@ resource "aws_iam_policy" "jenkins_task" {
         Effect = "Allow"
         Action = [
           "secretsmanager:GetSecretValue",
-          "secretsmanager:DescribeSecret",
-          "secretsmanager:ListSecrets"
+          "secretsmanager:DescribeSecret"
         ]
         Resource = "*"
       },
       {
-        Sid    = "EKSDescribe"
-        Effect = "Allow"
-        Action = [
-          "eks:DescribeCluster",
-          "eks:ListClusters"
-        ]
+        # Necesario para 'aws eks update-kubeconfig' antes de helm/kubectl;
+        # el acceso RBAC al namespace lo concede el access entry del agente.
+        Sid      = "EKSDescribe"
+        Effect   = "Allow"
+        Action   = ["eks:DescribeCluster"]
         Resource = "*"
       }
     ]
   })
 }
 
-resource "aws_iam_role_policy_attachment" "jenkins_task" {
-  role       = aws_iam_role.jenkins_task.name
-  policy_arn = aws_iam_policy.jenkins_task.arn
+resource "aws_iam_role_policy_attachment" "jenkins_agent" {
+  role       = aws_iam_role.jenkins_agent.name
+  policy_arn = aws_iam_policy.jenkins_agent.arn
 }
 
-# --- ECS Cluster ---
-
-resource "aws_ecs_cluster" "jenkins" {
-  name = "${var.project_name}-${var.environment}-jenkins"
-
-  setting {
-    name  = "containerInsights"
-    value = var.environment == "prod" ? "enabled" : "disabled"
-  }
-
-  tags = {
-    Environment = var.environment
-    Project     = var.project_name
-  }
+# --- EKS access entries (RBAC vía identidad AWS) ---
+# Controller: crea/borra los pods agente en el namespace 'jenkins'.
+resource "aws_eks_access_entry" "jenkins_controller" {
+  cluster_name  = var.eks_cluster_name
+  principal_arn = aws_iam_role.jenkins_ec2.arn
+  type          = "STANDARD"
 }
 
-# --- CloudWatch Logs ---
+resource "aws_eks_access_policy_association" "jenkins_controller" {
+  cluster_name  = var.eks_cluster_name
+  principal_arn = aws_iam_role.jenkins_ec2.arn
+  policy_arn    = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSEditPolicy"
 
-resource "aws_cloudwatch_log_group" "jenkins" {
-  name              = "/ecs/${var.project_name}-${var.environment}-jenkins"
-  retention_in_days = 30
-
-  tags = {
-    Environment = var.environment
-    Project     = var.project_name
+  access_scope {
+    type       = "namespace"
+    namespaces = [var.agent_namespace]
   }
+
+  depends_on = [aws_eks_access_entry.jenkins_controller]
 }
 
-# --- Launch Template + ASG (instancia EC2 singleton del cluster) ---
+# Agente: despliega (helm/kubectl) en el namespace de la aplicación del ambiente.
+resource "aws_eks_access_entry" "jenkins_agent" {
+  cluster_name  = var.eks_cluster_name
+  principal_arn = aws_iam_role.jenkins_agent.arn
+  type          = "STANDARD"
+}
+
+resource "aws_eks_access_policy_association" "jenkins_agent" {
+  cluster_name  = var.eks_cluster_name
+  principal_arn = aws_iam_role.jenkins_agent.arn
+  policy_arn    = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSEditPolicy"
+
+  access_scope {
+    type       = "namespace"
+    namespaces = [var.environment]
+  }
+
+  depends_on = [aws_eks_access_entry.jenkins_agent]
+}
+
+# --- Launch Template + ASG (instancia EC2 singleton del controller) ---
 
 resource "aws_launch_template" "jenkins" {
   name_prefix   = "${var.project_name}-${var.environment}-jenkins-"
-  image_id      = var.ecs_ami_id
+  image_id      = var.ami_id
   instance_type = var.instance_type
 
   iam_instance_profile {
@@ -1728,15 +1791,33 @@ resource "aws_launch_template" "jenkins" {
     security_groups             = [aws_security_group.jenkins_ec2.id]
   }
 
-  # $INSTANCE_ID/$REGION/$DEVICE/$i son variables bash (runtime en EC2).
-  # ${aws_ecs_cluster.jenkins.name} y ${aws_ebs_volume.jenkins_home.id} son
-  # interpolaciones Terraform expandidas en apply time.
+  # $INSTANCE_ID/$REGION/$DEVICE/$i/$PRIVATE_IP son variables bash (runtime en EC2).
+  # ${...} son interpolaciones Terraform expandidas en apply time.
   user_data = base64encode(<<-USERDATA
     #!/bin/bash
-    echo "ECS_CLUSTER=${aws_ecs_cluster.jenkins.name}" >> /etc/ecs/ecs.config
+    set -euxo pipefail
 
+    # --- Herramientas: Docker, aws-cli v2, kubectl ---
+    if command -v dnf &>/dev/null; then
+      dnf install -y docker unzip
+    else
+      amazon-linux-extras install -y docker && yum install -y unzip
+    fi
+    systemctl enable --now docker
+
+    if ! command -v aws &>/dev/null; then
+      curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+      unzip -q /tmp/awscliv2.zip -d /tmp && /tmp/aws/install
+    fi
+
+    curl -fsSL -o /usr/local/bin/kubectl \
+      "https://dl.k8s.io/release/v1.31.0/bin/linux/amd64/kubectl"
+    chmod +x /usr/local/bin/kubectl
+
+    # --- Adjuntar y montar el EBS de JENKINS_HOME ---
     INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
     REGION=$(curl -s http://169.254.169.254/latest/meta-data/placement/region)
+    PRIVATE_IP=$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)
     VOLUME_ID="${aws_ebs_volume.jenkins_home.id}"
 
     aws ec2 attach-volume \
@@ -1758,8 +1839,33 @@ resource "aws_launch_template" "jenkins" {
 
     mkdir -p /var/jenkins_home
     mount "$DEVICE" /var/jenkins_home
+    grep -q /var/jenkins_home /etc/fstab || \
+      echo "$DEVICE /var/jenkins_home ext4 defaults,nofail 0 2" >> /etc/fstab
+
+    # --- kubeconfig para el Kubernetes plugin (exec auth vía rol de la EC2) ---
+    mkdir -p /var/jenkins_home/.kube
+    aws eks update-kubeconfig \
+      --name "${var.eks_cluster_name}" \
+      --region "$REGION" \
+      --kubeconfig /var/jenkins_home/.kube/config
     chown -R 1000:1000 /var/jenkins_home
-    echo "$DEVICE /var/jenkins_home ext4 defaults,nofail 0 2" >> /etc/fstab
+
+    # --- Arrancar el controller Jenkins ---
+    # var.jenkins_image deberia ser la imagen propia con JCasC + plugins horneados
+    # (jenkins-shared-library/docker). Las variables de entorno alimentan las
+    # interpolaciones del jenkins.yaml (JCasC).
+    docker run -d --name jenkins --restart unless-stopped \
+      -p 8080:8080 -p 50000:50000 \
+      -v /var/jenkins_home:/var/jenkins_home \
+      -e JAVA_OPTS="-Djenkins.install.runSetupWizard=false" \
+      -e ECR_REGISTRY="${local.ecr_registry}" \
+      -e EKS_CLUSTER_NAME="${var.eks_cluster_name}" \
+      -e EKS_API_SERVER="${var.eks_cluster_endpoint}" \
+      -e AWS_REGION="$REGION" \
+      -e JENKINS_URL="http://$PRIVATE_IP:8080" \
+      -e JENKINS_TUNNEL="$PRIVATE_IP:50000" \
+      -e SHARED_LIBRARY_REPO="${var.shared_library_repo}" \
+      "${var.jenkins_image}"
   USERDATA
   )
 
@@ -1805,58 +1911,6 @@ resource "aws_autoscaling_group" "jenkins" {
 
   lifecycle {
     ignore_changes = [desired_capacity]
-  }
-}
-
-# --- ECS Task Definition (EC2 launch type, bridge mode) ---
-
-resource "aws_ecs_task_definition" "jenkins" {
-  family             = "${var.project_name}-${var.environment}-jenkins"
-  network_mode       = "bridge"
-  task_role_arn      = aws_iam_role.jenkins_task.arn
-  execution_role_arn = aws_iam_role.jenkins_execution.arn
-
-  volume {
-    name      = "jenkins-home"
-    host_path = "/var/jenkins_home"
-  }
-
-  container_definitions = jsonencode([{
-    name      = "jenkins"
-    image     = "jenkins/jenkins:${var.jenkins_image_tag}"
-    essential = true
-    cpu       = var.cpu
-    memory    = var.memory
-
-    portMappings = [
-      { containerPort = 8080, hostPort = 8080, protocol = "tcp" },
-      { containerPort = 50000, hostPort = 50000, protocol = "tcp" }
-    ]
-
-    mountPoints = [{
-      sourceVolume  = "jenkins-home"
-      containerPath = "/var/jenkins_home"
-      readOnly      = false
-    }]
-
-    environment = [{
-      name  = "JAVA_OPTS"
-      value = "-Djenkins.install.runSetupWizard=false"
-    }]
-
-    logConfiguration = {
-      logDriver = "awslogs"
-      options = {
-        "awslogs-group"         = aws_cloudwatch_log_group.jenkins.name
-        "awslogs-region"        = var.aws_region
-        "awslogs-stream-prefix" = "jenkins"
-      }
-    }
-  }])
-
-  tags = {
-    Environment = var.environment
-    Project     = var.project_name
   }
 }
 
@@ -1908,34 +1962,10 @@ resource "aws_lb_listener" "jenkins" {
   }
 }
 
-# Registra el ASG como target del ALB (bridge mode requiere target_type = instance)
+# Registra el ASG como target del ALB (target_type = instance).
 resource "aws_autoscaling_attachment" "jenkins" {
   autoscaling_group_name = aws_autoscaling_group.jenkins.name
   lb_target_group_arn    = aws_lb_target_group.jenkins.arn
-}
-
-# --- ECS Service (EC2 launch type) ---
-
-resource "aws_ecs_service" "jenkins" {
-  name            = "${var.project_name}-${var.environment}-jenkins"
-  cluster         = aws_ecs_cluster.jenkins.id
-  task_definition = aws_ecs_task_definition.jenkins.arn
-  desired_count   = 1
-  launch_type     = "EC2"
-
-  depends_on = [
-    aws_autoscaling_group.jenkins,
-    aws_lb_listener.jenkins,
-  ]
-
-  lifecycle {
-    ignore_changes = [task_definition]
-  }
-
-  tags = {
-    Environment = var.environment
-    Project     = var.project_name
-  }
 }
 EOF
 
@@ -1970,8 +2000,8 @@ variable "public_subnet_ids" {
   type        = list(string)
 }
 
-variable "ecs_ami_id" {
-  description = "AMI ECS-optimized para la instancia EC2 (amazon-linux-2 ECS)"
+variable "ami_id" {
+  description = "AMI base para la instancia EC2 del controller (Amazon Linux 2023 con Docker disponible vía dnf)"
   type        = string
 }
 
@@ -1994,27 +2024,49 @@ variable "volume_type" {
 }
 
 variable "aws_region" {
-  description = "Región AWS (CloudWatch Logs)"
+  description = "Región AWS"
   type        = string
   default     = "us-east-1"
 }
 
-variable "cpu" {
-  description = "CPU reservada para el container Jenkins en unidades ECS (1024 = 1 vCPU)"
-  type        = number
-  default     = 1024
-}
-
-variable "memory" {
-  description = "Memoria reservada para el container Jenkins en MB"
-  type        = number
-  default     = 2048
-}
-
-variable "jenkins_image_tag" {
-  description = "Tag de la imagen jenkins/jenkins"
+variable "jenkins_image" {
+  description = "Imagen Docker del controller (recomendado: imagen propia con JCasC + plugins en ECR)"
   type        = string
-  default     = "lts-jdk21"
+  default     = "jenkins/jenkins:lts-jdk21"
+}
+
+# --- Integración con EKS (agentes + RBAC) ---
+
+variable "eks_cluster_name" {
+  description = "Nombre del cluster EKS donde corren los agentes y se despliega la aplicación"
+  type        = string
+}
+
+variable "eks_cluster_endpoint" {
+  description = "Endpoint del API server de EKS (serverUrl del Kubernetes cloud en JCasC)"
+  type        = string
+}
+
+variable "shared_library_repo" {
+  description = "URL git del repositorio jenkins-shared-library (Global Pipeline Library)"
+  type        = string
+  default     = ""
+}
+
+variable "eks_oidc_provider_arn" {
+  description = "ARN del IAM OIDC provider del cluster EKS (para IRSA del agente)"
+  type        = string
+}
+
+variable "eks_oidc_issuer_host" {
+  description = "Host del OIDC issuer del cluster (issuer sin el prefijo https://), para las condiciones IRSA"
+  type        = string
+}
+
+variable "agent_namespace" {
+  description = "Namespace de Kubernetes donde el controller lanza los pods agente"
+  type        = string
+  default     = "jenkins"
 }
 
 variable "allowed_cidr_blocks" {
@@ -2041,14 +2093,14 @@ output "alb_dns_name" {
   value       = aws_lb.jenkins.dns_name
 }
 
-output "cluster_name" {
-  description = "Nombre del cluster ECS de Jenkins"
-  value       = aws_ecs_cluster.jenkins.name
+output "agent_role_arn" {
+  description = "ARN del IAM role IRSA del agente (anotar el ServiceAccount jenkins-agent con este valor)"
+  value       = aws_iam_role.jenkins_agent.arn
 }
 
-output "task_role_arn" {
-  description = "ARN del IAM task role de Jenkins (para asignar permisos adicionales)"
-  value       = aws_iam_role.jenkins_task.arn
+output "controller_role_arn" {
+  description = "ARN del IAM role de la instancia EC2 del controller (mapeado en el access entry de EKS)"
+  value       = aws_iam_role.jenkins_ec2.arn
 }
 
 output "ebs_volume_id" {
@@ -2057,7 +2109,7 @@ output "ebs_volume_id" {
 }
 
 output "ec2_security_group_id" {
-  description = "ID del security group de la instancia EC2 Jenkins (para agentes ECS)"
+  description = "ID del security group de la instancia EC2 Jenkins"
   value       = aws_security_group.jenkins_ec2.id
 }
 EOF
@@ -2076,6 +2128,10 @@ terraform {
     aws = {
       source  = "hashicorp/aws"
       version = "~> 5.0"
+    }
+    tls = {
+      source  = "hashicorp/tls"
+      version = "~> 4.0"
     }
   }
 }
@@ -2137,8 +2193,8 @@ variable "public_subnet_ids" {
   default     = ["subnet-00000001", "subnet-00000002"]
 }
 
-variable "ecs_ami_id" {
-  description = "AMI ECS-optimized (floci: valor de prueba)"
+variable "ami_id" {
+  description = "AMI base del controller Jenkins (floci: valor de prueba)"
   type        = string
   default     = "ami-00000000"
 }
@@ -2186,17 +2242,28 @@ module "ecr" {
   services     = local.services
 }
 
+module "eks" {
+  source       = "../../modules/eks"
+  environment  = local.environment
+  project_name = local.project_name
+  subnet_ids   = var.subnet_ids
+}
+
 module "jenkins" {
-  source            = "../../modules/jenkins"
-  environment       = local.environment
-  project_name      = local.project_name
-  vpc_id            = var.vpc_id
-  vpc_cidr          = var.vpc_cidr
-  subnet_ids        = var.subnet_ids
-  public_subnet_ids = var.public_subnet_ids
-  ecs_ami_id        = var.ecs_ami_id
-  aws_region        = var.aws_region
-  alb_internal      = true
+  source                = "../../modules/jenkins"
+  environment           = local.environment
+  project_name          = local.project_name
+  vpc_id                = var.vpc_id
+  vpc_cidr              = var.vpc_cidr
+  subnet_ids            = var.subnet_ids
+  public_subnet_ids     = var.public_subnet_ids
+  ami_id                = var.ami_id
+  aws_region            = var.aws_region
+  alb_internal          = true
+  eks_cluster_name      = module.eks.cluster_name
+  eks_cluster_endpoint  = module.eks.cluster_endpoint
+  eks_oidc_provider_arn = module.eks.oidc_provider_arn
+  eks_oidc_issuer_host  = module.eks.oidc_issuer_host
 }
 EOF
 
@@ -2262,6 +2329,10 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 5.0"
     }
+    tls = {
+      source  = "hashicorp/tls"
+      version = "~> 4.0"
+    }
   }
 }
 
@@ -2307,8 +2378,8 @@ variable "public_subnet_ids" {
   type        = list(string)
 }
 
-variable "ecs_ami_id" {
-  description = "AMI ECS-optimized para la instancia EC2 del cluster Jenkins"
+variable "ami_id" {
+  description = "AMI base (Amazon Linux 2023) para la instancia EC2 del controller Jenkins"
   type        = string
 }
 EOF
@@ -2353,17 +2424,28 @@ module "ecr" {
   services     = var.services
 }
 
+module "eks" {
+  source       = "../../modules/eks"
+  environment  = local.environment
+  project_name = var.project_name
+  subnet_ids   = var.subnet_ids
+}
+
 module "jenkins" {
-  source            = "../../modules/jenkins"
-  environment       = local.environment
-  project_name      = var.project_name
-  vpc_id            = var.vpc_id
-  vpc_cidr          = var.vpc_cidr
-  subnet_ids        = var.subnet_ids
-  public_subnet_ids = var.public_subnet_ids
-  ecs_ami_id        = var.ecs_ami_id
-  aws_region        = var.aws_region
-  alb_internal      = true
+  source                = "../../modules/jenkins"
+  environment           = local.environment
+  project_name          = var.project_name
+  vpc_id                = var.vpc_id
+  vpc_cidr              = var.vpc_cidr
+  subnet_ids            = var.subnet_ids
+  public_subnet_ids     = var.public_subnet_ids
+  ami_id                = var.ami_id
+  aws_region            = var.aws_region
+  alb_internal          = true
+  eks_cluster_name      = module.eks.cluster_name
+  eks_cluster_endpoint  = module.eks.cluster_endpoint
+  eks_oidc_provider_arn = module.eks.oidc_provider_arn
+  eks_oidc_issuer_host  = module.eks.oidc_issuer_host
 }
 EOF
 

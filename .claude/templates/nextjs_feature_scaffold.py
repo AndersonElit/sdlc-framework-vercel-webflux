@@ -1907,10 +1907,19 @@ def get_jenkinsfile() -> str:
 // Jenkinsfile (frontend Next.js) — deploy a Vercel vía CLI controlado por Jenkins.
 // La Git integration de Vercel está desactivada: el único disparador de
 // despliegues es este pipeline.
+//
+// Modelo de agentes: Kubernetes plugin. Corre en un pod efímero en EKS con un
+// contenedor 'node' (definido en org/flexicredit/podFrontend.yaml de la Shared
+// Library). defaultContainer 'node' hace que todos los sh corran ahí.
 // ───────────────────────────────────────────────────────────────────────────
 
 pipeline {
-    agent { label 'agent-node' }   // Node 20 + npm + Playwright
+    agent {
+        kubernetes {
+            defaultContainer 'node'
+            yaml libraryResource('org/flexicredit/podFrontend.yaml')
+        }
+    }
 
     options {
         timestamps()

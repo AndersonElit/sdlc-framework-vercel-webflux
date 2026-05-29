@@ -101,9 +101,12 @@ cat > "$OUT_DIR/vars/runSecurityScans.groovy" <<'EOF'
 // OWASP Dependency Check (CVEs) + escaneo de secretos. Falla ante hallazgo crítico.
 def call(Map args = [:]) {
     def failOnCvss = args.failOnCvss ?: '9'
+    // OWASP corre en el contenedor maven (defaultContainer del pod backend).
     sh "mvn -B --no-transfer-progress org.owasp:dependency-check-maven:check -DfailBuildOnCVSS=${failOnCvss}"
-    // Escaneo de secretos (gitleaks). Sustituible por trufflehog.
-    sh 'gitleaks detect --source . --no-banner --redact --exit-code 1'
+    // Escaneo de secretos (gitleaks) en su propio contenedor. Sustituible por trufflehog.
+    container('gitleaks') {
+        sh 'gitleaks detect --source . --no-banner --redact --exit-code 1'
+    }
 }
 EOF
 
@@ -140,7 +143,9 @@ def call(Map args = [:]) {
     def imageTag = args.imageTag ?: error('scanImage: falta imageTag')
     def registry = env.ECR_REGISTRY ?: error('scanImage: falta env.ECR_REGISTRY')
     def image = "${registry}/${ecrRepo}:${imageTag}"
-    sh "trivy image --exit-code 1 --severity CRITICAL --no-progress ${image}"
+    container('trivy') {
+        sh "trivy image --exit-code 1 --severity CRITICAL --no-progress ${image}"
+    }
 }
 EOF
 
@@ -152,9 +157,14 @@ def call(Map args = [:]) {
     def namespace = args.namespace ?: error('deployToEks: falta namespace')
     def envName   = args.env       ?: error('deployToEks: falta env')
     def imageTag  = args.imageTag  ?: error('deployToEks: falta imageTag')
-    def registry  = env.ECR_REGISTRY ?: error('deployToEks: falta env.ECR_REGISTRY')
+    def registry  = env.ECR_REGISTRY    ?: error('deployToEks: falta env.ECR_REGISTRY')
+    def cluster   = env.EKS_CLUSTER_NAME ?: error('deployToEks: falta env.EKS_CLUSTER_NAME')
+    def region    = env.AWS_REGION ?: 'us-east-1'
 
     container('deploy') {
+        // El acceso al API server lo autoriza el access entry del rol IRSA
+        // del agente; 'update-kubeconfig' configura el exec auth (aws eks get-token).
+        sh "aws eks update-kubeconfig --name ${cluster} --region ${region}"
         sh """
             helm upgrade --install ${service} ./helm/${service} \\
               --namespace ${namespace} --create-namespace \\
@@ -173,7 +183,10 @@ cat > "$OUT_DIR/vars/runSmokeTests.groovy" <<'EOF'
 def call(Map args = [:]) {
     def service   = args.service   ?: error('runSmokeTests: falta service')
     def namespace = args.namespace ?: error('runSmokeTests: falta namespace')
+    def cluster   = env.EKS_CLUSTER_NAME ?: error('runSmokeTests: falta env.EKS_CLUSTER_NAME')
+    def region    = env.AWS_REGION ?: 'us-east-1'
     container('deploy') {
+        sh "aws eks update-kubeconfig --name ${cluster} --region ${region}"
         sh """
             kubectl rollout status deployment/${service} -n ${namespace} --timeout=180s
             kubectl run smoke-${BUILD_NUMBER} --rm -i --restart=Never -n ${namespace} \\
@@ -228,36 +241,223 @@ EOF
 log_ok "Clase auxiliar src/org/flexicredit/PipelineDefaults.groovy generada."
 
 # ---------------------------------------------------------------------------
-# resources/ — plantilla de pod de agentes (referencia para JCasC)
+# resources/ — pods de agentes (cargados con libraryResource desde los
+# Jenkinsfile vía agent { kubernetes { yaml libraryResource(...) } }).
+# El ServiceAccount jenkins-agent lleva la anotación IRSA (eks.amazonaws.com/
+# role-arn) que la infra crea; así kaniko (ECR) y deploy (EKS) obtienen creds.
 # ---------------------------------------------------------------------------
 mkdir -p "$OUT_DIR/resources/org/flexicredit"
-cat > "$OUT_DIR/resources/org/flexicredit/podTemplate.yaml" <<'EOF'
-# Plantilla de referencia para los pod templates de los agentes efímeros.
-# La configuración real del controller se versiona con JCasC; esto documenta
-# los contenedores que los pasos vars/ esperan (container('kaniko'), etc.).
+
+# Pod backend — build/test (maven), imagen (kaniko), escaneos (trivy/gitleaks),
+# deploy (alpine/k8s) y un sidecar dind para Testcontainers.
+cat > "$OUT_DIR/resources/org/flexicredit/podBackend.yaml" <<'EOF'
 apiVersion: v1
 kind: Pod
 spec:
+  serviceAccountName: jenkins-agent
   containers:
     - name: maven
-      image: maven:3.9-eclipse-temurin-21-alpine
+      image: maven:3.9-eclipse-temurin-21
       command: ['sleep']
       args: ['infinity']
+      env:
+        # Testcontainers apunta al sidecar dind.
+        - name: DOCKER_HOST
+          value: tcp://localhost:2375
+        - name: TESTCONTAINERS_RYUK_DISABLED
+          value: "true"
+      resources:
+        requests:
+          cpu: "1"
+          memory: 2Gi
     - name: kaniko
       image: gcr.io/kaniko-project/executor:debug
       command: ['sleep']
       args: ['infinity']
-    - name: node
-      image: node:20-alpine
+    - name: trivy
+      image: aquasec/trivy:0.53.0
+      command: ['sleep']
+      args: ['infinity']
+    - name: gitleaks
+      image: zricethezav/gitleaks:latest
       command: ['sleep']
       args: ['infinity']
     - name: deploy
       image: alpine/k8s:1.29.0   # incluye kubectl, helm y aws-cli
       command: ['sleep']
       args: ['infinity']
+    # Sidecar Docker-in-Docker para los tests de integración (Testcontainers).
+    - name: dind
+      image: docker:25-dind
+      securityContext:
+        privileged: true
+      env:
+        - name: DOCKER_TLS_CERTDIR
+          value: ""
 EOF
 
-log_ok "Recurso resources/org/flexicredit/podTemplate.yaml generado."
+# Pod frontend — solo Node (build + deploy a Vercel via CLI + Playwright).
+cat > "$OUT_DIR/resources/org/flexicredit/podFrontend.yaml" <<'EOF'
+apiVersion: v1
+kind: Pod
+spec:
+  serviceAccountName: jenkins-agent
+  containers:
+    - name: node
+      image: mcr.microsoft.com/playwright:v1.45.0-jammy   # Node 20 + navegadores
+      command: ['sleep']
+      args: ['infinity']
+      resources:
+        requests:
+          cpu: 500m
+          memory: 1Gi
+EOF
+
+log_ok "Pods de agentes (podBackend.yaml, podFrontend.yaml) generados."
+
+# ---------------------------------------------------------------------------
+# bootstrap/ — objetos Kubernetes previos (namespace + ServiceAccount IRSA).
+# Se aplican una vez con un usuario con permisos de admin sobre el cluster:
+#   kubectl apply -f bootstrap/jenkins-agent-rbac.yaml
+# ---------------------------------------------------------------------------
+mkdir -p "$OUT_DIR/bootstrap"
+cat > "$OUT_DIR/bootstrap/jenkins-agent-rbac.yaml" <<'EOF'
+# Namespace donde el controller lanza los pods agente + ServiceAccount IRSA.
+# Sustituye <JENKINS_AGENT_ROLE_ARN> por el output agent_role_arn del módulo
+# Jenkins de Terraform antes de aplicar.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: jenkins
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: jenkins-agent
+  namespace: jenkins
+  annotations:
+    eks.amazonaws.com/role-arn: <JENKINS_AGENT_ROLE_ARN>
+EOF
+
+log_ok "Manifiesto bootstrap/jenkins-agent-rbac.yaml generado."
+
+# ---------------------------------------------------------------------------
+# docker/ — imagen del controller con JCasC + plugins horneados.
+# Construir y publicar en ECR; apuntar var.jenkins_image del módulo Terraform a
+# esta imagen. Los valores por ambiente se inyectan como variables de entorno
+# (ECR_REGISTRY, EKS_CLUSTER_NAME, AWS_REGION, JENKINS_URL, etc.) en el docker run.
+# ---------------------------------------------------------------------------
+mkdir -p "$OUT_DIR/docker"
+
+cat > "$OUT_DIR/docker/plugins.txt" <<'EOF'
+# Plugins mínimos del controller (instalados con jenkins-plugin-cli).
+configuration-as-code
+kubernetes
+workflow-aggregator
+git
+github
+github-branch-source
+pipeline-utility-steps
+sonar
+slack
+credentials
+credentials-binding
+matrix-auth
+EOF
+
+cat > "$OUT_DIR/docker/Dockerfile" <<'EOF'
+FROM jenkins/jenkins:lts-jdk21
+
+# Salta el wizard y carga la config declarativa (JCasC).
+ENV JAVA_OPTS="-Djenkins.install.runSetupWizard=false"
+ENV CASC_JENKINS_CONFIG=/var/jenkins_home/casc/jenkins.yaml
+
+COPY plugins.txt /usr/share/jenkins/ref/plugins.txt
+RUN jenkins-plugin-cli --plugin-file /usr/share/jenkins/ref/plugins.txt
+
+COPY jenkins.yaml /var/jenkins_home/casc/jenkins.yaml
+EOF
+
+# JCasC. Las claves ${VAR} se resuelven desde variables de entorno del contenedor,
+# por lo que el mismo archivo sirve para dev/staging/prod (valores inyectados por
+# el user_data de la instancia EC2 del controller).
+cat > "$OUT_DIR/docker/jenkins.yaml" <<'EOF'
+jenkins:
+  systemMessage: "FlexiCredit CI/CD — configurado con JCasC"
+  numExecutors: 0   # el controller no ejecuta builds; todo va a agentes EKS
+
+  clouds:
+    - kubernetes:
+        name: "eks"
+        # Endpoint del API server del cluster EKS (controller externo en EC2).
+        serverUrl: "${EKS_API_SERVER}"
+        namespace: "jenkins"
+        # URL por la que los pods agente alcanzan al controller (ALB interno).
+        jenkinsUrl: "${JENKINS_URL}"
+        jenkinsTunnel: "${JENKINS_TUNNEL}"   # host:50000 del controller
+        # Credencial kubeconfig (exec auth: aws eks get-token) generada en la EC2.
+        credentialsId: "eks-kubeconfig"
+        directConnection: false
+        # Los pod templates vienen de los Jenkinsfile (yaml libraryResource);
+        # no se declaran plantillas estáticas aquí.
+        templates: []
+
+  globalNodeProperties:
+    - envVars:
+        env:
+          - key: "ECR_REGISTRY"
+            value: "${ECR_REGISTRY}"
+          - key: "EKS_CLUSTER_NAME"
+            value: "${EKS_CLUSTER_NAME}"
+          - key: "AWS_REGION"
+            value: "${AWS_REGION}"
+
+credentials:
+  system:
+    domainCredentials:
+      - credentials:
+          - string:
+              scope: GLOBAL
+              id: "vercel-token"
+              secret: "${VERCEL_TOKEN}"
+          - string:
+              scope: GLOBAL
+              id: "vercel-org-id"
+              secret: "${VERCEL_ORG_ID}"
+          - string:
+              scope: GLOBAL
+              id: "vercel-project-id"
+              secret: "${VERCEL_PROJECT_ID}"
+          - file:
+              scope: GLOBAL
+              id: "eks-kubeconfig"
+              fileName: "kubeconfig"
+              secretBytes: "${base64:${readFile:/var/jenkins_home/.kube/config}}"
+
+unclassified:
+  location:
+    url: "${JENKINS_URL}"
+  globalLibraries:
+    libraries:
+      - name: "jenkins-shared-library"
+        defaultVersion: "main"
+        implicit: false
+        retriever:
+          modernSCM:
+            scm:
+              git:
+                remote: "${SHARED_LIBRARY_REPO}"
+  sonarGlobalConfiguration:
+    installations:
+      - name: "sonarqube"
+        serverUrl: "${SONAR_URL}"
+        credentialsId: "sonar-token"
+  slackNotifier:
+    teamDomain: "${SLACK_TEAM}"
+    tokenCredentialId: "slack-token"
+EOF
+
+log_ok "Imagen del controller (docker/Dockerfile, plugins.txt, jenkins.yaml) generada."
 
 # ---------------------------------------------------------------------------
 # README + .gitignore
@@ -292,12 +492,40 @@ con el nombre `jenkins-shared-library`, apuntando a este repositorio (rama `main
 | `runSmokeTests(service:, namespace:)` | Smoke Tests (readiness) |
 | `notify(status:, service:, env:)` | Notify (Slack/email) — también usado por el frontend |
 
-## Requisitos del entorno
+## Modelo de ejecución
 
-- `env.ECR_REGISTRY` disponible en el pipeline (registro ECR `<acct>.dkr.ecr.<region>.amazonaws.com`).
-- Pod templates con los contenedores `maven`, `kaniko`, `node` y `deploy`
-  (ver `resources/org/flexicredit/podTemplate.yaml`).
-- Plugins: Pipeline Utility, SonarQube Scanner, Slack Notification, Kubernetes.
+- **Controller**: contenedor Docker en EC2 + EBS (config declarativa con JCasC,
+  ver `docker/`). No ejecuta builds (`numExecutors: 0`).
+- **Agentes**: pods efímeros en EKS (Kubernetes plugin). Los Jenkinsfile cargan
+  el pod con `agent { kubernetes { yaml libraryResource('org/flexicredit/podBackend.yaml') } }`
+  (frontend: `podFrontend.yaml`).
+- **Autenticación**: el ServiceAccount `jenkins-agent` usa IRSA. kaniko hace push
+  a ECR y `deploy` ejecuta `aws eks update-kubeconfig` (exec auth) para helm/kubectl.
+
+## Variables de entorno esperadas (inyectadas por JCasC / infra)
+
+- `ECR_REGISTRY` — `<acct>.dkr.ecr.<region>.amazonaws.com`.
+- `EKS_CLUSTER_NAME`, `AWS_REGION` — usados por `deployToEks` / `runSmokeTests`.
+
+## Puesta en marcha
+
+1. Construye y publica la imagen del controller (`docker/`) en ECR; apunta
+   `var.jenkins_image` del módulo Jenkins de Terraform a esa imagen.
+2. Aplica `bootstrap/jenkins-agent-rbac.yaml` en el cluster (sustituyendo
+   `<JENKINS_AGENT_ROLE_ARN>` por el output `agent_role_arn`).
+3. Provee las credenciales referenciadas por el JCasC: `sonar-token`,
+   `slack-token`, `vercel-*` y el kubeconfig `eks-kubeconfig`.
+
+## Pods de agentes (`resources/org/flexicredit/`)
+
+- `podBackend.yaml` — contenedores `maven` (default), `kaniko`, `trivy`,
+  `gitleaks`, `deploy` (alpine/k8s) y sidecar `dind` (Testcontainers).
+- `podFrontend.yaml` — contenedor `node` (build + deploy Vercel + Playwright).
+
+## Plugins requeridos
+
+Ver `docker/plugins.txt` (configuration-as-code, kubernetes, workflow-aggregator,
+pipeline-utility-steps, sonar, slack, git/github, credentials, matrix-auth).
 EOF
 
 cat > "$OUT_DIR/.gitignore" <<'EOF'
@@ -332,9 +560,13 @@ echo
 log_ok "Shared Library lista en: $(cd "$OUT_DIR" && pwd)"
 echo
 echo "  Siguientes pasos:"
-echo "  1. Publica el directorio como repositorio remoto (GitHub/GitLab)."
-echo "  2. Regístralo en Jenkins: Manage Jenkins → System → Global Pipeline Libraries"
-echo "     name=jenkins-shared-library, default version=main, SCM=este repo."
-echo "  3. Los Jenkinsfile generados por los scaffolds ya lo referencian con"
-echo "     @Library('jenkins-shared-library@main') _"
+echo "  1. Publica el directorio como repositorio remoto (GitHub/GitLab) y úsalo"
+echo "     como SHARED_LIBRARY_REPO (el JCasC registra la Global Pipeline Library)."
+echo "  2. Construye y publica la imagen del controller (docker/) en ECR y apunta"
+echo "     var.jenkins_image del módulo Jenkins de Terraform a esa imagen."
+echo "  3. Aplica bootstrap/jenkins-agent-rbac.yaml en el cluster (namespace +"
+echo "     ServiceAccount IRSA) usando el output agent_role_arn de Terraform."
+echo "  4. Los Jenkinsfile generados por los scaffolds ya referencian la librería"
+echo "     con @Library('jenkins-shared-library@main') _ y cargan los pods con"
+echo "     libraryResource('org/flexicredit/podBackend.yaml' | 'podFrontend.yaml')."
 echo
