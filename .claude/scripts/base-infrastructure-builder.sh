@@ -2593,6 +2593,31 @@ variable "ami_id" {
   type        = string
   default     = "ami-00000000"
 }
+
+variable "db_name" {
+  description = "Nombre de la base de datos inicial (floci: valor de prueba)"
+  type        = string
+  default     = "flexicredit_dev"
+}
+
+variable "db_username" {
+  description = "Usuario administrador de la base de datos (floci: valor de prueba)"
+  type        = string
+  default     = "admin"
+}
+
+variable "db_password" {
+  description = "Contraseña del usuario administrador (floci: valor de prueba)"
+  type        = string
+  default     = "changeme123"
+  sensitive   = true
+}
+
+variable "vpc_security_group_ids" {
+  description = "IDs de security groups con acceso a RDS (floci: valor de prueba)"
+  type        = list(string)
+  default     = ["sg-00000000"]
+}
 EOF
 
 cat > "$TF_BACKEND/environments/dev/main.tf" << 'EOF'
@@ -2669,6 +2694,17 @@ module "msk" {
   vpc_cidr     = var.vpc_cidr
   subnet_ids   = var.subnet_ids
 }
+
+module "rds" {
+  source                  = "../../modules/rds"
+  environment             = local.environment
+  project_name            = local.project_name
+  subnet_ids              = var.subnet_ids
+  vpc_security_group_ids  = var.vpc_security_group_ids
+  db_name                 = var.db_name
+  db_username             = var.db_username
+  db_password             = var.db_password
+}
 EOF
 
 cat > "$TF_BACKEND/environments/dev/outputs.tf" << 'EOF'
@@ -2736,6 +2772,26 @@ output "msk_bootstrap_brokers_tls" {
 output "msk_access_policy_arn" {
   description = "ARN de la política IAM para adjuntar al task role de los microservicios"
   value       = module.msk.msk_access_policy_arn
+}
+
+output "rds_endpoint" {
+  description = "Endpoint de conexión a RDS"
+  value       = module.rds.endpoint
+}
+
+output "rds_port" {
+  description = "Puerto de conexión a RDS"
+  value       = module.rds.port
+}
+
+output "rds_db_name" {
+  description = "Nombre de la base de datos"
+  value       = module.rds.db_name
+}
+
+output "rds_arn" {
+  description = "ARN de la instancia RDS"
+  value       = module.rds.arn
 }
 EOF
 
@@ -2845,6 +2901,27 @@ variable "ami_id" {
   description = "AMI base (Amazon Linux 2023) para la instancia EC2 del controller Jenkins"
   type        = string
 }
+
+variable "db_name" {
+  description = "Nombre de la base de datos inicial"
+  type        = string
+}
+
+variable "db_username" {
+  description = "Usuario administrador de la base de datos"
+  type        = string
+}
+
+variable "db_password" {
+  description = "Contraseña del usuario administrador"
+  type        = string
+  sensitive   = true
+}
+
+variable "vpc_security_group_ids" {
+  description = "IDs de security groups con acceso a RDS"
+  type        = list(string)
+}
 EOF
 
 cat > "$TF_BACKEND/environments/$env/main.tf" << EOF
@@ -2918,6 +2995,17 @@ module "msk" {
   vpc_id       = var.vpc_id
   vpc_cidr     = var.vpc_cidr
   subnet_ids   = var.subnet_ids
+}
+
+module "rds" {
+  source                  = "../../modules/rds"
+  environment             = local.environment
+  project_name            = var.project_name
+  subnet_ids              = var.subnet_ids
+  vpc_security_group_ids  = var.vpc_security_group_ids
+  db_name                 = var.db_name
+  db_username             = var.db_username
+  db_password             = var.db_password
 }
 
 # ArgoCD (CD por GitOps). Se instala en el cluster EKS de este ambiente; los
@@ -3011,6 +3099,26 @@ output "argocd_admin_password_cmd" {
 output "argocd_server_url_cmd" {
   description = "Comando para obtener la URL (LoadBalancer) del argocd-server"
   value       = module.argocd.server_url_cmd
+}
+
+output "rds_endpoint" {
+  description = "Endpoint de conexión a RDS"
+  value       = module.rds.endpoint
+}
+
+output "rds_port" {
+  description = "Puerto de conexión a RDS"
+  value       = module.rds.port
+}
+
+output "rds_db_name" {
+  description = "Nombre de la base de datos"
+  value       = module.rds.db_name
+}
+
+output "rds_arn" {
+  description = "ARN de la instancia RDS"
+  value       = module.rds.arn
 }
 EOF
 
