@@ -1142,11 +1142,16 @@ resource "aws_security_group" "mongodb" {
 # La AZ se deriva de subnet_ids[0] para que coincida con la instancia EC2.
 
 data "aws_subnet" "mongodb_primary" {
-  id = var.subnet_ids[0]
+  count = var.availability_zone == "" ? 1 : 0
+  id    = var.subnet_ids[0]
+}
+
+locals {
+  mongodb_az = var.availability_zone != "" ? var.availability_zone : data.aws_subnet.mongodb_primary[0].availability_zone
 }
 
 resource "aws_ebs_volume" "mongodb_data" {
-  availability_zone = data.aws_subnet.mongodb_primary.availability_zone
+  availability_zone = local.mongodb_az
   size              = var.volume_size_gb
   type              = var.volume_type
   encrypted         = true
@@ -1432,6 +1437,12 @@ variable "subnet_ids" {
   type        = list(string)
 }
 
+variable "availability_zone" {
+  description = "Availability Zone (se infiere de subnet_ids[0] si se omite; requerido con floci)"
+  type        = string
+  default     = ""
+}
+
 variable "ami_id" {
   description = "AMI Amazon Linux 2 para la instancia MongoDB"
   type        = string
@@ -1589,11 +1600,16 @@ resource "aws_security_group" "jenkins_ec2" {
 # La AZ del volumen se deriva de subnet_ids[0] para coincidir con la instancia EC2.
 
 data "aws_subnet" "jenkins_primary" {
-  id = var.subnet_ids[0]
+  count = var.availability_zone == "" ? 1 : 0
+  id    = var.subnet_ids[0]
+}
+
+locals {
+  jenkins_az = var.availability_zone != "" ? var.availability_zone : data.aws_subnet.jenkins_primary[0].availability_zone
 }
 
 resource "aws_ebs_volume" "jenkins_home" {
-  availability_zone = data.aws_subnet.jenkins_primary.availability_zone
+  availability_zone = local.jenkins_az
   size              = var.volume_size_gb
   type              = var.volume_type
   encrypted         = true
@@ -2042,6 +2058,12 @@ variable "aws_region" {
   description = "Región AWS"
   type        = string
   default     = "us-east-1"
+}
+
+variable "availability_zone" {
+  description = "Availability Zone (se infiere de subnet_ids[0] si se omite; requerido con floci)"
+  type        = string
+  default     = ""
 }
 
 variable "jenkins_image" {
@@ -2605,6 +2627,12 @@ variable "ami_id" {
   default     = "ami-00000000"
 }
 
+variable "availability_zone" {
+  description = "Availability Zone (floci: valor de prueba)"
+  type        = string
+  default     = "us-east-1a"
+}
+
 variable "db_name" {
   description = "Nombre de la base de datos inicial (floci: valor de prueba)"
   type        = string
@@ -2690,6 +2718,7 @@ module "jenkins" {
   public_subnet_ids     = var.public_subnet_ids
   ami_id                = var.ami_id
   aws_region            = var.aws_region
+  availability_zone     = var.availability_zone
   alb_internal          = true
   eks_cluster_name      = module.eks.cluster_name
   eks_cluster_endpoint  = module.eks.cluster_endpoint
