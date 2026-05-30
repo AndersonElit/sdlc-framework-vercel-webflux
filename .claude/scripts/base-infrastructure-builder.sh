@@ -267,6 +267,7 @@ resource "aws_iam_role" "cluster" {
 }
 
 resource "aws_iam_role_policy_attachment" "cluster_policy" {
+  count      = var.attach_managed_policies ? 1 : 0
   role       = aws_iam_role.cluster.name
   policy_arn = "arn:aws:iam::aws:policy/AmazonEKSClusterPolicy"
 }
@@ -277,16 +278,19 @@ resource "aws_iam_role" "nodes" {
 }
 
 resource "aws_iam_role_policy_attachment" "nodes_worker" {
+  count      = var.attach_managed_policies ? 1 : 0
   role       = aws_iam_role.nodes.name
   policy_arn = "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy"
 }
 
 resource "aws_iam_role_policy_attachment" "nodes_cni" {
+  count      = var.attach_managed_policies ? 1 : 0
   role       = aws_iam_role.nodes.name
   policy_arn = "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy"
 }
 
 resource "aws_iam_role_policy_attachment" "nodes_ecr" {
+  count      = var.attach_managed_policies ? 1 : 0
   role       = aws_iam_role.nodes.name
   policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
 }
@@ -407,6 +411,12 @@ variable "node_max_size" {
   type        = number
   default     = 4
 }
+
+variable "attach_managed_policies" {
+  description = "Adjuntar políticas administradas de AWS a los roles (false en Floci: no existen managed policies de EKS)"
+  type        = bool
+  default     = true
+}
 EOF
 
 cat > "$TF_BACKEND/modules/eks/outputs.tf" << 'EOF'
@@ -461,7 +471,9 @@ log_ok "Módulo EKS listo."
 log "Escribiendo módulo RDS..."
 
 cat > "$TF_BACKEND/modules/rds/main.tf" << 'EOF'
+# enabled = false en Floci: CreateDBSubnetGroup no está soportado.
 resource "aws_db_subnet_group" "main" {
+  count       = var.enabled ? 1 : 0
   name        = "${var.project_name}-${var.environment}-rds"
   description = "Subnet group para ${var.project_name} ${var.environment}"
   subnet_ids  = var.subnet_ids
@@ -473,6 +485,7 @@ resource "aws_db_subnet_group" "main" {
 }
 
 resource "aws_db_instance" "main" {
+  count             = var.enabled ? 1 : 0
   identifier        = "${var.project_name}-${var.environment}"
   engine            = "postgres"
   engine_version    = var.engine_version
@@ -484,7 +497,7 @@ resource "aws_db_instance" "main" {
   username = var.db_username
   password = var.db_password
 
-  db_subnet_group_name   = aws_db_subnet_group.main.name
+  db_subnet_group_name   = aws_db_subnet_group.main[0].name
   vpc_security_group_ids = var.vpc_security_group_ids
 
   multi_az            = var.multi_az
@@ -568,32 +581,38 @@ variable "deletion_protection" {
   type        = bool
   default     = false
 }
+
+variable "enabled" {
+  description = "Crear recursos RDS (false en Floci: CreateDBSubnetGroup no soportado)"
+  type        = bool
+  default     = true
+}
 EOF
 
 cat > "$TF_BACKEND/modules/rds/outputs.tf" << 'EOF'
 output "endpoint" {
   description = "Endpoint de conexión a RDS"
-  value       = aws_db_instance.main.endpoint
+  value       = try(aws_db_instance.main[0].endpoint, "")
 }
 
 output "port" {
   description = "Puerto de conexión a RDS"
-  value       = aws_db_instance.main.port
+  value       = try(aws_db_instance.main[0].port, null)
 }
 
 output "db_name" {
   description = "Nombre de la base de datos"
-  value       = aws_db_instance.main.db_name
+  value       = try(aws_db_instance.main[0].db_name, "")
 }
 
 output "identifier" {
   description = "Identificador de la instancia RDS"
-  value       = aws_db_instance.main.identifier
+  value       = try(aws_db_instance.main[0].identifier, "")
 }
 
 output "arn" {
   description = "ARN de la instancia RDS"
-  value       = aws_db_instance.main.arn
+  value       = try(aws_db_instance.main[0].arn, "")
 }
 EOF
 
@@ -643,6 +662,12 @@ resource "aws_iam_policy" "secrets_read" {
       Resource = "arn:aws:secretsmanager:*:*:secret:/${var.environment}/*"
     }]
   })
+
+  # Floci ignora el atributo description al crear la política; ignorar el drift
+  # evita reemplazos innecesarios en cada apply.
+  lifecycle {
+    ignore_changes = [description, tags_all]
+  }
 }
 
 resource "aws_iam_policy" "ecr_pull" {
@@ -662,6 +687,10 @@ resource "aws_iam_policy" "ecr_pull" {
       Resource = "*"
     }]
   })
+
+  lifecycle {
+    ignore_changes = [description, tags_all]
+  }
 }
 
 resource "aws_iam_role_policy_attachment" "task_secrets" {
@@ -764,9 +793,28 @@ resource "aws_cognito_user_pool_client" "app_client" {
     id_token      = "hours"
     refresh_token = "days"
   }
+
+  # Floci devuelve atributos vacíos tras el apply; ignorarlos evita que Terraform
+  # marque el recurso como tainted por "inconsistent result" en cada ejecución.
+  lifecycle {
+    ignore_changes = [
+      callback_urls,
+      logout_urls,
+      supported_identity_providers,
+      allowed_oauth_flows,
+      allowed_oauth_scopes,
+      allowed_oauth_flows_user_pool_client,
+      access_token_validity,
+      id_token_validity,
+      refresh_token_validity,
+      token_validity_units,
+    ]
+  }
 }
 
+# CreateUserPoolDomain no está soportado en Floci; se omite en dev con enable_domain = false.
 resource "aws_cognito_user_pool_domain" "main" {
+  count        = var.enable_domain ? 1 : 0
   domain       = "${var.project_name}-${var.environment}"
   user_pool_id = aws_cognito_user_pool.main.id
 }
@@ -793,6 +841,12 @@ variable "logout_urls" {
   description = "URLs de logout OAuth2"
   type        = list(string)
   default     = ["http://localhost:3000"]
+}
+
+variable "enable_domain" {
+  description = "Crear el dominio del User Pool (false en Floci: CreateUserPoolDomain no soportado)"
+  type        = bool
+  default     = true
 }
 EOF
 
@@ -1643,7 +1697,9 @@ resource "aws_iam_role" "jenkins_ec2" {
 }
 
 # Permite a SSM administrar la instancia (sesiones sin SSH abierto).
+# attach_ssm_policy = false en Floci: AmazonSSMManagedInstanceCore no existe.
 resource "aws_iam_role_policy_attachment" "jenkins_ec2_ssm" {
+  count      = var.attach_ssm_policy ? 1 : 0
   role       = aws_iam_role.jenkins_ec2.name
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
@@ -1651,6 +1707,10 @@ resource "aws_iam_role_policy_attachment" "jenkins_ec2_ssm" {
 resource "aws_iam_policy" "jenkins_ec2" {
   name        = "${var.project_name}-${var.environment}-jenkins-ec2"
   description = "Adjuntar el EBS de JENKINS_HOME y resolver el cluster EKS (kubeconfig)"
+
+  lifecycle {
+    ignore_changes = [description, tags_all]
+  }
 
   policy = jsonencode({
     Version = "2012-10-17"
@@ -1715,6 +1775,10 @@ resource "aws_iam_role" "jenkins_agent" {
 resource "aws_iam_policy" "jenkins_agent" {
   name        = "${var.project_name}-${var.environment}-jenkins-agent"
   description = "Permisos del agente: push/pull ECR (kaniko), leer secrets y describir EKS (deploy)"
+
+  lifecycle {
+    ignore_changes = [description, tags_all]
+  }
 
   policy = jsonencode({
     Version = "2012-10-17"
@@ -2117,6 +2181,12 @@ variable "alb_internal" {
   type        = bool
   default     = false
 }
+
+variable "attach_ssm_policy" {
+  description = "Adjuntar AmazonSSMManagedInstanceCore al rol EC2 (false en Floci: managed policy no existe)"
+  type        = bool
+  default     = true
+}
 EOF
 
 cat > "$TF_BACKEND/modules/jenkins/outputs.tf" << 'EOF'
@@ -2166,7 +2236,9 @@ locals {
   log_retention_days  = var.environment == "dev" ? 7 : 30
 }
 
+# enabled = false en Floci: CreateConfiguration y aws_msk_cluster no están soportados.
 resource "aws_security_group" "msk" {
+  count       = var.enabled ? 1 : 0
   name        = "${var.project_name}-${var.environment}-msk"
   description = "Security group para el cluster MSK"
   vpc_id      = var.vpc_id
@@ -2217,6 +2289,7 @@ resource "aws_security_group" "msk" {
 }
 
 resource "aws_cloudwatch_log_group" "msk_broker" {
+  count             = var.enabled ? 1 : 0
   name              = "/aws/msk/${var.project_name}-${var.environment}/broker"
   retention_in_days = local.log_retention_days
 
@@ -2227,6 +2300,7 @@ resource "aws_cloudwatch_log_group" "msk_broker" {
 }
 
 resource "aws_msk_configuration" "main" {
+  count          = var.enabled ? 1 : 0
   name           = "${var.project_name}-${var.environment}"
   kafka_versions = [var.kafka_version]
   description    = "Configuración broker MSK para ${var.project_name} ${var.environment}"
@@ -2241,6 +2315,7 @@ PROPS
 }
 
 resource "aws_msk_cluster" "main" {
+  count                  = var.enabled ? 1 : 0
   cluster_name           = "${var.project_name}-${var.environment}"
   kafka_version          = var.kafka_version
   number_of_broker_nodes = var.number_of_broker_nodes
@@ -2254,7 +2329,7 @@ resource "aws_msk_cluster" "main" {
         volume_size = var.broker_ebs_volume_size
       }
     }
-    security_groups = [aws_security_group.msk.id]
+    security_groups = [aws_security_group.msk[0].id]
   }
 
   encryption_info {
@@ -2265,15 +2340,15 @@ resource "aws_msk_cluster" "main" {
   }
 
   configuration_info {
-    arn      = aws_msk_configuration.main.arn
-    revision = aws_msk_configuration.main.latest_revision
+    arn      = aws_msk_configuration.main[0].arn
+    revision = aws_msk_configuration.main[0].latest_revision
   }
 
   logging_info {
     broker_logs {
       cloudwatch_logs {
         enabled   = true
-        log_group = aws_cloudwatch_log_group.msk_broker.name
+        log_group = aws_cloudwatch_log_group.msk_broker[0].name
       }
     }
   }
@@ -2293,6 +2368,7 @@ resource "aws_msk_cluster" "main" {
 
 # Política IAM para producir/consumir desde microservicios vía autenticación IAM.
 resource "aws_iam_policy" "msk_access" {
+  count       = var.enabled ? 1 : 0
   name        = "${var.project_name}-${var.environment}-msk-access"
   description = "Permite a los microservicios producir y consumir en el cluster MSK"
 
@@ -2306,7 +2382,7 @@ resource "aws_iam_policy" "msk_access" {
           "kafka-cluster:Connect",
           "kafka-cluster:DescribeCluster"
         ]
-        Resource = aws_msk_cluster.main.arn
+        Resource = aws_msk_cluster.main[0].arn
       },
       {
         Sid    = "MSKTopicReadWrite"
@@ -2317,7 +2393,7 @@ resource "aws_iam_policy" "msk_access" {
           "kafka-cluster:WriteData",
           "kafka-cluster:ReadData"
         ]
-        Resource = "arn:aws:kafka:*:*:topic/${aws_msk_cluster.main.cluster_name}/*/*"
+        Resource = "arn:aws:kafka:*:*:topic/${aws_msk_cluster.main[0].cluster_name}/*/*"
       },
       {
         Sid    = "MSKConsumerGroup"
@@ -2326,7 +2402,7 @@ resource "aws_iam_policy" "msk_access" {
           "kafka-cluster:AlterGroup",
           "kafka-cluster:DescribeGroup"
         ]
-        Resource = "arn:aws:kafka:*:*:group/${aws_msk_cluster.main.cluster_name}/*/*"
+        Resource = "arn:aws:kafka:*:*:group/${aws_msk_cluster.main[0].cluster_name}/*/*"
       }
     ]
   })
@@ -2382,47 +2458,53 @@ variable "broker_ebs_volume_size" {
   type        = number
   default     = 20
 }
+
+variable "enabled" {
+  description = "Crear recursos MSK (false en Floci: CreateConfiguration y MSK cluster no soportados)"
+  type        = bool
+  default     = true
+}
 EOF
 
 cat > "$TF_BACKEND/modules/msk/outputs.tf" << 'EOF'
 output "cluster_arn" {
   description = "ARN del cluster MSK"
-  value       = aws_msk_cluster.main.arn
+  value       = try(aws_msk_cluster.main[0].arn, "")
 }
 
 output "cluster_name" {
   description = "Nombre del cluster MSK"
-  value       = aws_msk_cluster.main.cluster_name
+  value       = try(aws_msk_cluster.main[0].cluster_name, "")
 }
 
 output "bootstrap_brokers" {
   description = "Lista de brokers Kafka en texto plano (para conexiones internas en dev)"
-  value       = aws_msk_cluster.main.bootstrap_brokers
+  value       = try(aws_msk_cluster.main[0].bootstrap_brokers, "")
 }
 
 output "bootstrap_brokers_tls" {
   description = "Lista de brokers Kafka con TLS"
-  value       = aws_msk_cluster.main.bootstrap_brokers_tls
+  value       = try(aws_msk_cluster.main[0].bootstrap_brokers_tls, "")
 }
 
 output "zookeeper_connect_string" {
   description = "String de conexión a ZooKeeper"
-  value       = aws_msk_cluster.main.zookeeper_connect_string
+  value       = try(aws_msk_cluster.main[0].zookeeper_connect_string, "")
 }
 
 output "security_group_id" {
   description = "ID del SG del cluster MSK (añadir a los microservicios que lo consuman)"
-  value       = aws_security_group.msk.id
+  value       = try(aws_security_group.msk[0].id, "")
 }
 
 output "msk_access_policy_arn" {
   description = "ARN de la política IAM para producir/consumir en MSK (adjuntar al task role)"
-  value       = aws_iam_policy.msk_access.arn
+  value       = try(aws_iam_policy.msk_access[0].arn, "")
 }
 
 output "cloudwatch_log_group" {
   description = "Nombre del log group de CloudWatch para los brokers MSK"
-  value       = aws_cloudwatch_log_group.msk_broker.name
+  value       = try(aws_cloudwatch_log_group.msk_broker[0].name, "")
 }
 EOF
 
@@ -2573,19 +2655,22 @@ provider "aws" {
   skip_requesting_account_id  = true
 
   endpoints {
-    ec2            = "http://localhost:4566"
-    eks            = "http://localhost:4566"
-    rds            = "http://localhost:4566"
-    s3             = "http://localhost:4566"
-    iam            = "http://localhost:4566"
-    sts            = "http://localhost:4566"
-    cognitoidp     = "http://localhost:4566"
-    apigateway     = "http://localhost:4566"
-    apigatewayv2   = "http://localhost:4566"
+    ec2              = "http://localhost:4566"
+    eks              = "http://localhost:4566"
+    rds              = "http://localhost:4566"
+    s3               = "http://localhost:4566"
+    iam              = "http://localhost:4566"
+    sts              = "http://localhost:4566"
+    cognitoidp       = "http://localhost:4566"
+    apigateway       = "http://localhost:4566"
+    apigatewayv2     = "http://localhost:4566"
     secretsmanager       = "http://localhost:4566"
     ecr                  = "http://localhost:4566"
     elasticloadbalancing = "http://localhost:4566"
     kafka                = "http://localhost:4566"
+    cloudwatchlogs       = "http://localhost:4566"
+    ssm                  = "http://localhost:4566"
+    autoscaling          = "http://localhost:4566"
   }
 }
 EOF
@@ -2660,10 +2745,26 @@ variable "vpc_security_group_ids" {
 EOF
 
 cat > "$TF_BACKEND/environments/dev/main.tf" << 'EOF'
+# Floci tiene una VPC por defecto; la descubrimos en lugar de usar IDs hardcodeados.
+data "aws_vpc" "default" {
+  default = true
+}
+
+data "aws_subnets" "default" {
+  filter {
+    name   = "vpc-id"
+    values = [data.aws_vpc.default.id]
+  }
+}
+
 locals {
   project_name = "my-app"
   environment  = "dev"
   services     = ["auth-svc", "user-svc", "order-svc"]
+
+  vpc_id     = data.aws_vpc.default.id
+  vpc_cidr   = data.aws_vpc.default.cidr_block
+  subnet_ids = data.aws_subnets.default.ids
 }
 
 module "iam" {
@@ -2673,9 +2774,10 @@ module "iam" {
 }
 
 module "cognito" {
-  source       = "../../modules/cognito"
-  environment  = local.environment
-  project_name = local.project_name
+  source        = "../../modules/cognito"
+  environment   = local.environment
+  project_name  = local.project_name
+  enable_domain = false
 }
 
 module "api_gateway" {
@@ -2702,20 +2804,21 @@ module "ecr" {
 }
 
 module "eks" {
-  source       = "../../modules/eks"
-  environment  = local.environment
-  project_name = local.project_name
-  subnet_ids   = var.subnet_ids
+  source                  = "../../modules/eks"
+  environment             = local.environment
+  project_name            = local.project_name
+  subnet_ids              = local.subnet_ids
+  attach_managed_policies = false
 }
 
 module "jenkins" {
   source                = "../../modules/jenkins"
   environment           = local.environment
   project_name          = local.project_name
-  vpc_id                = var.vpc_id
-  vpc_cidr              = var.vpc_cidr
-  subnet_ids            = var.subnet_ids
-  public_subnet_ids     = var.public_subnet_ids
+  vpc_id                = local.vpc_id
+  vpc_cidr              = local.vpc_cidr
+  subnet_ids            = local.subnet_ids
+  public_subnet_ids     = local.subnet_ids
   ami_id                = var.ami_id
   aws_region            = var.aws_region
   availability_zone     = var.availability_zone
@@ -2724,26 +2827,29 @@ module "jenkins" {
   eks_cluster_endpoint  = module.eks.cluster_endpoint
   eks_oidc_provider_arn = module.eks.oidc_provider_arn
   eks_oidc_issuer_host  = module.eks.oidc_issuer_host
+  attach_ssm_policy     = false
 }
 
 module "msk" {
   source       = "../../modules/msk"
   environment  = local.environment
   project_name = local.project_name
-  vpc_id       = var.vpc_id
-  vpc_cidr     = var.vpc_cidr
-  subnet_ids   = var.subnet_ids
+  vpc_id       = local.vpc_id
+  vpc_cidr     = local.vpc_cidr
+  subnet_ids   = local.subnet_ids
+  enabled      = false
 }
 
 module "rds" {
-  source                  = "../../modules/rds"
-  environment             = local.environment
-  project_name            = local.project_name
-  subnet_ids              = var.subnet_ids
-  vpc_security_group_ids  = var.vpc_security_group_ids
-  db_name                 = var.db_name
-  db_username             = var.db_username
-  db_password             = var.db_password
+  source                 = "../../modules/rds"
+  environment            = local.environment
+  project_name           = local.project_name
+  subnet_ids             = local.subnet_ids
+  vpc_security_group_ids = var.vpc_security_group_ids
+  db_name                = var.db_name
+  db_username            = var.db_username
+  db_password            = var.db_password
+  enabled                = false
 }
 EOF
 
