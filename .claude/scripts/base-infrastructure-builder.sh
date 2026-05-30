@@ -321,14 +321,18 @@ resource "aws_eks_cluster" "main" {
 # --- OIDC provider (IRSA) ---
 # Permite que los ServiceAccounts del cluster (p. ej. jenkins-agent) asuman
 # roles IAM mediante web identity federation.
+# Floci no popula identity[0].oidc[0] ni soporta node groups; en dev se desactiva
+# el data plane con enable_data_plane = false.
 data "tls_certificate" "oidc" {
-  url = aws_eks_cluster.main.identity[0].oidc[0].issuer
+  count = var.enable_data_plane ? 1 : 0
+  url   = aws_eks_cluster.main.identity[0].oidc[0].issuer
 }
 
 resource "aws_iam_openid_connect_provider" "main" {
+  count           = var.enable_data_plane ? 1 : 0
   url             = aws_eks_cluster.main.identity[0].oidc[0].issuer
   client_id_list  = ["sts.amazonaws.com"]
-  thumbprint_list = [data.tls_certificate.oidc.certificates[0].sha1_fingerprint]
+  thumbprint_list = [data.tls_certificate.oidc[0].certificates[0].sha1_fingerprint]
 
   tags = {
     Environment = var.environment
@@ -337,6 +341,7 @@ resource "aws_iam_openid_connect_provider" "main" {
 }
 
 resource "aws_eks_node_group" "main" {
+  count           = var.enable_data_plane ? 1 : 0
   cluster_name    = aws_eks_cluster.main.name
   node_group_name = "${var.project_name}-${var.environment}-ng"
   node_role_arn   = aws_iam_role.nodes.arn
@@ -417,6 +422,12 @@ variable "attach_managed_policies" {
   type        = bool
   default     = true
 }
+
+variable "enable_data_plane" {
+  description = "Crear node group + OIDC provider (false en Floci: no soporta CreateNodegroup ni popula el OIDC issuer del cluster)"
+  type        = bool
+  default     = true
+}
 EOF
 
 cat > "$TF_BACKEND/modules/eks/outputs.tf" << 'EOF'
@@ -442,23 +453,23 @@ output "cluster_ca_certificate" {
 }
 
 output "cluster_oidc_issuer_url" {
-  description = "URL del OIDC issuer (para IRSA)"
-  value       = aws_eks_cluster.main.identity[0].oidc[0].issuer
+  description = "URL del OIDC issuer (para IRSA); vacío cuando el data plane está desactivado (Floci)"
+  value       = try(aws_eks_cluster.main.identity[0].oidc[0].issuer, "")
 }
 
 output "oidc_provider_arn" {
-  description = "ARN del IAM OIDC provider del cluster (para los roles IRSA)"
-  value       = aws_iam_openid_connect_provider.main.arn
+  description = "ARN del IAM OIDC provider del cluster (para los roles IRSA); vacío sin data plane"
+  value       = try(aws_iam_openid_connect_provider.main[0].arn, "")
 }
 
 output "oidc_issuer_host" {
-  description = "Host del OIDC issuer (sin https://) para las condiciones de confianza IRSA"
-  value       = replace(aws_eks_cluster.main.identity[0].oidc[0].issuer, "https://", "")
+  description = "Host del OIDC issuer (sin https://) para las condiciones de confianza IRSA; vacío sin data plane"
+  value       = try(replace(aws_eks_cluster.main.identity[0].oidc[0].issuer, "https://", ""), "")
 }
 
 output "node_group_arn" {
-  description = "ARN del node group"
-  value       = aws_eks_node_group.main.arn
+  description = "ARN del node group; vacío sin data plane"
+  value       = try(aws_eks_node_group.main[0].arn, "")
 }
 EOF
 
@@ -774,41 +785,32 @@ resource "aws_cognito_user_pool_client" "app_client" {
   name         = "${var.project_name}-${var.environment}-client"
   user_pool_id = aws_cognito_user_pool.main.id
 
-  generate_secret                      = false
-  allowed_oauth_flows_user_pool_client = true
-  allowed_oauth_flows                  = ["implicit", "code"]
-  allowed_oauth_scopes                 = ["email", "openid", "profile"]
+  generate_secret = false
 
-  callback_urls = var.callback_urls
-  logout_urls   = var.logout_urls
+  # Floci devuelve estos atributos en cero/vacío tras el apply, lo que produce un
+  # error "Provider produced inconsistent result" (comprobación en tiempo de apply
+  # que ignore_changes NO evita). En el emulador se omite toda la configuración
+  # OAuth/token y se crea un client mínimo; en AWS real se configura completa.
+  allowed_oauth_flows_user_pool_client = var.emulator ? null : true
+  allowed_oauth_flows                  = var.emulator ? null : ["implicit", "code"]
+  allowed_oauth_scopes                 = var.emulator ? null : ["email", "openid", "profile"]
 
-  supported_identity_providers = ["COGNITO"]
+  callback_urls = var.emulator ? null : var.callback_urls
+  logout_urls   = var.emulator ? null : var.logout_urls
 
-  access_token_validity  = 1
-  id_token_validity      = 1
-  refresh_token_validity = 30
+  supported_identity_providers = var.emulator ? null : ["COGNITO"]
 
-  token_validity_units {
-    access_token  = "hours"
-    id_token      = "hours"
-    refresh_token = "days"
-  }
+  access_token_validity  = var.emulator ? null : 1
+  id_token_validity      = var.emulator ? null : 1
+  refresh_token_validity = var.emulator ? null : 30
 
-  # Floci devuelve atributos vacíos tras el apply; ignorarlos evita que Terraform
-  # marque el recurso como tainted por "inconsistent result" en cada ejecución.
-  lifecycle {
-    ignore_changes = [
-      callback_urls,
-      logout_urls,
-      supported_identity_providers,
-      allowed_oauth_flows,
-      allowed_oauth_scopes,
-      allowed_oauth_flows_user_pool_client,
-      access_token_validity,
-      id_token_validity,
-      refresh_token_validity,
-      token_validity_units,
-    ]
+  dynamic "token_validity_units" {
+    for_each = var.emulator ? [] : [1]
+    content {
+      access_token  = "hours"
+      id_token      = "hours"
+      refresh_token = "days"
+    }
   }
 }
 
@@ -847,6 +849,12 @@ variable "enable_domain" {
   description = "Crear el dominio del User Pool (false en Floci: CreateUserPoolDomain no soportado)"
   type        = bool
   default     = true
+}
+
+variable "emulator" {
+  description = "Crear un app client mínimo sin OAuth/token config (true en Floci: devuelve atributos inconsistentes tras el apply)"
+  type        = bool
+  default     = false
 }
 EOF
 
@@ -1748,6 +1756,7 @@ resource "aws_iam_instance_profile" "jenkins_ec2" {
 # este rol. kaniko lo usa para push a ECR; el deploy para 'aws eks get-token'.
 
 data "aws_iam_policy_document" "jenkins_agent_assume_role" {
+  count = var.enable_compute ? 1 : 0
   statement {
     actions = ["sts:AssumeRoleWithWebIdentity"]
     principals {
@@ -1768,11 +1777,13 @@ data "aws_iam_policy_document" "jenkins_agent_assume_role" {
 }
 
 resource "aws_iam_role" "jenkins_agent" {
+  count              = var.enable_compute ? 1 : 0
   name               = "${var.project_name}-${var.environment}-jenkins-agent"
-  assume_role_policy = data.aws_iam_policy_document.jenkins_agent_assume_role.json
+  assume_role_policy = data.aws_iam_policy_document.jenkins_agent_assume_role[0].json
 }
 
 resource "aws_iam_policy" "jenkins_agent" {
+  count       = var.enable_compute ? 1 : 0
   name        = "${var.project_name}-${var.environment}-jenkins-agent"
   description = "Permisos del agente: push/pull ECR (kaniko), leer secrets y describir EKS (deploy)"
 
@@ -1825,19 +1836,23 @@ resource "aws_iam_policy" "jenkins_agent" {
 }
 
 resource "aws_iam_role_policy_attachment" "jenkins_agent" {
-  role       = aws_iam_role.jenkins_agent.name
-  policy_arn = aws_iam_policy.jenkins_agent.arn
+  count      = var.enable_compute ? 1 : 0
+  role       = aws_iam_role.jenkins_agent[0].name
+  policy_arn = aws_iam_policy.jenkins_agent[0].arn
 }
 
 # --- EKS access entries (RBAC vía identidad AWS) ---
+# Floci no soporta CreateAccessEntry; en dev se desactivan con enable_compute = false.
 # Controller: crea/borra los pods agente en el namespace 'jenkins'.
 resource "aws_eks_access_entry" "jenkins_controller" {
+  count         = var.enable_compute ? 1 : 0
   cluster_name  = var.eks_cluster_name
   principal_arn = aws_iam_role.jenkins_ec2.arn
   type          = "STANDARD"
 }
 
 resource "aws_eks_access_policy_association" "jenkins_controller" {
+  count         = var.enable_compute ? 1 : 0
   cluster_name  = var.eks_cluster_name
   principal_arn = aws_iam_role.jenkins_ec2.arn
   policy_arn    = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSEditPolicy"
@@ -1852,14 +1867,16 @@ resource "aws_eks_access_policy_association" "jenkins_controller" {
 
 # Agente: despliega (helm/kubectl) en el namespace de la aplicación del ambiente.
 resource "aws_eks_access_entry" "jenkins_agent" {
+  count         = var.enable_compute ? 1 : 0
   cluster_name  = var.eks_cluster_name
-  principal_arn = aws_iam_role.jenkins_agent.arn
+  principal_arn = aws_iam_role.jenkins_agent[0].arn
   type          = "STANDARD"
 }
 
 resource "aws_eks_access_policy_association" "jenkins_agent" {
+  count         = var.enable_compute ? 1 : 0
   cluster_name  = var.eks_cluster_name
-  principal_arn = aws_iam_role.jenkins_agent.arn
+  principal_arn = aws_iam_role.jenkins_agent[0].arn
   policy_arn    = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSEditPolicy"
 
   access_scope {
@@ -1871,8 +1888,10 @@ resource "aws_eks_access_policy_association" "jenkins_agent" {
 }
 
 # --- Launch Template + ASG (instancia EC2 singleton del controller) ---
+# Floci no soporta CreateLaunchTemplate; en dev se desactiva con enable_compute = false.
 
 resource "aws_launch_template" "jenkins" {
+  count         = var.enable_compute ? 1 : 0
   name_prefix   = "${var.project_name}-${var.environment}-jenkins-"
   image_id      = var.ami_id
   instance_type = var.instance_type
@@ -1981,6 +2000,7 @@ resource "aws_launch_template" "jenkins" {
 # Singleton: desired/min/max = 1. Fijado a subnet_ids[0] para que la AZ
 # coincida con el volumen EBS.
 resource "aws_autoscaling_group" "jenkins" {
+  count               = var.enable_compute ? 1 : 0
   name                = "${var.project_name}-${var.environment}-jenkins"
   vpc_zone_identifier = [var.subnet_ids[0]]
   desired_capacity    = 1
@@ -1988,7 +2008,7 @@ resource "aws_autoscaling_group" "jenkins" {
   max_size            = 1
 
   launch_template {
-    id      = aws_launch_template.jenkins.id
+    id      = aws_launch_template.jenkins[0].id
     version = "$Latest"
   }
 
@@ -2010,8 +2030,10 @@ resource "aws_autoscaling_group" "jenkins" {
 }
 
 # --- ALB ---
+# Floci no enruta ELBv2; en dev se desactiva con enable_compute = false.
 
 resource "aws_lb" "jenkins" {
+  count              = var.enable_compute ? 1 : 0
   name               = "${var.project_name}-${var.environment}-jenkins"
   internal           = var.alb_internal
   load_balancer_type = "application"
@@ -2025,6 +2047,7 @@ resource "aws_lb" "jenkins" {
 }
 
 resource "aws_lb_target_group" "jenkins" {
+  count       = var.enable_compute ? 1 : 0
   name        = "${var.project_name}-${var.environment}-jenkins"
   port        = 8080
   protocol    = "HTTP"
@@ -2047,20 +2070,22 @@ resource "aws_lb_target_group" "jenkins" {
 }
 
 resource "aws_lb_listener" "jenkins" {
-  load_balancer_arn = aws_lb.jenkins.arn
+  count             = var.enable_compute ? 1 : 0
+  load_balancer_arn = aws_lb.jenkins[0].arn
   port              = 80
   protocol          = "HTTP"
 
   default_action {
     type             = "forward"
-    target_group_arn = aws_lb_target_group.jenkins.arn
+    target_group_arn = aws_lb_target_group.jenkins[0].arn
   }
 }
 
 # Registra el ASG como target del ALB (target_type = instance).
 resource "aws_autoscaling_attachment" "jenkins" {
-  autoscaling_group_name = aws_autoscaling_group.jenkins.name
-  lb_target_group_arn    = aws_lb_target_group.jenkins.arn
+  count                  = var.enable_compute ? 1 : 0
+  autoscaling_group_name = aws_autoscaling_group.jenkins[0].name
+  lb_target_group_arn    = aws_lb_target_group.jenkins[0].arn
 }
 EOF
 
@@ -2187,22 +2212,28 @@ variable "attach_ssm_policy" {
   type        = bool
   default     = true
 }
+
+variable "enable_compute" {
+  description = "Crear el cómputo EC2/ELB + access entries EKS + IRSA del agente (false en Floci: no soporta launch templates, ELBv2 ni access entries)"
+  type        = bool
+  default     = true
+}
 EOF
 
 cat > "$TF_BACKEND/modules/jenkins/outputs.tf" << 'EOF'
 output "jenkins_url" {
-  description = "URL de acceso a la UI de Jenkins vía ALB"
-  value       = "http://${aws_lb.jenkins.dns_name}"
+  description = "URL de acceso a la UI de Jenkins vía ALB; vacío sin cómputo (Floci)"
+  value       = try("http://${aws_lb.jenkins[0].dns_name}", "")
 }
 
 output "alb_dns_name" {
-  description = "DNS name del ALB de Jenkins"
-  value       = aws_lb.jenkins.dns_name
+  description = "DNS name del ALB de Jenkins; vacío sin cómputo (Floci)"
+  value       = try(aws_lb.jenkins[0].dns_name, "")
 }
 
 output "agent_role_arn" {
-  description = "ARN del IAM role IRSA del agente (anotar el ServiceAccount jenkins-agent con este valor)"
-  value       = aws_iam_role.jenkins_agent.arn
+  description = "ARN del IAM role IRSA del agente; vacío sin cómputo (Floci)"
+  value       = try(aws_iam_role.jenkins_agent[0].arn, "")
 }
 
 output "controller_role_arn" {
@@ -2664,10 +2695,11 @@ provider "aws" {
     cognitoidp       = "http://localhost:4566"
     apigateway       = "http://localhost:4566"
     apigatewayv2     = "http://localhost:4566"
-    secretsmanager       = "http://localhost:4566"
-    ecr                  = "http://localhost:4566"
-    elasticloadbalancing = "http://localhost:4566"
-    kafka                = "http://localhost:4566"
+    secretsmanager         = "http://localhost:4566"
+    ecr                    = "http://localhost:4566"
+    elasticloadbalancing   = "http://localhost:4566"
+    elasticloadbalancingv2 = "http://localhost:4566"
+    kafka                  = "http://localhost:4566"
     cloudwatchlogs       = "http://localhost:4566"
     ssm                  = "http://localhost:4566"
     autoscaling          = "http://localhost:4566"
@@ -2778,6 +2810,7 @@ module "cognito" {
   environment   = local.environment
   project_name  = local.project_name
   enable_domain = false
+  emulator      = true
 }
 
 module "api_gateway" {
@@ -2809,6 +2842,7 @@ module "eks" {
   project_name            = local.project_name
   subnet_ids              = local.subnet_ids
   attach_managed_policies = false
+  enable_data_plane       = false
 }
 
 module "jenkins" {
@@ -2828,6 +2862,7 @@ module "jenkins" {
   eks_oidc_provider_arn = module.eks.oidc_provider_arn
   eks_oidc_issuer_host  = module.eks.oidc_issuer_host
   attach_ssm_policy     = false
+  enable_compute        = false
 }
 
 module "msk" {
