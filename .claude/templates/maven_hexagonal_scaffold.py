@@ -4,6 +4,7 @@
 import argparse
 import json
 import logging
+import re
 import sys
 from pathlib import Path
 
@@ -1207,7 +1208,37 @@ bin/
     logger.debug("Helm chart creado en %s", helm_root)
 
     logger.info("Proyecto creado exitosamente en: %s", root.resolve())
+    _update_terraform_services(project_name)
     _print_run_instructions(project_name, root, messaging_system, port)
+
+
+def _update_terraform_services(service_name: str) -> None:
+    repo_root = Path(__file__).parent.parent.parent
+    envs = ["dev", "staging", "prod"]
+    pattern = re.compile(r'(services\s*=\s*\[)([^\]]*?)(\])')
+
+    for env in envs:
+        main_tf = repo_root / "terraform" / "backend" / "environments" / env / "main.tf"
+        if not main_tf.exists():
+            logger.debug("[Terraform] %s no encontrado, omitiendo", main_tf)
+            continue
+
+        content = main_tf.read_text()
+        match = pattern.search(content)
+        if not match:
+            logger.warning("[Terraform] No se encontró 'services' en %s", main_tf)
+            continue
+
+        existing = [s.strip().strip('"') for s in match.group(2).split(',') if s.strip().strip('"')]
+        if service_name in existing:
+            logger.info("[Terraform] '%s' ya existe en services (%s)", service_name, env)
+            continue
+
+        existing.append(service_name)
+        new_list = ", ".join(f'"{s}"' for s in existing)
+        new_content = content[:match.start()] + f'{match.group(1)}{new_list}{match.group(3)}' + content[match.end():]
+        main_tf.write_text(new_content)
+        logger.info("[Terraform] Agregado '%s' a services en %s", service_name, env)
 
 
 def _print_run_instructions(project_name: str, root: Path, messaging_system: str, port: int = 8080) -> None:
