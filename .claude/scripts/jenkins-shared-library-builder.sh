@@ -462,6 +462,14 @@ credentials:
       - credentials:
           - string:
               scope: GLOBAL
+              id: "sonar-token"
+              secret: "${SONAR_TOKEN}"
+          - string:
+              scope: GLOBAL
+              id: "slack-token"
+              secret: "${SLACK_TOKEN}"
+          - string:
+              scope: GLOBAL
               id: "vercel-token"
               secret: "${VERCEL_TOKEN}"
           - string:

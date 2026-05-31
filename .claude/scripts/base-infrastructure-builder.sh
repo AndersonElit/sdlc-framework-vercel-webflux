@@ -2047,6 +2047,15 @@ resource "aws_launch_template" "jenkins" {
       -e JENKINS_URL="http://$PRIVATE_IP:8080" \
       -e JENKINS_TUNNEL="$PRIVATE_IP:50000" \
       -e SHARED_LIBRARY_REPO="${var.shared_library_repo}" \
+      -e SONAR_URL="${var.sonar_url}" \
+      -e SONAR_TOKEN="${var.sonar_token}" \
+      -e SLACK_TEAM="${var.slack_team}" \
+      -e SLACK_TOKEN="${var.slack_token}" \
+      -e VERCEL_TOKEN="${var.vercel_token}" \
+      -e VERCEL_ORG_ID="${var.vercel_org_id}" \
+      -e VERCEL_PROJECT_ID="${var.vercel_project_id}" \
+      -e GITOPS_GIT_USERNAME="${var.gitops_git_username}" \
+      -e GITOPS_GIT_TOKEN="${var.gitops_git_token}" \
       "${var.jenkins_image}"
   USERDATA
   )
@@ -2244,6 +2253,64 @@ variable "eks_cluster_endpoint" {
 variable "shared_library_repo" {
   description = "URL git del repositorio jenkins-shared-library (Global Pipeline Library)"
   type        = string
+  default     = ""
+}
+
+variable "sonar_url" {
+  description = "URL del servidor SonarQube (ej. http://sonarqube:9000)"
+  type        = string
+  default     = ""
+}
+
+variable "sonar_token" {
+  description = "Token de autenticación de SonarQube"
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
+variable "slack_team" {
+  description = "Workspace de Slack (subdominio de slack.com)"
+  type        = string
+  default     = ""
+}
+
+variable "slack_token" {
+  description = "Token del bot de Slack para el canal #cicd"
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
+variable "vercel_token" {
+  description = "Token de servicio de Vercel"
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
+variable "vercel_org_id" {
+  description = "ID de la organización en Vercel"
+  type        = string
+  default     = ""
+}
+
+variable "vercel_project_id" {
+  description = "ID del proyecto flexicredit-web en Vercel"
+  type        = string
+  default     = ""
+}
+
+variable "gitops_git_username" {
+  description = "Usuario git con permiso de push (para bumpImageTag)"
+  type        = string
+  default     = ""
+}
+
+variable "gitops_git_token" {
+  description = "Token del usuario git (para bumpImageTag)"
+  type        = string
+  sensitive   = true
   default     = ""
 }
 
@@ -2865,6 +2932,70 @@ variable "vpc_security_group_ids" {
   type        = list(string)
   default     = ["sg-00000000"]
 }
+
+variable "shared_library_repo" {
+  description = "URL git del repositorio jenkins-shared-library"
+  type        = string
+  default     = ""
+}
+
+variable "sonar_url" {
+  description = "URL del servidor SonarQube"
+  type        = string
+  default     = ""
+}
+
+variable "sonar_token" {
+  description = "Token de autenticación de SonarQube"
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
+variable "slack_team" {
+  description = "Workspace de Slack"
+  type        = string
+  default     = ""
+}
+
+variable "slack_token" {
+  description = "Token del bot de Slack"
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
+variable "vercel_token" {
+  description = "Token de servicio de Vercel"
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
+variable "vercel_org_id" {
+  description = "ID de la organización en Vercel"
+  type        = string
+  default     = ""
+}
+
+variable "vercel_project_id" {
+  description = "ID del proyecto en Vercel"
+  type        = string
+  default     = ""
+}
+
+variable "gitops_git_username" {
+  description = "Usuario git para bumpImageTag"
+  type        = string
+  default     = ""
+}
+
+variable "gitops_git_token" {
+  description = "Token git para bumpImageTag"
+  type        = string
+  sensitive   = true
+  default     = ""
+}
 EOF
 
 cat > "$TF_BACKEND/environments/dev/main.tf" << 'EOF'
@@ -2959,6 +3090,16 @@ module "jenkins" {
   eks_oidc_issuer_host  = module.eks.oidc_issuer_host
   attach_ssm_policy     = false
   enable_compute        = false
+  shared_library_repo   = var.shared_library_repo
+  sonar_url             = var.sonar_url
+  sonar_token           = var.sonar_token
+  slack_team            = var.slack_team
+  slack_token           = var.slack_token
+  vercel_token          = var.vercel_token
+  vercel_org_id         = var.vercel_org_id
+  vercel_project_id     = var.vercel_project_id
+  gitops_git_username   = var.gitops_git_username
+  gitops_git_token      = var.gitops_git_token
 }
 
 # MSK desactivado en dev: floci deja el cluster en estado CREATING para siempre y el
@@ -3209,6 +3350,60 @@ variable "vpc_security_group_ids" {
   description = "IDs de security groups con acceso a RDS"
   type        = list(string)
 }
+
+variable "shared_library_repo" {
+  description = "URL git del repositorio jenkins-shared-library"
+  type        = string
+}
+
+variable "sonar_url" {
+  description = "URL del servidor SonarQube"
+  type        = string
+}
+
+variable "sonar_token" {
+  description = "Token de autenticación de SonarQube"
+  type        = string
+  sensitive   = true
+}
+
+variable "slack_team" {
+  description = "Workspace de Slack"
+  type        = string
+}
+
+variable "slack_token" {
+  description = "Token del bot de Slack"
+  type        = string
+  sensitive   = true
+}
+
+variable "vercel_token" {
+  description = "Token de servicio de Vercel"
+  type        = string
+  sensitive   = true
+}
+
+variable "vercel_org_id" {
+  description = "ID de la organización en Vercel"
+  type        = string
+}
+
+variable "vercel_project_id" {
+  description = "ID del proyecto en Vercel"
+  type        = string
+}
+
+variable "gitops_git_username" {
+  description = "Usuario git para bumpImageTag"
+  type        = string
+}
+
+variable "gitops_git_token" {
+  description = "Token git para bumpImageTag"
+  type        = string
+  sensitive   = true
+}
 EOF
 
 cat > "$TF_BACKEND/environments/$env/main.tf" << EOF
@@ -3273,6 +3468,16 @@ module "jenkins" {
   eks_cluster_endpoint  = module.eks.cluster_endpoint
   eks_oidc_provider_arn = module.eks.oidc_provider_arn
   eks_oidc_issuer_host  = module.eks.oidc_issuer_host
+  shared_library_repo   = var.shared_library_repo
+  sonar_url             = var.sonar_url
+  sonar_token           = var.sonar_token
+  slack_team            = var.slack_team
+  slack_token           = var.slack_token
+  vercel_token          = var.vercel_token
+  vercel_org_id         = var.vercel_org_id
+  vercel_project_id     = var.vercel_project_id
+  gitops_git_username   = var.gitops_git_username
+  gitops_git_token      = var.gitops_git_token
 }
 
 module "msk" {
