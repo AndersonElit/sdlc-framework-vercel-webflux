@@ -3015,6 +3015,11 @@ output "ecr_repository_urls" {
   value       = module.ecr.repository_urls
 }
 
+output "ecr_registry" {
+  description = "URL base del registry ECR (para docker login y construcción de image tags)"
+  value       = try(split("/", values(module.ecr.repository_urls)[0])[0], null)
+}
+
 output "secret_arns" {
   description = "ARNs de los secrets en Secrets Manager"
   value       = module.secrets_manager.secret_arns
@@ -3315,6 +3320,11 @@ output "cognito_client_id" {
 output "ecr_repository_urls" {
   description = "URLs de los repositorios ECR"
   value       = module.ecr.repository_urls
+}
+
+output "ecr_registry" {
+  description = "URL base del registry ECR (para docker login y construcción de image tags)"
+  value       = try(split("/", values(module.ecr.repository_urls)[0])[0], null)
 }
 
 output "secret_arns" {
