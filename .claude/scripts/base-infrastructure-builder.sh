@@ -41,6 +41,14 @@ else
   log "No hay imágenes para eliminar."
 fi
 
+log "Creando red Docker floci-net..."
+if docker network inspect floci-net &>/dev/null; then
+  log "Red floci-net ya existe."
+else
+  docker network create floci-net
+  log_ok "Red floci-net creada."
+fi
+
 log "Levantando contenedor floci..."
 docker run -d \
   --name floci \
@@ -55,6 +63,57 @@ docker run -d \
   floci/floci:latest
 
 log_ok "Floci listo."
+
+# ---------------------------------------------------------------------------
+# MongoDB (dev local)
+# Floci EC2 no soporta launch templates ni autoscaling groups, y sus "instancias"
+# son contenedores Docker sin systemd/yum/EBS, por lo que el módulo mongodb (EC2)
+# no puede arrancar mongod en floci. Para dev se levanta un contenedor mongo:7 real
+# en :27017 — el mismo enfoque con que floci respalda internamente RDS y MSK.
+# El módulo terraform/backend/modules/mongodb queda reservado para staging/prod (AWS real).
+# El volumen floci-mongo-data sobrevive a los reinicios (docker rm no elimina volúmenes).
+# ---------------------------------------------------------------------------
+log "Levantando contenedor MongoDB (dev)..."
+docker run -d \
+  --name floci-mongo \
+  --network floci-net \
+  -p 27017:27017 \
+  -v floci-mongo-data:/data/db \
+  mongo:7
+log_ok "MongoDB listo (interno floci-mongo:27017 / host localhost:27017)."
+
+# ---------------------------------------------------------------------------
+# Apache Kafka (dev local, KRaft)
+# Floci (community) deja el cluster MSK en estado CREATING indefinidamente y, peor,
+# el provider de AWS crashea al leerlo (nil pointer en kafka/cluster.go), por lo que
+# el recurso aws_msk_cluster es inviable en dev. En su lugar se levanta un broker
+# Apache Kafka real en modo KRaft (sin ZooKeeper) en la red floci-net, igual que el
+# contenedor mongo:7. El módulo terraform/backend/modules/msk queda desactivado en
+# dev (enabled=false) y reservado para staging/prod (AWS real).
+#
+# Doble listener para cubrir ambos consumidores:
+#   - INTERNAL (flexicredit-kafka-dev:9092) → microservicios como contenedores en floci-net.
+#   - EXTERNAL (localhost:29092)            → herramientas/CLI desde el host.
+# ---------------------------------------------------------------------------
+log "Levantando contenedor Apache Kafka (dev, KRaft)..."
+docker run -d \
+  --name flexicredit-kafka-dev \
+  --network floci-net \
+  -p 29092:29092 \
+  -e KAFKA_NODE_ID=1 \
+  -e KAFKA_PROCESS_ROLES=broker,controller \
+  -e KAFKA_LISTENERS=INTERNAL://0.0.0.0:9092,EXTERNAL://0.0.0.0:29092,CONTROLLER://0.0.0.0:9093 \
+  -e KAFKA_ADVERTISED_LISTENERS=INTERNAL://flexicredit-kafka-dev:9092,EXTERNAL://localhost:29092 \
+  -e KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT \
+  -e KAFKA_INTER_BROKER_LISTENER_NAME=INTERNAL \
+  -e KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER \
+  -e KAFKA_CONTROLLER_QUORUM_VOTERS=1@localhost:9093 \
+  -e KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1 \
+  -e KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1 \
+  -e KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1 \
+  -e KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS=0 \
+  apache/kafka:3.7.0
+log_ok "Apache Kafka listo (interno flexicredit-kafka-dev:9092 / host localhost:29092)."
 
 # ---------------------------------------------------------------------------
 # Estructura base de Terraform (frontend / backend desacoplados)
@@ -482,9 +541,12 @@ log_ok "Módulo EKS listo."
 log "Escribiendo módulo RDS..."
 
 cat > "$TF_BACKEND/modules/rds/main.tf" << 'EOF'
-# enabled = false en Floci: CreateDBSubnetGroup no está soportado.
+# Floci levanta un contenedor PostgreSQL real (postgres:16-alpine) y proxya TCP a un
+# puerto del host (rango 7001-7099). Floci NO soporta CreateDBSubnetGroup ni operaciones de
+# red, así que en modo floci (var.floci = true) se omite el subnet group y el instance se
+# crea solo con engine/credenciales. El subnet group se mantiene para staging/prod (AWS real).
 resource "aws_db_subnet_group" "main" {
-  count       = var.enabled ? 1 : 0
+  count       = var.enabled && !var.floci ? 1 : 0
   name        = "${var.project_name}-${var.environment}-rds"
   description = "Subnet group para ${var.project_name} ${var.environment}"
   subnet_ids  = var.subnet_ids
@@ -508,7 +570,7 @@ resource "aws_db_instance" "main" {
   username = var.db_username
   password = var.db_password
 
-  db_subnet_group_name   = aws_db_subnet_group.main[0].name
+  db_subnet_group_name   = var.floci ? null : aws_db_subnet_group.main[0].name
   vpc_security_group_ids = var.vpc_security_group_ids
 
   multi_az            = var.multi_az
@@ -594,9 +656,15 @@ variable "deletion_protection" {
 }
 
 variable "enabled" {
-  description = "Crear recursos RDS (false en Floci: CreateDBSubnetGroup no soportado)"
+  description = "Crear recursos RDS"
   type        = bool
   default     = true
+}
+
+variable "floci" {
+  description = "Modo floci: omite subnet group y red no soportados; crea solo el DB instance"
+  type        = bool
+  default     = false
 }
 EOF
 
@@ -2267,7 +2335,12 @@ locals {
   log_retention_days  = var.environment == "dev" ? 7 : 30
 }
 
-# enabled = false en Floci: CreateConfiguration y aws_msk_cluster no están soportados.
+# Floci orquesta un contenedor Redpanda real (compatible con la API de Kafka). El puerto
+# del broker se mapea dinámicamente; obtenerlo vía GetBootstrapBrokers (output msk_bootstrap_brokers).
+# Floci solo soporta CreateCluster/GetBootstrapBrokers: NO CreateConfiguration, ni logging_info,
+# ni open_monitoring. En modo floci (var.floci = true) se crea el cluster con la config mínima
+# (broker_node_group_info) y se omite lo demás. El SG sí se crea (floci soporta EC2 SGs) porque
+# broker_node_group_info.security_groups es obligatorio en el provider. Staging/prod conservan todo.
 resource "aws_security_group" "msk" {
   count       = var.enabled ? 1 : 0
   name        = "${var.project_name}-${var.environment}-msk"
@@ -2320,7 +2393,7 @@ resource "aws_security_group" "msk" {
 }
 
 resource "aws_cloudwatch_log_group" "msk_broker" {
-  count             = var.enabled ? 1 : 0
+  count             = var.enabled && !var.floci ? 1 : 0
   name              = "/aws/msk/${var.project_name}-${var.environment}/broker"
   retention_in_days = local.log_retention_days
 
@@ -2331,7 +2404,7 @@ resource "aws_cloudwatch_log_group" "msk_broker" {
 }
 
 resource "aws_msk_configuration" "main" {
-  count          = var.enabled ? 1 : 0
+  count          = var.enabled && !var.floci ? 1 : 0
   name           = "${var.project_name}-${var.environment}"
   kafka_versions = [var.kafka_version]
   description    = "Configuración broker MSK para ${var.project_name} ${var.environment}"
@@ -2353,41 +2426,53 @@ resource "aws_msk_cluster" "main" {
 
   broker_node_group_info {
     # Un broker por subnet; las subnets deben estar en AZs distintas.
-    instance_type  = var.broker_instance_type
-    client_subnets = slice(var.subnet_ids, 0, var.number_of_broker_nodes)
+    instance_type   = var.broker_instance_type
+    client_subnets  = slice(var.subnet_ids, 0, var.number_of_broker_nodes)
+    security_groups = [aws_security_group.msk[0].id]
     storage_info {
       ebs_storage_info {
         volume_size = var.broker_ebs_volume_size
       }
     }
-    security_groups = [aws_security_group.msk[0].id]
   }
 
-  encryption_info {
-    encryption_in_transit {
-      client_broker = var.environment == "dev" ? "TLS_PLAINTEXT" : "TLS"
-      in_cluster    = true
-    }
-  }
-
-  configuration_info {
-    arn      = aws_msk_configuration.main[0].arn
-    revision = aws_msk_configuration.main[0].latest_revision
-  }
-
-  logging_info {
-    broker_logs {
-      cloudwatch_logs {
-        enabled   = true
-        log_group = aws_cloudwatch_log_group.msk_broker[0].name
+  dynamic "encryption_info" {
+    for_each = var.floci ? [] : [1]
+    content {
+      encryption_in_transit {
+        client_broker = var.environment == "dev" ? "TLS_PLAINTEXT" : "TLS"
+        in_cluster    = true
       }
     }
   }
 
-  open_monitoring {
-    prometheus {
-      jmx_exporter { enabled_in_broker = true }
-      node_exporter { enabled_in_broker = true }
+  dynamic "configuration_info" {
+    for_each = var.floci ? [] : [1]
+    content {
+      arn      = aws_msk_configuration.main[0].arn
+      revision = aws_msk_configuration.main[0].latest_revision
+    }
+  }
+
+  dynamic "logging_info" {
+    for_each = var.floci ? [] : [1]
+    content {
+      broker_logs {
+        cloudwatch_logs {
+          enabled   = true
+          log_group = aws_cloudwatch_log_group.msk_broker[0].name
+        }
+      }
+    }
+  }
+
+  dynamic "open_monitoring" {
+    for_each = var.floci ? [] : [1]
+    content {
+      prometheus {
+        jmx_exporter { enabled_in_broker = true }
+        node_exporter { enabled_in_broker = true }
+      }
     }
   }
 
@@ -2491,9 +2576,15 @@ variable "broker_ebs_volume_size" {
 }
 
 variable "enabled" {
-  description = "Crear recursos MSK (false en Floci: CreateConfiguration y MSK cluster no soportados)"
+  description = "Crear recursos MSK"
   type        = bool
   default     = true
+}
+
+variable "floci" {
+  description = "Modo floci: cluster mínimo (sin configuration_info, logging_info ni open_monitoring)"
+  type        = bool
+  default     = false
 }
 EOF
 
@@ -2797,6 +2888,11 @@ locals {
   vpc_id     = data.aws_vpc.default.id
   vpc_cidr   = data.aws_vpc.default.cidr_block
   subnet_ids = data.aws_subnets.default.ids
+
+  # Apache Kafka standalone (KRaft) que levanta floci-start en floci-net (no MSK).
+  # Interno: para microservicios como contenedores en floci-net. Externo: desde el host.
+  kafka_bootstrap_brokers          = "flexicredit-kafka-dev:9092"
+  kafka_bootstrap_brokers_external = "localhost:29092"
 }
 
 module "iam" {
@@ -2865,6 +2961,11 @@ module "jenkins" {
   enable_compute        = false
 }
 
+# MSK desactivado en dev: floci deja el cluster en estado CREATING para siempre y el
+# provider de AWS crashea al leerlo (nil pointer en kafka/cluster.go). Kafka local lo
+# da el contenedor Apache Kafka standalone (flexicredit-kafka-dev en floci-net, KRaft)
+# que levanta floci-start; los microservicios apuntan a local.kafka_bootstrap_brokers.
+# El módulo queda reservado para staging/prod (AWS real).
 module "msk" {
   source       = "../../modules/msk"
   environment  = local.environment
@@ -2875,16 +2976,21 @@ module "msk" {
   enabled      = false
 }
 
+# Floci levanta un contenedor PostgreSQL real (postgres:16-alpine) y proxya TCP
+# en un puerto del rango 7001-7099 (no 5432): leerlo del output rds_endpoint/rds_port.
+# vpc_security_group_ids vacío en dev: el SG no aplica al proxy TCP de floci y
+# evitamos referenciar el sg-00000000 de prueba.
 module "rds" {
   source                 = "../../modules/rds"
   environment            = local.environment
   project_name           = local.project_name
   subnet_ids             = local.subnet_ids
-  vpc_security_group_ids = var.vpc_security_group_ids
+  vpc_security_group_ids = []
   db_name                = var.db_name
   db_username            = var.db_username
   db_password            = var.db_password
-  enabled                = false
+  enabled                = true
+  floci                  = true
 }
 EOF
 
@@ -2935,24 +3041,14 @@ output "jenkins_ebs_volume_id" {
   value       = module.jenkins.ebs_volume_id
 }
 
-output "msk_cluster_arn" {
-  description = "ARN del cluster MSK"
-  value       = module.msk.cluster_arn
+output "kafka_bootstrap_brokers" {
+  description = "Bootstrap brokers de Apache Kafka para microservicios como contenedores en floci-net"
+  value       = local.kafka_bootstrap_brokers
 }
 
-output "msk_bootstrap_brokers" {
-  description = "Bootstrap brokers Kafka (plaintext, dev)"
-  value       = module.msk.bootstrap_brokers
-}
-
-output "msk_bootstrap_brokers_tls" {
-  description = "Bootstrap brokers Kafka (TLS)"
-  value       = module.msk.bootstrap_brokers_tls
-}
-
-output "msk_access_policy_arn" {
-  description = "ARN de la política IAM para adjuntar al task role de los microservicios"
-  value       = module.msk.msk_access_policy_arn
+output "kafka_bootstrap_brokers_external" {
+  description = "Bootstrap brokers de Apache Kafka accesibles desde el host (CLI/herramientas)"
+  value       = local.kafka_bootstrap_brokers_external
 }
 
 output "rds_endpoint" {

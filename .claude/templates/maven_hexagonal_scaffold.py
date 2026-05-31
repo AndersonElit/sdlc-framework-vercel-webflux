@@ -2,6 +2,7 @@
 """Genera un proyecto base Spring Boot Reactivo multimódulo con arquitectura hexagonal."""
 
 import argparse
+import json
 import logging
 import sys
 from pathlib import Path
@@ -9,8 +10,18 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
-def get_yaml_content(database: str, messaging_system: str) -> str:
-    lines = ["spring:"]
+def get_yaml_content(project_name: str, database: str, messaging_system: str) -> str:
+    lines = [
+        "spring:",
+        "  application:",
+        f"    name: {project_name}",
+        "  config:",
+        f'    import: "aws-secretsmanager:/flexicredit/${{APP_ENV:dev}}/{project_name}"',
+        "  cloud:",
+        "    aws:",
+        "      region:",
+        "        static: us-east-1",
+    ]
     if database.lower() == "mongo":
         lines += ["  data:", "    mongodb:", "      uri: ${MONGODB_URI}"]
     else:
@@ -47,102 +58,69 @@ def get_yaml_content(database: str, messaging_system: str) -> str:
                 "        spring.json.trusted.packages: '*'",
             ]
 
-    lines += ["server:", "  port: ${SERVER_PORT}"]
+    lines += ["server:", "  port: ${SERVER_PORT:8080}"]
     return "\n".join(lines) + "\n"
 
 
-def get_env_content(project_name: str, database: str, messaging_system: str) -> str:
-    lines = [
-        f"# {'=' * 67}",
-        f"# Environment Variables - {project_name}",
-        f"# {'=' * 67}",
-        "# IMPORTANT: This file contains sensitive credentials.",
-        "# DO NOT commit this file to version control.",
-        "# Copy .env.example to .env and fill in the actual values.",
-        f"# {'=' * 67}",
-        "",
-        "# Server",
-        "SERVER_PORT=8080",
-        "",
-        "# Database",
-    ]
+def get_dev_yaml_content() -> str:
+    return """\
+spring:
+  cloud:
+    aws:
+      secretsmanager:
+        endpoint: http://localhost:4566
+      credentials:
+        access-key: floci
+        secret-key: floci
+"""
 
+
+def get_secrets_setup_content(project_name: str, database: str, messaging_system: str) -> str:
+    secret: dict = {"SERVER_PORT": "8080"}
     if database.lower() == "mongo":
-        lines.append("MONGODB_URI=mongodb://localhost:27017/mydb")
+        secret["MONGODB_URI"] = "mongodb://localhost:27017/mydb"
     else:
-        lines += ["R2DBC_URL=r2dbc:postgresql://localhost:5432/mydb", "DB_USERNAME=postgres", "DB_PASSWORD=password"]
+        secret["R2DBC_URL"] = "r2dbc:postgresql://localhost:5432/mydb"
+        secret["DB_USERNAME"] = "postgres"
+        secret["DB_PASSWORD"] = "change_me"
 
     if messaging_system.lower() in ("rabbit-producer", "rabbit-consumer"):
-        lines += [
-            "",
-            "# RabbitMQ",
-            "RABBITMQ_HOST=localhost",
-            "RABBITMQ_PORT=5672",
-            "RABBITMQ_USERNAME=guest",
-            "RABBITMQ_PASSWORD=guest",
-        ]
+        secret["RABBITMQ_HOST"] = "localhost"
+        secret["RABBITMQ_PORT"] = "5672"
+        secret["RABBITMQ_USERNAME"] = "guest"
+        secret["RABBITMQ_PASSWORD"] = "guest"
 
-    if messaging_system.lower() == "kafka-producer":
-        lines += [
-            "",
-            "# Kafka",
-            "KAFKA_BOOTSTRAP_SERVERS=localhost:9092",
-        ]
-    elif messaging_system.lower() == "kafka-consumer":
-        lines += [
-            "",
-            "# Kafka",
-            "KAFKA_BOOTSTRAP_SERVERS=localhost:9092",
-            "KAFKA_CONSUMER_GROUP_ID=my-group",
-        ]
+    if messaging_system.lower() in ("kafka-producer", "kafka-consumer"):
+        secret["KAFKA_BOOTSTRAP_SERVERS"] = "localhost:9092"
 
-    return "\n".join(lines) + "\n"
+    if messaging_system.lower() == "kafka-consumer":
+        secret["KAFKA_CONSUMER_GROUP_ID"] = f"{project_name}-group"
 
+    secret_json = json.dumps(secret)
+    return f"""\
+#!/usr/bin/env bash
+# Crea (o actualiza) el secret de desarrollo en floci (emulador AWS).
+# Requiere que floci esté corriendo en http://localhost:4566.
 
-def get_env_example_content(project_name: str, database: str, messaging_system: str) -> str:
-    lines = [
-        f"# {'=' * 67}",
-        f"# Environment Variables Template - {project_name}",
-        f"# {'=' * 67}",
-        "# Copy this file to .env and fill in the actual values.",
-        f"# {'=' * 67}",
-        "",
-        "# Server",
-        "SERVER_PORT=8080",
-        "",
-        "# Database",
-    ]
+SECRET_NAME="flexicredit/dev/{project_name}"
+ENDPOINT="http://localhost:4566"
+REGION="us-east-1"
 
-    if database.lower() == "mongo":
-        lines.append("MONGODB_URI=mongodb://localhost:27017/mydb")
-    else:
-        lines += ["R2DBC_URL=r2dbc:postgresql://localhost:5432/mydb", "DB_USERNAME=", "DB_PASSWORD="]
-
-    if messaging_system.lower() in ("rabbit-producer", "rabbit-consumer"):
-        lines += [
-            "",
-            "# RabbitMQ",
-            "RABBITMQ_HOST=localhost",
-            "RABBITMQ_PORT=5672",
-            "RABBITMQ_USERNAME=",
-            "RABBITMQ_PASSWORD=",
-        ]
-
-    if messaging_system.lower() == "kafka-producer":
-        lines += [
-            "",
-            "# Kafka",
-            "KAFKA_BOOTSTRAP_SERVERS=localhost:9092",
-        ]
-    elif messaging_system.lower() == "kafka-consumer":
-        lines += [
-            "",
-            "# Kafka",
-            "KAFKA_BOOTSTRAP_SERVERS=localhost:9092",
-            "KAFKA_CONSUMER_GROUP_ID=",
-        ]
-
-    return "\n".join(lines) + "\n"
+if aws --endpoint-url="$ENDPOINT" secretsmanager describe-secret \\
+       --secret-id "$SECRET_NAME" --region "$REGION" &>/dev/null; then
+    aws --endpoint-url="$ENDPOINT" secretsmanager put-secret-value \\
+        --secret-id "$SECRET_NAME" \\
+        --secret-string '{secret_json}' \\
+        --region "$REGION"
+    echo "Secret actualizado: $SECRET_NAME"
+else
+    aws --endpoint-url="$ENDPOINT" secretsmanager create-secret \\
+        --name "$SECRET_NAME" \\
+        --secret-string '{secret_json}' \\
+        --region "$REGION"
+    echo "Secret creado: $SECRET_NAME"
+fi
+"""
 
 
 def get_dockerfile_content(database: str, messaging_system: str) -> str:
@@ -561,11 +539,21 @@ def get_root_pom(project_name: str, database: str, messaging_system: str) -> str
     <modules>
 {modules_xml}
     </modules>
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>io.awspring.cloud</groupId>
+                <artifactId>spring-cloud-aws-dependencies</artifactId>
+                <version>3.2.1</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
     <dependencies>
         <dependency>
-            <groupId>me.paulschwarz</groupId>
-            <artifactId>spring-dotenv</artifactId>
-            <version>4.0.0</version>
+            <groupId>io.awspring.cloud</groupId>
+            <artifactId>spring-cloud-aws-starter-secrets-manager</artifactId>
         </dependency>
         <dependency>
             <groupId>io.projectreactor</groupId>
@@ -1153,7 +1141,8 @@ public class ApplicationConfig {{
 
             resources_dir = root / module / "src/main/resources"
             resources_dir.mkdir(parents=True, exist_ok=True)
-            (resources_dir / "application.yml").write_text(get_yaml_content(database, messaging_system))
+            (resources_dir / "application.yml").write_text(get_yaml_content(project_name, database, messaging_system))
+            (resources_dir / "application-dev.yml").write_text(get_dev_yaml_content())
             logger.debug("application.yml creado en: %s", resources_dir)
 
         logger.info("Módulo listo: %s", module)
@@ -1167,10 +1156,12 @@ public class ApplicationConfig {{
     elif messaging_system.lower() == "kafka-consumer":
         create_kafka_consumer_files(root, safe_name)
 
-    (root / ".env").write_text(get_env_content(project_name, database, messaging_system))
-    logger.debug(".env creado")
-    (root / ".env.example").write_text(get_env_example_content(project_name, database, messaging_system))
-    logger.debug(".env.example creado")
+    secrets_dir = root / "scripts"
+    secrets_dir.mkdir(parents=True, exist_ok=True)
+    secrets_script = secrets_dir / "create-secrets-dev.sh"
+    secrets_script.write_text(get_secrets_setup_content(project_name, database, messaging_system))
+    secrets_script.chmod(0o755)
+    logger.debug("scripts/create-secrets-dev.sh creado")
 
     gitignore = """\
 target/
@@ -1193,7 +1184,6 @@ hs_err_pid*
 .settings/
 bin/
 .vscode/
-.env
 """
     (root / ".gitignore").write_text(gitignore)
     logger.debug(".gitignore creado")
@@ -1237,14 +1227,14 @@ def _print_run_instructions(project_name: str, root: Path, messaging_system: str
  1. Entra al directorio del proyecto:
     cd {root}
 
- 2. Configura las variables de entorno:
-    cp .env.example .env
-    # Edita .env con tus credenciales reales
+ 2. Asegúrate de que floci esté corriendo y crea el secret de desarrollo:
+    bash scripts/create-secrets-dev.sh
 {rabbit_note}
  3. Compila el proyecto:
     mvn clean install -DskipTests
 
- 4. Ejecuta la aplicación:
+ 4. Ejecuta la aplicación (perfil dev → apunta a floci):
+    SPRING_PROFILES_ACTIVE=dev \\
     mvn -pl infrastructure/entry-points/app spring-boot:run
 
  5. Verifica que está corriendo:
@@ -1255,9 +1245,11 @@ def _print_run_instructions(project_name: str, root: Path, messaging_system: str
     # Construir la imagen
     docker build -t {project_name}:latest .
 
-    # Ejecutar pasando variables de entorno desde .env
+    # Ejecutar apuntando a floci del host (o a AWS real en staging/prod)
     docker run -d --name {project_name} \\
-      --env-file .env \\
+      -e SPRING_PROFILES_ACTIVE=dev \\
+      -e APP_ENV=dev \\
+      --network host \\
       -p 8080:8080 \\
       {project_name}:latest
 
@@ -1267,6 +1259,13 @@ def _print_run_instructions(project_name: str, root: Path, messaging_system: str
 
  Detener y eliminar:
     docker rm -f {project_name}
+
+ ── AWS Secrets Manager ────────────────────────────────────────────────
+
+ Secret path:  flexicredit/<APP_ENV>/{project_name}
+ Perfil dev:   application-dev.yml apunta a floci (http://localhost:4566)
+ Staging/prod: usa IRSA (ServiceAccount 'jenkins-agent' en EKS), sin credenciales
+               hardcodeadas. Cambiar APP_ENV=staging|prod al desplegar.
 
 ────────────────────────────────────────────────────────────────────────
 """
