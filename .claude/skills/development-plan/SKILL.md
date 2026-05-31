@@ -153,7 +153,23 @@ Secciones en orden exacto:
    - Secrets floci: comando `bash .claude/scripts/create-all-secrets-dev.sh` — el script itera sobre todos los directorios `*-service` en `backend/` usando `find`; describir que ejecuta el `scripts/create-secrets-dev.sh` de cada servicio y omite los que aún no existan; **no usar un loop con nombres de servicios hardcodeados**
    - Pasos para aplicar el `.env` local a cada proyecto
    - Ajustes mínimos al `application.yml` de cada microservicio para apuntar a floci
-8. **Criterios de Aceptación** — lista de verificación.
+8. **Re-aplicar Infraestructura Terraform (dev)**
+   - Explicar que `maven_hexagonal_scaffold.py` edita automáticamente `terraform/backend/environments/{dev,staging,prod}/main.tf` agregando el nombre del servicio a la lista `services = [...]` que alimenta `module.ecr` y `module.secrets_manager`
+   - Indicar que esta edición ocurre en los tres ambientes pero que **solo el ambiente `dev` se aplica en esta etapa**; `staging` y `prod` se provisiona a través del pipeline de CI/CD
+   - Comando a ejecutar después de generar todos los scaffolds backend (un solo apply al final, no uno por servicio):
+     ```bash
+     cd terraform/backend/environments/dev
+     terraform apply -target=module.ecr -target=module.secrets_manager
+     ```
+   - Comando de verificación de repositorios ECR creados en floci:
+     ```bash
+     aws --endpoint-url=http://localhost:4566 ecr describe-repositories \
+         --region us-east-1 \
+         --query 'repositories[].repositoryName' \
+         --output table
+     ```
+   - Criterio de aceptación de este paso: la salida del comando de verificación lista un repositorio por cada microservicio generado
+9. **Criterios de Aceptación** — lista de verificación; incluir como criterio verificable: `Los repositorios ECR de todos los microservicios existen en floci (terraform apply ejecutado)`.
 
 ---
 
