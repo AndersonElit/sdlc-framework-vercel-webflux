@@ -395,12 +395,12 @@ mkdir -p "$OUT_DIR/docker"
 
 cat > "$OUT_DIR/docker/plugins.txt" <<'EOF'
 # Plugins mínimos del controller (instalados con jenkins-plugin-cli).
+# Los repos internos (microservicios, shared library) viven en Gitea (floci-net).
 configuration-as-code
 kubernetes
 workflow-aggregator
 git
-github
-github-branch-source
+gitea
 pipeline-utility-steps
 sonar
 slack
@@ -604,7 +604,7 @@ Terraform `argocd` y los manifiestos `argocd-bootstrap/` (ver `base-infrastructu
 ## Plugins requeridos
 
 Ver `docker/plugins.txt` (configuration-as-code, kubernetes, workflow-aggregator,
-pipeline-utility-steps, sonar, slack, git/github, credentials, matrix-auth).
+pipeline-utility-steps, sonar, slack, git, gitea, credentials, matrix-auth).
 EOF
 
 cat > "$OUT_DIR/.gitignore" <<'EOF'
@@ -629,7 +629,24 @@ if [[ "$DO_GIT" -eq 1 ]]; then
     fi
     git -C "$OUT_DIR" add -A
     git -C "$OUT_DIR" commit -q -m "chore: scaffold jenkins-shared-library"
+    # Crear el repo en Gitea si el contenedor está activo, luego apuntar el remote.
+    # URL de host (localhost:3000) para push desde la máquina de desarrollo.
+    # Jenkins y ArgoCD usan la URL interna: http://gitea:3000/flexicredit/jenkins-shared-library.git
+    if curl -sf http://localhost:3000/api/healthz &>/dev/null; then
+      curl -sf -u "gitea-admin:gitea-admin" -X POST \
+        "http://localhost:3000/api/v1/orgs/flexicredit/repos" \
+        -H "Content-Type: application/json" \
+        -d '{"name":"jenkins-shared-library","private":true,"auto_init":false,"default_branch":"main"}' \
+        &>/dev/null \
+        && log_ok "Repo flexicredit/jenkins-shared-library creado en Gitea." \
+        || log "Repo jenkins-shared-library ya existe en Gitea."
+    else
+      log "Gitea no está activo — el repo se creará manualmente. Correr base-infrastructure-builder.sh primero."
+    fi
+    git -C "$OUT_DIR" remote add origin http://localhost:3000/flexicredit/jenkins-shared-library.git \
+      2>/dev/null || git -C "$OUT_DIR" remote set-url origin http://localhost:3000/flexicredit/jenkins-shared-library.git
     log_ok "Repositorio git inicializado (rama main) con commit inicial."
+    log_ok "Remote 'origin' → http://localhost:3000/flexicredit/jenkins-shared-library.git"
   else
     log "git no está instalado; se omite la inicialización del repositorio."
   fi
@@ -639,8 +656,16 @@ echo
 log_ok "Shared Library lista en: $(cd "$OUT_DIR" && pwd)"
 echo
 echo "  Siguientes pasos:"
-echo "  1. Publica el directorio como repositorio remoto (GitHub/GitLab) y úsalo"
-echo "     como SHARED_LIBRARY_REPO (el JCasC registra la Global Pipeline Library)."
+echo "  1. Publica la shared library en Gitea (requiere que base-infrastructure-builder.sh"
+echo "     haya corrido primero para que el contenedor gitea esté activo):"
+echo ""
+echo "       cd $OUT_DIR"
+echo "       git push -u origin main"
+echo "       # Credenciales: gitea-admin / gitea-admin"
+echo ""
+echo "     URL interna (para Jenkins y ArgoCD en floci-net):"
+echo "       SHARED_LIBRARY_REPO=http://gitea:3000/flexicredit/jenkins-shared-library.git"
+echo ""
 echo "  2. Construye y publica la imagen del controller (docker/) en ECR y apunta"
 echo "     var.jenkins_image del módulo Jenkins de Terraform a esa imagen."
 echo "  3. Aplica bootstrap/jenkins-agent-rbac.yaml en el cluster (namespace +"

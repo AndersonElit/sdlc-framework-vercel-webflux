@@ -116,6 +116,77 @@ docker run -d \
 log_ok "Apache Kafka listo (interno flexicredit-kafka-dev:9092 / host localhost:29092)."
 
 # ---------------------------------------------------------------------------
+# Gitea (servidor Git local para dev)
+# Reemplaza GitHub/GitLab para los repos internos del proyecto: microservicios
+# y jenkins-shared-library. El SDLC principal permanece en GitHub.
+#
+# Acceso desde floci-net (Jenkins, ArgoCD, pods k3s) → http://gitea:3000
+# Acceso desde el host                                → http://localhost:3000
+# SSH desde el host                                   → localhost:2222
+#
+# SQLite como backend (sin BD adicional en dev).
+# El volumen gitea-data persiste repos, usuarios y configuración entre reinicios.
+# ---------------------------------------------------------------------------
+log "Levantando contenedor Gitea (servidor Git local)..."
+docker run -d \
+  --name gitea \
+  --network floci-net \
+  -p 3000:3000 \
+  -p 2222:22 \
+  -v gitea-data:/data \
+  -e GITEA__security__INSTALL_LOCK=true \
+  -e GITEA__database__DB_TYPE=sqlite3 \
+  -e GITEA__server__ROOT_URL=http://gitea:3000/ \
+  -e GITEA__server__HTTP_PORT=3000 \
+  -e GITEA__server__SSH_PORT=2222 \
+  -e GITEA__server__SSH_LISTEN_PORT=22 \
+  -e GITEA__log__MODE=console \
+  -e GITEA__log__LEVEL=warn \
+  gitea/gitea:1.22
+
+log "Esperando que Gitea esté listo..."
+GITEA_READY=0
+for i in $(seq 1 30); do
+  if curl -sf http://localhost:3000/api/healthz &>/dev/null; then
+    GITEA_READY=1
+    break
+  fi
+  sleep 2
+done
+if [[ "$GITEA_READY" -eq 0 ]]; then
+  log_err "Gitea no respondió en 60 s. Revisar logs con: docker logs gitea"
+  exit 1
+fi
+
+log "Creando usuario admin en Gitea..."
+docker exec gitea gitea admin user create \
+  --username gitea-admin \
+  --password gitea-admin \
+  --email admin@flexicredit.local \
+  --admin \
+  --must-change-password=false 2>/dev/null \
+  && log_ok "Usuario gitea-admin creado." \
+  || log "Usuario gitea-admin ya existe."
+
+GITEA_API="http://localhost:3000/api/v1"
+GITEA_AUTH="gitea-admin:gitea-admin"
+
+log "Creando organización flexicredit en Gitea..."
+curl -sf -u "$GITEA_AUTH" -X POST "$GITEA_API/orgs" \
+  -H "Content-Type: application/json" \
+  -d '{"username":"flexicredit","visibility":"private","repo_admin_change_team_access":true}' \
+  &>/dev/null \
+  && log_ok "Organización flexicredit creada." \
+  || log "Organización flexicredit ya existe."
+
+log_ok "Gitea listo."
+log "  UI:           http://localhost:3000"
+log "  Credenciales: gitea-admin / gitea-admin"
+log "  Organización: flexicredit"
+log "  Los repositorios se crean bajo esta organización a medida que se generan"
+log "  los servicios con los scripts de scaffold y jenkins-shared-library-builder.sh"
+
+# ---------------------------------------------------------------------------
 # Estructura base de Terraform (frontend / backend desacoplados)
 # ---------------------------------------------------------------------------
 TERRAFORM_ROOT="${PROJECT_ROOT:-$(pwd)}/terraform"
@@ -3679,16 +3750,10 @@ spec:
   generators:
     - list:
         elements:
-          # ── Un elemento por microservicio ──────────────────────────────
-          - service: auth-svc
-            repoURL: https://github.com/<org>/auth-svc.git
-            revision: main
-          - service: user-svc
-            repoURL: https://github.com/<org>/user-svc.git
-            revision: main
-          - service: order-svc
-            repoURL: https://github.com/<org>/order-svc.git
-            revision: main
+          # -- services managed by scaffold --
+          # Las entradas se añaden automáticamente al correr maven_hexagonal_scaffold.py.
+          # repoURL apunta a Gitea en floci-net (http://gitea:3000); ArgoCD llega a él
+          # porque floci-eks-my-app-dev (donde corre k3s) está en la misma red floci-net.
   template:
     metadata:
       name: '{{.service}}-$env'
@@ -3708,21 +3773,25 @@ $SYNC_POLICY_BLOCK
 EOF
 
 cat > "$TF_BACKEND/environments/$env/argocd-bootstrap/repo-credentials.example.yaml" << 'EOF'
-# OPCIONAL — solo si los repos de los servicios son privados.
-# Crea un Secret por repo (o usa un secret de credenciales por organización).
-# Rellena los placeholders y aplica con kubectl. ArgoCD solo necesita LECTURA.
+# Credenciales de repositorio para ArgoCD (un Secret por organización en Gitea).
+# ArgoCD usa estas credenciales para clonar los repos al sincronizar.
+# Aplicar con: kubectl apply -f repo-credentials.example.yaml
+#
+# En dev (floci): Gitea corre en floci-net como contenedor "gitea".
+# ArgoCD (pod en k3s dentro de floci-eks-my-app-dev) alcanza Gitea via http://gitea:3000
+# porque floci-eks-my-app-dev está en la misma red floci-net.
 apiVersion: v1
 kind: Secret
 metadata:
-  name: repo-auth-svc
+  name: repo-creds-gitea-flexicredit
   namespace: argocd
   labels:
-    argocd.argoproj.io/secret-type: repository
+    argocd.argoproj.io/secret-type: repo-creds
 stringData:
   type: git
-  url: https://github.com/<org>/auth-svc.git
-  username: <git-username>
-  password: <git-token-readonly>
+  url: http://gitea:3000/flexicredit
+  username: gitea-admin
+  password: gitea-admin
 EOF
 
 done

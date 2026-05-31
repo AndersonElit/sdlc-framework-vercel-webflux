@@ -2237,7 +2237,67 @@ def scaffold(project_name: str) -> None:
         logger.debug("Creado: %s", relative_path)
 
     logger.info("Arquetipo generado exitosamente en: %s", root.resolve())
+    _setup_gitea_repo(project_name, root)
     _print_run_instructions(project_name, root)
+
+
+def _setup_gitea_repo(project_name: str, root: Path) -> None:
+    import base64
+    import json as _json
+    import subprocess
+    import urllib.error
+    import urllib.request
+
+    gitea_host = "http://localhost:3000"
+    org = "flexicredit"
+    credentials = base64.b64encode(b"gitea-admin:gitea-admin").decode()
+
+    try:
+        urllib.request.urlopen(f"{gitea_host}/api/healthz", timeout=3)
+    except Exception:
+        logger.warning(
+            "[Gitea] No activo en %s — crear el repo manualmente tras correr "
+            "base-infrastructure-builder.sh.", gitea_host
+        )
+        return
+
+    payload = _json.dumps({
+        "name": project_name,
+        "private": True,
+        "auto_init": False,
+        "default_branch": "main",
+    }).encode()
+    req = urllib.request.Request(
+        f"{gitea_host}/api/v1/orgs/{org}/repos",
+        data=payload,
+        headers={"Content-Type": "application/json", "Authorization": f"Basic {credentials}"},
+        method="POST",
+    )
+    try:
+        urllib.request.urlopen(req, timeout=5)
+        logger.info("[Gitea] Repo %s/%s creado.", org, project_name)
+    except urllib.error.HTTPError as e:
+        if e.code == 409:
+            logger.info("[Gitea] Repo %s/%s ya existe.", org, project_name)
+        else:
+            logger.warning("[Gitea] No se pudo crear el repo: HTTP %s", e.code)
+            return
+
+    try:
+        subprocess.run(["git", "init", "-q", "-b", "main"], cwd=root, check=True)
+        result = subprocess.run(["git", "config", "user.email"], cwd=root, capture_output=True)
+        if result.returncode != 0:
+            subprocess.run(["git", "config", "user.email", "cicd@flexicredit.local"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "FlexiCredit CI"], cwd=root, check=True)
+        subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", f"chore: scaffold {project_name}"], cwd=root, check=True)
+        remote_url = f"{gitea_host}/{org}/{project_name}.git"
+        subprocess.run(["git", "remote", "add", "origin", remote_url], cwd=root, check=False)
+        logger.info("[Gitea] Remote 'origin' → %s", remote_url)
+        logger.info("[Gitea] URL interna (Jenkins/ArgoCD): http://gitea:3000/%s/%s.git", org, project_name)
+        logger.info("[Gitea] Para publicar: cd %s && git push -u origin main", root)
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        logger.warning("[Gitea] No se pudo inicializar el repo git: %s", e)
 
 
 def _print_run_instructions(project_name: str, root: Path) -> None:
