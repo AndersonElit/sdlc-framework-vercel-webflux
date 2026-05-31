@@ -3212,12 +3212,12 @@ output "api_endpoint" {
   value       = module.api_gateway.api_endpoint
 }
 
-output "cognito_user_pool_id" {
+output "user_pool_id" {
   description = "ID del User Pool de Cognito"
   value       = module.cognito.user_pool_id
 }
 
-output "cognito_client_id" {
+output "user_pool_client_id" {
   description = "App Client ID de Cognito"
   value       = module.cognito.client_id
 }
@@ -3593,12 +3593,12 @@ output "api_endpoint" {
   value       = module.api_gateway.api_endpoint
 }
 
-output "cognito_user_pool_id" {
+output "user_pool_id" {
   description = "ID del User Pool de Cognito"
   value       = module.cognito.user_pool_id
 }
 
-output "cognito_client_id" {
+output "user_pool_client_id" {
   description = "App Client ID de Cognito"
   value       = module.cognito.client_id
 }
