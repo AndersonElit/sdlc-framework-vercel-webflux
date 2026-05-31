@@ -146,9 +146,11 @@ Secciones en orden exacto:
    - **`Dockerfile` backend**: imagen multi-stage (builder `maven:3.9-eclipse-temurin-21` + runtime `eclipse-temurin:21-jre-alpine`); Kaniko lo usa sin Docker daemon.
    - **Helm charts `helm/<service>/`**: `values.yaml` (base), `values-dev.yaml`, `values-staging.yaml`, `values-prod.yaml`; los campos `image.repository` e `image.tag` los escribe `bumpImageTag` en cada build y ArgoCD los lee para sincronizar el cluster.
 6. **Verificación Post-Scaffolding**
-   - Checklist: compilar cada microservicio (`mvn compile`), verificar que el frontend levanta (`npm run dev`)
+   - Compilación backend: comando `bash .claude/scripts/compile-services.sh` — el script detecta automáticamente todos los directorios `*-service` en `backend/` usando `find`, sin hardcodear nombres; describe qué reporta y que sale con código 1 si algún servicio falla
+   - Verificación frontend: comando `bash .claude/scripts/verify-frontend.sh` — detecta automáticamente los proyectos en `frontend/`; describe qué pasos ejecuta (`npm install`, `npm run type-check`, `npm run lint`) y que omite pasos ausentes en `package.json`
    - Estructura de directorios esperada por proyecto
 7. **Configuración Inicial Post-Scaffold**
+   - Secrets floci: comando `bash .claude/scripts/create-all-secrets-dev.sh` — el script itera sobre todos los directorios `*-service` en `backend/` usando `find`; describir que ejecuta el `scripts/create-secrets-dev.sh` de cada servicio y omite los que aún no existan; **no usar un loop con nombres de servicios hardcodeados**
    - Pasos para aplicar el `.env` local a cada proyecto
    - Ajustes mínimos al `application.yml` de cada microservicio para apuntar a floci
 8. **Criterios de Aceptación** — lista de verificación.
@@ -443,6 +445,7 @@ Antes de escribir los archivos, verifica que el directorio `docs/development/` e
 
 # REGLAS IMPORTANTES
 
+- NO incluir loops o comandos bash con nombres de servicios o proyectos hardcodeados (ej: `for service in servicio-a servicio-b ...`). En su lugar, referenciar los scripts genéricos de `.claude/scripts/` que usan `find *-service` o `find *-project` para descubrir los componentes dinámicamente: `compile-services.sh` (compilar backend), `verify-frontend.sh` (verificar frontend), `create-all-secrets-dev.sh` (crear secrets floci). Si el proceso que se quiere documentar no tiene aún un script genérico, describir el paso como instrucción narrativa, no como loop con nombres fijos.
 - NO generar código de aplicación dentro de los documentos de plan. Los documentos describen QUÉ implementar y cómo estructurarlo, no contienen implementaciones completas.
 - SÍ incluir fragmentos de código ilustrativos (firmas de métodos, ejemplos de configuración, comandos exactos) cuando sea necesario para claridad.
 - Las rutas de archivos en comandos deben ser relativas al directorio raíz del repositorio.
