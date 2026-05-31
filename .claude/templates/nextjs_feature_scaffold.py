@@ -1134,7 +1134,7 @@ interface AuthContextValue {
 const AuthContext = createContext<AuthContextValue | null>(null)
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
-  const [user, setUser] = useState<AuthUser | null>(null)
+  const [user] = useState<AuthUser | null>(null)
   const [isLoading, setIsLoading] = useState(true)
 
   useEffect(() => {
@@ -1324,7 +1324,7 @@ export function useDebounce<T>(value: T, delay = 300): T {
 
 def get_use_local_storage() -> str:
     return """\
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 
 export function useLocalStorage<T>(key: string, initialValue: T) {
   const [storedValue, setStoredValue] = useState<T>(() => {
@@ -1729,7 +1729,7 @@ const BASE = '/users'
 
 export const usersApi = {
   getAll: (params?: PaginationParams) =>
-    get<PaginatedResponse<User>>(BASE, { params: params as Record<string, number> }),
+    get<PaginatedResponse<User>>(BASE, { params }),
 
   getById: (id: string) => get<User>(`${BASE}/${id}`),
 
@@ -2177,6 +2177,7 @@ def scaffold(project_name: str) -> None:
         "src/lib/env/index.ts": get_lib_env(),
         "src/lib/constants/index.ts": get_lib_constants(),
         "src/lib/validations/common.ts": get_lib_validations(),
+        "src/lib/validations/index.ts": "export { emailSchema, passwordSchema, paginationSchema, idSchema } from './common'\n",
         "src/lib/api/client.ts": get_lib_api_client(),
         "src/lib/api/interceptors.ts": get_lib_api_interceptors(),
         "src/lib/api/error-handler.ts": get_lib_api_error_handler(),
