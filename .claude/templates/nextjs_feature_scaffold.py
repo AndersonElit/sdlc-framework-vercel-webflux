@@ -311,30 +311,16 @@ next-env.d.ts
 
 def get_env_local(project_name: str) -> str:
     return f"""\
-# ======================================================================
-# Environment Variables - {project_name}
-# ======================================================================
-# IMPORTANT: DO NOT commit this file to version control.
-# Copy .env.example to .env.local and fill in actual values.
-# ======================================================================
-
-# App
-NEXT_PUBLIC_APP_URL=http://localhost:3000
-NEXT_PUBLIC_APP_NAME={project_name}
-NEXT_PUBLIC_APP_ENV=development
-
-# API
-NEXT_PUBLIC_API_URL=http://localhost:8080/api/v1
-API_SECRET_KEY=your-secret-key-here
-
-# Auth
 NEXTAUTH_URL=http://localhost:3000
-NEXTAUTH_SECRET=your-nextauth-secret-here
-JWT_SECRET=your-jwt-secret-here
+NEXTAUTH_SECRET=dev-secret-change-in-production
 
-# Feature Flags
-NEXT_PUBLIC_ENABLE_ANALYTICS=false
-NEXT_PUBLIC_ENABLE_DEBUG=true
+# Cognito local (floci)
+COGNITO_CLIENT_ID=dev-client-id
+COGNITO_CLIENT_SECRET=dev-client-secret
+COGNITO_ISSUER=http://localhost:9229
+
+# API Gateway local
+NEXT_PUBLIC_API_BASE_URL=http://localhost:4567/v1
 """
 
 
