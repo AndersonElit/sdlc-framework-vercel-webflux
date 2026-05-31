@@ -87,15 +87,13 @@ Secciones en orden exacto:
    - Descripción de qué genera (árbol Terraform multi-ambiente)
    - Directorio de salida esperado
 4. **Paso 2: Inicializar el ambiente dev (floci)**
-   - Comandos Terraform para el ambiente `dev`
-   - Verificación de recursos floci levantados (PostgreSQL local, MongoDB local, Kafka local, Cognito local)
+   - Comando exacto: `bash .claude/scripts/init-dev-environment.sh`
+   - Descripción de qué hace (init/plan/apply Terraform, verificación de recursos floci, conectividad, outputs, checklist)
    - Tabla de endpoints locales y puertos esperados
-5. **Paso 3: Verificar conectividad**
-   - Checklist de verificación con comandos concretos (psql, mongosh, kafka-topics, etc.)
-6. **Paso 4: Variables de entorno base**
+5. **Paso 3: Variables de entorno base**
    - Tabla de variables de entorno necesarias para el desarrollo local
    - Indicar qué archivo `.env` debe crearse en cada proyecto
-7. **Criterios de Aceptación** — lista de verificación (`- [ ]`) para dar esta etapa por completada.
+6. **Criterios de Aceptación** — lista de verificación (`- [ ]`) para dar esta etapa por completada. Debe incluir una entrada para `bash .claude/scripts/init-dev-environment.sh`.
 
 ---
 
