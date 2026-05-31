@@ -30,6 +30,7 @@ docs/development/
 ├── DEV-[proyecto]-00-infrastructure.md   # Etapa 0: Infraestructura local (Terraform + floci)
 ├── DEV-[proyecto]-01-databases.md        # Etapa 1: Bases de datos y migraciones
 ├── DEV-[proyecto]-02-scaffold.md         # Etapa 2: Scaffolding de proyectos
+├── DEV-[proyecto]-02b-cicd.md            # Etapa 2b: Configuración del pipeline CI/CD (Jenkins + ArgoCD)
 ├── DEV-[proyecto]-03-ms-[servicio].md    # Etapa 3: Un archivo por microservicio
 ├── DEV-[proyecto]-04-fe-[feature].md     # Etapa 4: Un archivo por feature frontend
 └── DEV-[proyecto]-05-tests.md            # Etapa 5: Pruebas de integración, E2E, estrés y carga
@@ -138,13 +139,70 @@ Secciones en orden exacto:
    - Indicar si el servicio usa mensajería (kafka-producer / kafka-consumer / ambos / none)
 4. **Scaffolding del Frontend**
    - Comando exacto para el proyecto Next.js
-5. **Verificación Post-Scaffolding**
+5. **Artefactos CI/CD generados por el scaffold**
+   - Documentar los artefactos que produce el scaffold y que consume la Etapa 2b: `Jenkinsfile` (backend y frontend), `Dockerfile` multi-stage (backend) y charts Helm (`helm/<service>/`)
+   - **Backend `Jenkinsfile`**: tabla de stages con el step de la shared library que invoca cada uno (`computeImageTag`, `buildBackendService`, `runIntegrationTests`, `runQualityGates`, `runSecurityScans`, `buildAndPushImage`, `scanImage`, `bumpImageTag`, `runSmokeTests`, `notify`). Explicar que el pod de agentes se carga desde `org/flexicredit/podBackend.yaml` de la shared library y que el ServiceAccount `jenkins-agent` usa IRSA.
+   - **Frontend `Jenkinsfile`**: tabla de stages (Install, Type Check, Lint, Unit Tests, Pull config Vercel, Build, Deploy prebuilt, E2E Tests, Promote/Alias prod, Notify). Indicar que despliega a Vercel vía CLI y que la Git integration de Vercel se desactiva.
+   - **`Dockerfile` backend**: imagen multi-stage (builder `maven:3.9-eclipse-temurin-21` + runtime `eclipse-temurin:21-jre-alpine`); Kaniko lo usa sin Docker daemon.
+   - **Helm charts `helm/<service>/`**: `values.yaml` (base), `values-dev.yaml`, `values-staging.yaml`, `values-prod.yaml`; los campos `image.repository` e `image.tag` los escribe `bumpImageTag` en cada build y ArgoCD los lee para sincronizar el cluster.
+6. **Verificación Post-Scaffolding**
    - Checklist: compilar cada microservicio (`mvn compile`), verificar que el frontend levanta (`npm run dev`)
    - Estructura de directorios esperada por proyecto
-6. **Configuración Inicial Post-Scaffold**
+7. **Configuración Inicial Post-Scaffold**
    - Pasos para aplicar el `.env` local a cada proyecto
    - Ajustes mínimos al `application.yml` de cada microservicio para apuntar a floci
-7. **Criterios de Aceptación** — lista de verificación.
+8. **Criterios de Aceptación** — lista de verificación.
+
+---
+
+## Etapa 2b — DEV-[proyecto]-02b-cicd.md
+
+Título H1: `# Etapa 2b — Configuración del Pipeline CI/CD`
+
+**Propósito:** Esta etapa se ejecuta inmediatamente después del scaffold y antes de comenzar cualquier microservicio. El objetivo es que cada commit de las etapas 3 y 4 sea validado automáticamente por el pipeline: build, tests, quality gate, imagen y actualización del estado GitOps. Jenkins hace CI; ArgoCD hace CD por GitOps.
+
+Secciones en orden exacto:
+
+1. **Objetivo** — describir que el CI/CD se configura antes de la implementación para validar el código a medida que se genera. Indicar el modelo: Jenkins CI → `bumpImageTag` → ArgoCD CD (auto-sync dev/staging; manual prod). Incluir un diagrama ASCII del flujo: `git push → Jenkins stages → helm/<service>/values-<env>.yaml → ArgoCD → EKS`.
+2. **Prerrequisitos** — Etapa 2 completa (Jenkinsfile + Dockerfile + Helm charts generados); módulos Terraform `jenkins` y `argocd` aplicados (Etapa 0).
+3. **Paso 1: Generar la Shared Library**
+   - Comando: `bash .claude/scripts/jenkins-shared-library-builder.sh -o jenkins-shared-library`
+   - Árbol de directorios generado: `vars/` (10 steps), `src/org/[proyecto]/PipelineDefaults.groovy`, `resources/org/[proyecto]/podBackend.yaml` y `podFrontend.yaml`, `bootstrap/jenkins-agent-rbac.yaml`, `docker/` (Dockerfile + plugins.txt + jenkins.yaml JCasC)
+   - Tabla de steps de `vars/`: nombre del archivo → stage del pipeline que invoca → descripción
+   - Instrucción para publicar el directorio como repositorio remoto (GitHub / GitLab); la URL se usa en el paso de credenciales como `SHARED_LIBRARY_REPO`
+4. **Paso 2: Construir y publicar la imagen del controller**
+   - Comandos: `docker build` de `docker/Dockerfile`, `aws ecr get-login-password | docker login`, `docker push`
+   - Indicar que se debe actualizar `var.jenkins_image` en el módulo Terraform `jenkins` y hacer `terraform apply`
+5. **Paso 3: Bootstrap del cluster (namespace + ServiceAccount IRSA)**
+   - Sustituir `<JENKINS_AGENT_ROLE_ARN>` con el output `agent_role_arn` de Terraform
+   - Comando: `kubectl apply -f jenkins-shared-library/bootstrap/jenkins-agent-rbac.yaml`
+   - Verificación: `kubectl get namespace jenkins` y `kubectl get serviceaccount jenkins-agent -n jenkins`
+6. **Paso 4: Proveer variables de entorno y credenciales al controller (JCasC)**
+   - Tabla de variables de entorno inyectadas al controller (EC2 user_data o SSM): `ECR_REGISTRY`, `EKS_API_SERVER`, `EKS_CLUSTER_NAME`, `AWS_REGION`, `JENKINS_URL`, `JENKINS_TUNNEL`, `SHARED_LIBRARY_REPO`, `SONAR_URL`, `SLACK_TEAM`, `VERCEL_TOKEN`, `VERCEL_ORG_ID`, `VERCEL_PROJECT_ID`, `GITOPS_GIT_USERNAME`, `GITOPS_GIT_TOKEN`; fuente de cada variable (Terraform output o configuración manual)
+   - Tabla de credenciales gestionadas por el JCasC: `sonar-token`, `slack-token`, `eks-kubeconfig`, `gitops-git-credentials`; tipo de credencial y descripción
+7. **Paso 5: Crear los jobs de pipeline en Jenkins**
+   - Tipo de job: Multibranch Pipeline
+   - Tabla de jobs a crear: job name → repositorio → `SERVICE_NAME` por defecto
+   - Configuración de cada job: Branch Sources, Build Configuration, Scan Triggers (webhook + periódico)
+   - Instrucción para configurar webhooks en GitHub/GitLab (URL del webhook, eventos `Push` y `Pull Request`)
+8. **Paso 6: Bootstrap de ArgoCD (ApplicationSet por servicio)**
+   - Comandos: `kubectl apply -f terraform/backend/environments/<env>/argocd-bootstrap/`
+   - Indicar que el `ApplicationSet` generado tiene un elemento de lista por microservicio con la URL del repositorio vacía; completar esa URL antes de aplicar
+   - Tabla de política de sync por ambiente: `dev`/`staging` → automated (prune + selfHeal); `prod` → sync manual en UI de ArgoCD
+   - Verificación: `argocd app list`
+9. **Verificación del pipeline completo**
+   - Hacer un commit trivial en el primer microservicio (el que no tiene dependencias externas)
+   - Checklist de stages que deben aparecer como exitosos en Jenkins
+   - Verificar que el app en ArgoCD queda en estado `Synced` tras el pipeline
+10. **Criterios de Aceptación** — lista de verificación.
+
+### Reglas para el documento de CI/CD
+
+- Derivar los nombres de los jobs exactamente de la lista de microservicios identificados en el roadmap.
+- La tabla de variables de entorno del JCasC debe listar todas las variables que usa `docker/jenkins.yaml`; no omitir ninguna.
+- El diagrama ASCII del flujo CI/CD (sección Objetivo) debe mostrar la frontera CI→CD claramente: Jenkins escribe en Git, ArgoCD lee de Git.
+- Indicar explícitamente que el frontend despliega a Vercel (no a EKS) y que ArgoCD no gestiona el frontend.
+- El paso de bootstrap de ArgoCD debe ser posterior a que el cluster EKS esté disponible (depende del módulo Terraform `eks`).
 
 ---
 
@@ -364,11 +422,12 @@ Analiza los bounded contexts, los roles de usuario y los flujos del sistema para
 
 Genera los documentos en este orden:
 
-1. Primero el roadmap (`DEV-[proyecto]-roadmap.md`) — necesita tener la visión completa antes de generarse
+1. Primero el roadmap (`DEV-[proyecto]-roadmap.md`) — necesita tener la visión completa antes de generarse; incluir la fila de Etapa 2b en la tabla de secuencia de etapas, posicionada entre la Etapa 2 (scaffold) y la Etapa 3a (primer microservicio), con dependencia `Etapa 2 + infra Jenkins/ArgoCD (Etapa 0)` y esfuerzo estimado de 1 día
 2. Luego las etapas 0, 1 y 2 (infraestructura, bases de datos, scaffolding)
-3. Luego los documentos de microservicios en el orden de implementación determinado en el Paso 3
-4. Luego los documentos de features frontend en orden de dependencia (auth primero, siempre)
-5. Finalmente el documento de pruebas
+3. Luego la etapa 2b (configuración del pipeline CI/CD) — va antes de los microservicios para que cada commit de las etapas 3 y 4 sea validado automáticamente
+4. Luego los documentos de microservicios en el orden de implementación determinado en el Paso 3
+5. Luego los documentos de features frontend en orden de dependencia (auth primero, siempre)
+6. Finalmente el documento de pruebas
 
 ## Paso 6 — Crear el directorio de salida
 
