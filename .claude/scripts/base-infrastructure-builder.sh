@@ -3222,6 +3222,11 @@ output "cognito_client_id" {
   value       = module.cognito.client_id
 }
 
+output "user_pool_endpoint" {
+  description = "Endpoint del User Pool de Cognito (issuer JWT para NextAuth y API Gateway)"
+  value       = module.cognito.user_pool_endpoint
+}
+
 output "ecr_repository_urls" {
   description = "URLs de los repositorios ECR"
   value       = module.ecr.repository_urls
@@ -3596,6 +3601,11 @@ output "cognito_user_pool_id" {
 output "cognito_client_id" {
   description = "App Client ID de Cognito"
   value       = module.cognito.client_id
+}
+
+output "user_pool_endpoint" {
+  description = "Endpoint del User Pool de Cognito (issuer JWT para NextAuth y API Gateway)"
+  value       = module.cognito.user_pool_endpoint
 }
 
 output "ecr_repository_urls" {
