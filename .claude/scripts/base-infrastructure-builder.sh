@@ -3046,6 +3046,11 @@ output "jenkins_ebs_volume_id" {
   value       = module.jenkins.ebs_volume_id
 }
 
+output "jenkins_agent_role_arn" {
+  description = "ARN del IAM role del agente Jenkins (para RBAC en EKS/IRSA en dev)"
+  value       = module.jenkins.agent_role_arn
+}
+
 output "kafka_bootstrap_brokers" {
   description = "Bootstrap brokers de Apache Kafka para microservicios como contenedores en floci-net"
   value       = local.kafka_bootstrap_brokers
@@ -3351,6 +3356,11 @@ output "jenkins_url" {
 output "jenkins_ebs_volume_id" {
   description = "ID del volumen EBS que persiste JENKINS_HOME"
   value       = module.jenkins.ebs_volume_id
+}
+
+output "jenkins_agent_role_arn" {
+  description = "ARN del IAM role del agente Jenkins (IRSA para pods en EKS)"
+  value       = module.jenkins.agent_role_arn
 }
 
 output "msk_cluster_arn" {
