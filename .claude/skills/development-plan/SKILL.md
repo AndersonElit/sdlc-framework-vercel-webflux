@@ -133,8 +133,8 @@ Secciones en orden exacto:
 1. **Objetivo** — generar la estructura base de todos los proyectos.
 2. **Directorio de trabajo** — indicar que los microservicios se crean en `backend/` y el frontend en `frontend/`; crear estos directorios antes de ejecutar los scripts.
 3. **Scaffolding de Microservicios**
-   - Para cada microservicio: comando exacto con flags `-n`, `-d`, `-m` derivados del diseño técnico
-   - Tabla resumen: servicio → comando completo → módulos generados
+   - Para cada microservicio: comando exacto con flags `-n`, `-d`, `-m`, `-p` derivados del diseño técnico
+   - Tabla resumen: servicio → puerto local → comando completo → módulos generados
    - Indicar si el servicio usa mensajería (kafka-producer / kafka-consumer / ambos / none)
 4. **Scaffolding del Frontend**
    - Comando exacto para el proyecto Next.js
@@ -381,7 +381,7 @@ Antes de escribir los archivos, verifica que el directorio `docs/development/` e
 - NO generar código de aplicación dentro de los documentos de plan. Los documentos describen QUÉ implementar y cómo estructurarlo, no contienen implementaciones completas.
 - SÍ incluir fragmentos de código ilustrativos (firmas de métodos, ejemplos de configuración, comandos exactos) cuando sea necesario para claridad.
 - Las rutas de archivos en comandos deben ser relativas al directorio raíz del repositorio.
-- Los comandos de scaffold deben derivarse del diseño: si un servicio usa Kafka, incluir el flag `-m kafka-producer` o `-m kafka-consumer` según corresponda; si usa PostgreSQL, `-d postgres`; si usa MongoDB, `-d mongo`.
+- Los comandos de scaffold deben derivarse del diseño: si un servicio usa Kafka, incluir el flag `-m kafka-producer` o `-m kafka-consumer` según corresponda; si usa PostgreSQL, `-d postgres`; si usa MongoDB, `-d mongo`. Incluir siempre el flag `-p <puerto>` con el puerto local asignado al servicio (derivado del diseño de infraestructura o del mapa de puertos del roadmap) — el default del script es `8080` pero cada microservicio debe tener un puerto distinto para poder correr simultáneamente en local.
 - El documento de roadmap debe ser navegable: los nombres de los documentos en la tabla de etapas deben ser enlaces relativos a los archivos generados.
 - Cada documento de microservicio debe ser completamente autónomo para que un desarrollador diferente pueda tomarlo y ejecutarlo.
 - Los criterios de aceptación deben ser verificables objetivamente (no "la aplicación funciona", sino "el endpoint GET /clientes/{id} retorna 200 con el schema esperado").

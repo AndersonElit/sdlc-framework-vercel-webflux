@@ -10,7 +10,7 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
-def get_yaml_content(project_name: str, database: str, messaging_system: str) -> str:
+def get_yaml_content(project_name: str, database: str, messaging_system: str, port: int = 8080) -> str:
     lines = [
         "spring:",
         "  application:",
@@ -58,7 +58,7 @@ def get_yaml_content(project_name: str, database: str, messaging_system: str) ->
                 "        spring.json.trusted.packages: '*'",
             ]
 
-    lines += ["server:", "  port: ${SERVER_PORT:8080}"]
+    lines += ["server:", f"  port: ${{SERVER_PORT:{port}}}"]
     return "\n".join(lines) + "\n"
 
 
@@ -70,13 +70,13 @@ spring:
       secretsmanager:
         endpoint: http://localhost:4566
       credentials:
-        access-key: floci
-        secret-key: floci
+        access-key: test
+        secret-key: test
 """
 
 
-def get_secrets_setup_content(project_name: str, database: str, messaging_system: str) -> str:
-    secret: dict = {"SERVER_PORT": "8080"}
+def get_secrets_setup_content(project_name: str, database: str, messaging_system: str, port: int = 8080) -> str:
+    secret: dict = {"SERVER_PORT": str(port)}
     if database.lower() == "mongo":
         secret["MONGODB_URI"] = "mongodb://localhost:27017/mydb"
     else:
@@ -123,7 +123,7 @@ fi
 """
 
 
-def get_dockerfile_content(database: str, messaging_system: str) -> str:
+def get_dockerfile_content(database: str, messaging_system: str, port: int = 8080) -> str:
     db_module = "mongo" if database.lower() == "mongo" else "postgres"
 
     copy_poms = [
@@ -170,7 +170,7 @@ RUN mvn clean package -DskipTests --no-transfer-progress
 FROM eclipse-temurin:21-jre-alpine
 WORKDIR /app
 COPY --from=builder /app/infrastructure/entry-points/app/target/*.jar app.jar
-EXPOSE 8080
+EXPOSE {port}
 ENTRYPOINT ["java", "-jar", "app.jar"]
 """
 
@@ -339,7 +339,7 @@ target/
 """
 
 
-def get_helm_chart_files(project_name: str) -> dict:
+def get_helm_chart_files(project_name: str, port: int = 8080) -> dict:
     """Helm chart consumido por deployToEks() de la Shared Library.
 
     Layout esperado por el step: helm/<service>/ con Chart.yaml, values.yaml y
@@ -355,7 +355,7 @@ version: 0.1.0
 appVersion: "0.1.0"
 """
 
-    values_yaml = """\
+    values_yaml = f"""\
 # Valores base. En GitOps, image.repository/tag se fijan por ambiente en
 # values-<env>.yaml (los escribe el paso bumpImageTag de Jenkins y los lee ArgoCD).
 replicaCount: 1
@@ -367,7 +367,7 @@ image:
 
 service:
   type: ClusterIP
-  port: 8080
+  port: {port}
 
 resources:
   requests:
@@ -1023,10 +1023,10 @@ public class MessageConsumer {{
     logger.info("Módulo kafka-consumer generado")
 
 
-def scaffold(project_name: str, database: str, messaging_system: str) -> None:
+def scaffold(project_name: str, database: str, messaging_system: str, port: int = 8080) -> None:
     safe_name = project_name.replace("-", "")
     root = Path(project_name)
-    logger.info("Creando proyecto: %s (db=%s, messaging=%s)", project_name, database, messaging_system)
+    logger.info("Creando proyecto: %s (db=%s, messaging=%s, port=%d)", project_name, database, messaging_system, port)
 
     db_adapter_module = (
         "infrastructure/driven-adapters/mongo"
@@ -1141,7 +1141,7 @@ public class ApplicationConfig {{
 
             resources_dir = root / module / "src/main/resources"
             resources_dir.mkdir(parents=True, exist_ok=True)
-            (resources_dir / "application.yml").write_text(get_yaml_content(project_name, database, messaging_system))
+            (resources_dir / "application.yml").write_text(get_yaml_content(project_name, database, messaging_system, port))
             (resources_dir / "application-dev.yml").write_text(get_dev_yaml_content())
             logger.debug("application.yml creado en: %s", resources_dir)
 
@@ -1159,7 +1159,7 @@ public class ApplicationConfig {{
     secrets_dir = root / "scripts"
     secrets_dir.mkdir(parents=True, exist_ok=True)
     secrets_script = secrets_dir / "create-secrets-dev.sh"
-    secrets_script.write_text(get_secrets_setup_content(project_name, database, messaging_system))
+    secrets_script.write_text(get_secrets_setup_content(project_name, database, messaging_system, port))
     secrets_script.chmod(0o755)
     logger.debug("scripts/create-secrets-dev.sh creado")
 
@@ -1190,7 +1190,7 @@ bin/
     (root / "pom.xml").write_text(get_root_pom(project_name, database, messaging_system))
     logger.debug("pom.xml raíz creado")
 
-    (root / "Dockerfile").write_text(get_dockerfile_content(database, messaging_system))
+    (root / "Dockerfile").write_text(get_dockerfile_content(database, messaging_system, port))
     logger.debug("Dockerfile creado")
     (root / ".dockerignore").write_text(get_dockerignore_content())
     logger.debug(".dockerignore creado")
@@ -1200,17 +1200,17 @@ bin/
 
     # Helm chart consumido por deployToEks() de la Shared Library.
     helm_root = root / "helm" / project_name
-    for rel_path, content in get_helm_chart_files(project_name).items():
+    for rel_path, content in get_helm_chart_files(project_name, port).items():
         target = helm_root / rel_path
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content)
     logger.debug("Helm chart creado en %s", helm_root)
 
     logger.info("Proyecto creado exitosamente en: %s", root.resolve())
-    _print_run_instructions(project_name, root, messaging_system)
+    _print_run_instructions(project_name, root, messaging_system, port)
 
 
-def _print_run_instructions(project_name: str, root: Path, messaging_system: str) -> None:
+def _print_run_instructions(project_name: str, root: Path, messaging_system: str, port: int = 8080) -> None:
     rabbit_note = ""
     if messaging_system.lower() in ("rabbit-producer", "rabbit-consumer"):
         rabbit_note = "\n  # Asegúrate de tener RabbitMQ corriendo antes de iniciar:\n  docker run -d --name rabbitmq -p 5672:5672 -p 15672:15672 rabbitmq:3-management\n"
@@ -1238,7 +1238,7 @@ def _print_run_instructions(project_name: str, root: Path, messaging_system: str
     mvn -pl infrastructure/entry-points/app spring-boot:run
 
  5. Verifica que está corriendo:
-    curl http://localhost:8080/hello
+    curl http://localhost:{port}/hello
 
  ── Ejecución con Docker ───────────────────────────────────────────────
 
@@ -1250,12 +1250,12 @@ def _print_run_instructions(project_name: str, root: Path, messaging_system: str
       -e SPRING_PROFILES_ACTIVE=dev \\
       -e APP_ENV=dev \\
       --network host \\
-      -p 8080:8080 \\
+      -p {port}:{port} \\
       {project_name}:latest
 
  Verificar contenedor:
     docker logs -f {project_name}
-    curl http://localhost:8080/hello
+    curl http://localhost:{port}/hello
 
  Detener y eliminar:
     docker rm -f {project_name}
@@ -1284,6 +1284,8 @@ def main() -> None:
     parser.add_argument("-m", "--messaging-system", default="none",
                         choices=["none", "rabbit-producer", "rabbit-consumer", "kafka-producer", "kafka-consumer"],
                         help="Sistema de mensajería a configurar")
+    parser.add_argument("-p", "--port", type=int, default=8080,
+                        metavar="PORT", help="Puerto HTTP del servidor (default: 8080)")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Mostrar logs detallados (DEBUG)")
 
@@ -1298,7 +1300,7 @@ def main() -> None:
     )
 
     try:
-        scaffold(args.service_name, args.database, args.messaging_system)
+        scaffold(args.service_name, args.database, args.messaging_system, args.port)
     except OSError as e:
         logger.error("No se pudo crear el proyecto: %s", e)
         sys.exit(1)
