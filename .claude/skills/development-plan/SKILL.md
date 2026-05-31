@@ -220,32 +220,38 @@ Secciones en orden exacto:
 2. **Prerrequisitos**
    - Etapas anteriores que deben estar completas
    - Servicios que deben estar corriendo
-3. **Capa de Dominio (`domain`)**
+3. **Ciclo de Desarrollo Incremental en EKS dev**
+   - Explicar que con la Etapa 2b completada, cada commit que pasa el pipeline CI despliega automáticamente el microservicio en EKS dev vía ArgoCD, sin necesidad de terminar la implementación completa
+   - Tabla de condición mínima para el primer despliegue: contexto Spring arranca sin errores (`Started ...Application in X seconds`), `/actuator/health/readiness` responde `UP` (`readinessProbe` del chart Helm pasa), secret `flexicredit/dev/<servicio>` existe en floci
+   - Indicar que esta condición se cumple con el esqueleto generado por el scaffold más la configuración del `application.yml`; no requiere ningún caso de uso implementado
+   - Diagrama ASCII del ciclo por caso de uso: `Implementar caso de uso → mvn test (local) → git push → Jenkins pipeline → bumpImageTag → ArgoCD sync → EKS dev → endpoint disponible`
+   - Indicar que cada caso de uso que se implementa y pushea queda disponible en EKS dev sin intervención manual
+4. **Capa de Dominio (`domain`)**
    - Entidades a implementar (derivadas del schema.sql y el diseño): nombre, campos clave, reglas de negocio
    - Value Objects relevantes
    - Eventos de dominio (nombre del evento, payload mínimo)
    - Interfaces de puertos secundarios (repository interfaces, messaging ports): firma de los métodos
    - Reglas de dominio a validar (invariantes)
-4. **Capa de Aplicación (`application`)**
+5. **Capa de Aplicación (`application`)**
    - Tabla de casos de uso: nombre del use case, descripción, puerto primario que expone, puerto secundario que consume
    - DTOs de entrada y salida por caso de uso
    - Flujo de orquestación para los casos de uso más importantes
-5. **Capa de Infraestructura (`infrastructure`)**
+6. **Capa de Infraestructura (`infrastructure`)**
    - Adaptadores R2DBC: tablas que gestiona, operaciones a implementar
    - Productores Kafka: tópicos, estructura del evento, cuándo se publica
    - Consumidores Kafka (si aplica): tópicos que consume, lógica de procesamiento
    - Clientes REST (WebClient): servicios externos a llamar, endpoints, contrato esperado
    - Configuración de Spring Security para este servicio
-6. **API REST (`rest-api`)**
+7. **API REST (`rest-api`)**
    - Tabla de endpoints: método, ruta, descripción, request body, response, códigos HTTP
    - Referencia a la especificación OpenAPI para el contrato completo
    - Configuración de rutas en Router Functions o `@RestController`
-7. **Pruebas Unitarias**
+8. **Pruebas Unitarias**
    - **Dominio**: casos de prueba para reglas de negocio, invariantes, validaciones de entidades
    - **Aplicación**: casos de prueba para cada use case (mocks de puertos secundarios con Mockito); happy path + casos de error
    - **Infraestructura**: pruebas de repositorios con Testcontainers (PostgreSQL o MongoDB real)
    - Tabla de cobertura mínima esperada por capa
-8. **Criterios de Aceptación** — lista de verificación.
+9. **Criterios de Aceptación** — lista de verificación.
 
 ### Reglas para los documentos de microservicio
 
