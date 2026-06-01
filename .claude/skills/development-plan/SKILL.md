@@ -103,13 +103,16 @@ Título H1: `# Etapa 1 — Bases de Datos y Migraciones`
 
 Secciones en orden exacto:
 
+0. **Automatización** — bloque inicial antes del Objetivo, con el comando de ejecución del script:
+   ```bash
+   bash .claude/scripts/init-databases.sh
+   ```
+   Describir brevemente qué automatiza: crea el usuario y la base PostgreSQL, habilita `pgcrypto`, aplica el `schema.sql` completo, genera `V1__initial_schema.sql` por microservicio extrayendo el bloque `BC-XX` correspondiente, genera `V2__seed_roles_permisos.sql` para `seguridad-service`, y ejecuta el script de colecciones MongoDB. Indicar que el flag `--bc-tags` (repetible, formato `--bc-tags servicio=BC-XX`) permite personalizar el mapping service→tag; los defaults cubren los 6 servicios del proyecto. Aclarar que las secciones siguientes son referencia de diseño y para ejecución manual puntual.
 1. **Objetivo** — crear los esquemas y colecciones que el sistema requiere.
 2. **Estrategia de Persistencia** — resumen de la decisión poliglota (PostgreSQL transaccional + MongoDB auditoría), con referencia a los archivos de diseño.
 3. **PostgreSQL — Esquema Relacional**
    - Referencia al archivo `docs/design/database/SDD-[proyecto]-schema.sql`
    - Tabla de bounded contexts con sus tablas correspondientes
-   - Instrucciones para crear la base de datos local y ejecutar el schema
-   - Comandos exactos (psql o docker exec)
 4. **PostgreSQL — Migraciones Flyway por Microservicio**
    - Para cada microservicio que usa PostgreSQL: ubicación del directorio de migraciones (`src/main/resources/db/migration/`)
    - Nomenclatura obligatoria: `V1__initial_schema.sql`, `V2__...`, etc.
@@ -117,9 +120,8 @@ Secciones en orden exacto:
    - Regla de propiedad: cada tabla es propiedad de exactamente un microservicio; ningún otro servicio hace DDL sobre ella
 5. **MongoDB — Colecciones y Validadores**
    - Referencia al archivo `docs/design/database/SDD-[proyecto]-collections.js`
-   - Instrucciones para ejecutar el script contra la instancia local de MongoDB
    - Tabla de colecciones con su propósito y bounded context
-6. **Criterios de Aceptación** — lista de verificación para dar esta etapa por completada.
+6. **Criterios de Aceptación** — lista de verificación para dar esta etapa por completada. Incluir como primer criterio: `bash .claude/scripts/init-databases.sh` finalizó con checklist ✓.
 
 ---
 
@@ -459,7 +461,7 @@ Antes de escribir los archivos, verifica que el directorio `docs/development/` e
 
 # REGLAS IMPORTANTES
 
-- NO incluir loops o comandos bash con nombres de servicios o proyectos hardcodeados (ej: `for service in servicio-a servicio-b ...`). En su lugar, referenciar los scripts genéricos de `.claude/scripts/` que usan `find *-service` o `find *-project` para descubrir los componentes dinámicamente: `compile-services.sh` (compilar backend), `verify-frontend.sh` (verificar frontend), `create-all-secrets-dev.sh` (crear secrets floci). Si el proceso que se quiere documentar no tiene aún un script genérico, describir el paso como instrucción narrativa, no como loop con nombres fijos.
+- NO incluir loops o comandos bash con nombres de servicios o proyectos hardcodeados (ej: `for service in servicio-a servicio-b ...`). En su lugar, referenciar los scripts genéricos de `.claude/scripts/` que usan `find *-service` o `find *-project` para descubrir los componentes dinámicamente: `init-databases.sh` (crear bases de datos, aplicar schema, generar migraciones Flyway y colecciones MongoDB), `compile-services.sh` (compilar backend), `verify-frontend.sh` (verificar frontend), `create-all-secrets-dev.sh` (crear secrets floci). Si el proceso que se quiere documentar no tiene aún un script genérico, describir el paso como instrucción narrativa, no como loop con nombres fijos.
 - NO generar código de aplicación dentro de los documentos de plan. Los documentos describen QUÉ implementar y cómo estructurarlo, no contienen implementaciones completas.
 - SÍ incluir fragmentos de código ilustrativos (firmas de métodos, ejemplos de configuración, comandos exactos) cuando sea necesario para claridad.
 - Las rutas de archivos en comandos deben ser relativas al directorio raíz del repositorio.
