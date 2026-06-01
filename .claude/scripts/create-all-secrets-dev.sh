@@ -7,7 +7,13 @@
 # de driven-adapters generada por el scaffold.
 #
 # Uso:
-#   bash .claude/scripts/create-all-secrets-dev.sh
+#   bash .claude/scripts/create-all-secrets-dev.sh \
+#     -p <pg-db> -m <mongo-db> -u <usuario> -w <clave>
+#
+#   -p, --pg-db    NOMBRE   Base de datos PostgreSQL (obligatorio)
+#   -m, --mongo-db NOMBRE   Base de datos MongoDB    (obligatorio)
+#   -u, --user     NOMBRE   Usuario de aplicación    (obligatorio)
+#   -w, --password CLAVE    Clave del usuario         (obligatorio)
 #
 # Variables de entorno opcionales (anulan los Terraform outputs):
 #   RDS_PORT            Puerto dinámico de PostgreSQL RDS en floci
@@ -18,6 +24,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 BACKEND_DIR="${REPO_ROOT}/backend"
 TF_DEV_DIR="${REPO_ROOT}/terraform/backend/environments/dev"
@@ -38,6 +45,39 @@ HEADER() {
   echo "── $* $(printf '%.0s─' {1..50})" | head -c 60
   echo ""
 }
+
+# ── Parámetros ────────────────────────────────────────────────────────────────
+PG_DB_NAME=""
+MONGO_DB_NAME=""
+DB_USER=""
+DB_PASSWORD=""
+
+usage() {
+  sed -n '9,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  exit "${1:-0}"
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -p|--pg-db)    PG_DB_NAME="$2";    shift 2 ;;
+    -m|--mongo-db) MONGO_DB_NAME="$2"; shift 2 ;;
+    -u|--user)     DB_USER="$2";       shift 2 ;;
+    -w|--password) DB_PASSWORD="$2";   shift 2 ;;
+    -h|--help)     usage 0 ;;
+    *) log_err "Opción desconocida: $1"; usage 1 ;;
+  esac
+done
+
+MISSING_ARGS=()
+[[ -z "$PG_DB_NAME"    ]] && MISSING_ARGS+=("-p/--pg-db")
+[[ -z "$MONGO_DB_NAME" ]] && MISSING_ARGS+=("-m/--mongo-db")
+[[ -z "$DB_USER"       ]] && MISSING_ARGS+=("-u/--user")
+[[ -z "$DB_PASSWORD"   ]] && MISSING_ARGS+=("-w/--password")
+
+if [[ ${#MISSING_ARGS[@]} -gt 0 ]]; then
+  log_err "Faltan parámetros obligatorios: ${MISSING_ARGS[*]}"
+  usage 1
+fi
 
 # ── Dependencias ──────────────────────────────────────────────────────────────
 for dep in aws jq terraform; do
@@ -179,9 +219,9 @@ for svc_path in "${services[@]}"; do
   case "$db_type" in
     postgres)
       secret_json=$(jq -n \
-        --arg r2dbc   "r2dbc:postgresql://localhost:${RDS_PORT}/flexicredit_dev" \
-        --arg user    "admin" \
-        --arg pass    "changeme123" \
+        --arg r2dbc   "r2dbc:postgresql://localhost:${RDS_PORT}/${PG_DB_NAME}" \
+        --arg user    "$DB_USER" \
+        --arg pass    "$DB_PASSWORD" \
         --arg kafka   "localhost:29092" \
         --arg cognito "$COGNITO_ISSUER_URI" \
         '{
@@ -194,7 +234,7 @@ for svc_path in "${services[@]}"; do
       ;;
     mongo)
       secret_json=$(jq -n \
-        --arg mongo   "mongodb://localhost:27017/flexicredit_audit" \
+        --arg mongo   "mongodb://localhost:27017/${MONGO_DB_NAME}" \
         --arg kafka   "localhost:29092" \
         --arg cognito "$COGNITO_ISSUER_URI" \
         '{

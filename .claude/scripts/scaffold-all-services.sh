@@ -71,15 +71,26 @@ BACKEND_SERVICES=()
 FRONTEND_NAME=""
 HAS_FRONTEND=0
 declare -A BC_TAGS
+PG_DB_NAME=""
+MONGO_DB_NAME=""
+DB_USER=""
+DB_PASSWORD=""
 
 usage() {
   cat <<EOF
-Uso: $0 --backend nombre:db:messaging:puerto [--backend ...] [--frontend nombre] [--bc-tags servicio=TAG ...]
+Uso: $0 --backend nombre:db:messaging:puerto [--backend ...] \
+        -p <pg-db> -m <mongo-db> -u <usuario> -w <clave> \
+        [--frontend nombre] [--bc-tags servicio=TAG ...]
 
   --backend   Par nombre:db:messaging:puerto. Repetir una vez por servicio (obligatorio).
               db       = postgres | mongo
               messaging = none | kafka-producer | kafka-consumer | rabbit-producer | rabbit-consumer
               puerto   = número de puerto HTTP
+
+  -p, --pg-db    NOMBRE   Base de datos PostgreSQL (obligatorio)
+  -m, --mongo-db NOMBRE   Base de datos MongoDB    (obligatorio)
+  -u, --user     NOMBRE   Usuario de aplicación    (obligatorio)
+  -w, --password CLAVE    Clave del usuario         (obligatorio)
 
   --frontend  Nombre del proyecto frontend Next.js (opcional).
               Si se omite, no se genera frontend.
@@ -93,6 +104,8 @@ Ejemplo:
     --backend seguridad-service:postgres:none:8081 \\
     --backend clientes-service:postgres:kafka-producer:8082 \\
     --backend configuracion-service:postgres:kafka-producer:8083 \\
+    -p flexicredit_dev -m flexicredit_audit \\
+    -u flexiapp -w secret123 \\
     --frontend flexicredit-web \\
     --bc-tags clientes-service=BC-01 \\
     --bc-tags configuracion-service=BC-02
@@ -164,6 +177,54 @@ while [[ $# -gt 0 ]]; do
       BC_TAGS["$SERVICE"]="$TAG"
       shift
       ;;
+    -p|--pg-db)
+      if [[ -z "${2:-}" ]]; then
+        log_err "--pg-db requiere un valor (nombre de la base de datos PostgreSQL)."
+        exit 1
+      fi
+      PG_DB_NAME="$2"
+      shift 2
+      ;;
+    --pg-db=*)
+      PG_DB_NAME="${1#*=}"
+      shift
+      ;;
+    -m|--mongo-db)
+      if [[ -z "${2:-}" ]]; then
+        log_err "--mongo-db requiere un valor (nombre de la base de datos MongoDB)."
+        exit 1
+      fi
+      MONGO_DB_NAME="$2"
+      shift 2
+      ;;
+    --mongo-db=*)
+      MONGO_DB_NAME="${1#*=}"
+      shift
+      ;;
+    -u|--user)
+      if [[ -z "${2:-}" ]]; then
+        log_err "--user requiere un valor (usuario de aplicación)."
+        exit 1
+      fi
+      DB_USER="$2"
+      shift 2
+      ;;
+    --user=*)
+      DB_USER="${1#*=}"
+      shift
+      ;;
+    -w|--password)
+      if [[ -z "${2:-}" ]]; then
+        log_err "--password requiere un valor (clave del usuario)."
+        exit 1
+      fi
+      DB_PASSWORD="$2"
+      shift 2
+      ;;
+    --password=*)
+      DB_PASSWORD="${1#*=}"
+      shift
+      ;;
     -h|--help)
       usage
       ;;
@@ -174,8 +235,15 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ "${#BACKEND_SERVICES[@]}" -eq 0 ]]; then
-  log_err "Se requiere al menos un argumento --backend."
+MISSING_ARGS=()
+[[ "${#BACKEND_SERVICES[@]}" -eq 0 ]] && MISSING_ARGS+=("--backend")
+[[ -z "$PG_DB_NAME"    ]] && MISSING_ARGS+=("-p/--pg-db")
+[[ -z "$MONGO_DB_NAME" ]] && MISSING_ARGS+=("-m/--mongo-db")
+[[ -z "$DB_USER"       ]] && MISSING_ARGS+=("-u/--user")
+[[ -z "$DB_PASSWORD"   ]] && MISSING_ARGS+=("-w/--password")
+
+if [[ ${#MISSING_ARGS[@]} -gt 0 ]]; then
+  log_err "Faltan parámetros obligatorios: ${MISSING_ARGS[*]}"
   log_err "Ejecute con --help para ver la ayuda."
   exit 1
 fi
@@ -603,7 +671,11 @@ fi
 HEADER "11. Secrets floci"
 
 log "Ejecutando create-all-secrets-dev.sh..."
-if bash "$SCRIPT_DIR/create-all-secrets-dev.sh"; then
+if bash "$SCRIPT_DIR/create-all-secrets-dev.sh" \
+     --pg-db    "$PG_DB_NAME" \
+     --mongo-db "$MONGO_DB_NAME" \
+     --user     "$DB_USER" \
+     --password "$DB_PASSWORD"; then
   log_ok "Secrets creados en floci."
 else
   log_err "Creación de secrets falló."
