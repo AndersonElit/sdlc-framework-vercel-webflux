@@ -209,6 +209,11 @@ else
   log_ok "Base de datos flexicredit creada."
 fi
 
+log "Otorgando permisos de schema public a flexicredit..."
+PGPASSWORD=changeme123 psql "$PGADMIN/flexicredit" \
+  -c "GRANT ALL ON SCHEMA public TO flexicredit"
+log_ok "Permisos de schema public otorgados."
+
 log "Habilitando extensión pgcrypto..."
 PGPASSWORD=changeme123 psql "$PGADMIN/flexicredit" \
   -c "CREATE EXTENSION IF NOT EXISTS pgcrypto"
@@ -242,10 +247,13 @@ for SERVICE in "${!BC_TAGS[@]}"; do
   MIGRATION_DIR="$REPO_ROOT/backend/$SERVICE/$REST_MODULE/$MIGRATION_SUBPATH"
   V1_FILE="$MIGRATION_DIR/V1__initial_schema.sql"
 
-  # Extraer bloque del bounded context desde el schema.sql
-  # El schema.sql usa comentarios -- BC-XX: para delimitar cada sección
-  BLOCK=$(awk "/-- $TAG:/,/-- BC-[0-9]+:/" "$SCHEMA_SQL" 2>/dev/null | \
-    grep -v "^-- BC-[0-9]*:" | sed '/^[[:space:]]*$/N;/^\n$/d' || true)
+  # Extraer bloque del bounded context desde el schema.sql.
+  # Salta la línea del encabezado (-- BC-XX: ...) y acumula hasta el siguiente encabezado o EOF.
+  BLOCK=$(awk -v tag="-- $TAG:" '
+    $0 ~ tag        { found=1; next }
+    found && /^-- BC-[0-9]+:/ { exit }
+    found           { print }
+  ' "$SCHEMA_SQL" 2>/dev/null | sed '/^[[:space:]]*$/N;/^\n$/d' || true)
 
   if [[ -z "$BLOCK" ]]; then
     log_warn "$SERVICE ($TAG) — bloque no encontrado en schema.sql; se generará un archivo vacío con cabecera."
