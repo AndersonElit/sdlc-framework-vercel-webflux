@@ -103,11 +103,15 @@ Título H1: `# Etapa 1 — Bases de Datos y Migraciones`
 
 Secciones en orden exacto:
 
-0. **Automatización** — bloque inicial antes del Objetivo, con el comando de ejecución del script:
+0. **Automatización** — bloque inicial antes del Objetivo, con el comando de ejecución del script. `init-databases.sh` recibe **cuatro parámetros obligatorios** (no tiene valores por defecto): el nombre de la base PostgreSQL, el nombre de la base MongoDB y el usuario/clave de aplicación a crear. Mostrar el comando con los valores concretos derivados del diseño (nombres de BD desde `docs/design/SDD-[proyecto]-infrastructure.md` / la estrategia de persistencia; usuario y clave de aplicación para el ambiente local):
    ```bash
-   bash .claude/scripts/init-databases.sh
+   bash .claude/scripts/init-databases.sh \
+     -p <base-postgres> \
+     -m <base-mongo> \
+     -u <usuario-app> \
+     -w <clave-app>
    ```
-   Describir brevemente qué automatiza: crea el usuario y la base PostgreSQL, habilita `pgcrypto`, aplica el `schema.sql` completo y ejecuta el script de colecciones MongoDB. Aclarar que la generación de migraciones Flyway (`V1__initial_schema.sql` por microservicio y `V2__seed_roles_permisos.sql`) se realiza en la **Etapa 2** mediante `scaffold-all-services.sh` una vez que los directorios de los servicios ya existen. Aclarar que las secciones siguientes son referencia de diseño y para ejecución manual puntual.
+   Describir brevemente qué automatiza: crea el usuario/clave indicados, crea **ambas** bases (PostgreSQL y MongoDB) con ese usuario/clave, habilita `pgcrypto`, aplica el `schema.sql` completo sobre la base PostgreSQL y ejecuta el script de colecciones MongoDB sobre la base Mongo. Aclarar que la generación de migraciones Flyway (`V1__initial_schema.sql` por microservicio y `V2__seed_roles_permisos.sql`) se realiza en la **Etapa 2** mediante `scaffold-all-services.sh` una vez que los directorios de los servicios ya existen. Aclarar que las secciones siguientes son referencia de diseño y para ejecución manual puntual.
 1. **Objetivo** — crear los esquemas y colecciones que el sistema requiere.
 2. **Estrategia de Persistencia** — resumen de la decisión poliglota (PostgreSQL transaccional + MongoDB auditoría), con referencia a los archivos de diseño.
 3. **PostgreSQL — Esquema Relacional**
@@ -121,7 +125,7 @@ Secciones en orden exacto:
 5. **MongoDB — Colecciones y Validadores**
    - Referencia al archivo `docs/design/database/SDD-[proyecto]-collections.js`
    - Tabla de colecciones con su propósito y bounded context
-6. **Criterios de Aceptación** — lista de verificación para dar esta etapa por completada. Incluir como primer criterio: `bash .claude/scripts/init-databases.sh` finalizó con checklist ✓.
+6. **Criterios de Aceptación** — lista de verificación para dar esta etapa por completada. Incluir como primer criterio: `bash .claude/scripts/init-databases.sh` (con sus cuatro parámetros obligatorios `-p`, `-m`, `-u`, `-w`) finalizó con checklist ✓.
 
 ---
 
@@ -450,7 +454,7 @@ Antes de escribir los archivos, verifica que el directorio `docs/development/` e
 
 # REGLAS IMPORTANTES
 
-- NO incluir loops o comandos bash con nombres de servicios o proyectos hardcodeados (ej: `for service in servicio-a servicio-b ...`). En su lugar, referenciar los scripts genéricos de `.claude/scripts/` que usan `find *-service` o `find *-project` para descubrir los componentes dinámicamente: `scaffold-all-services.sh` (generar scaffolding de microservicios y frontend, con `--backend nombre:db:messaging:puerto` y `--frontend nombre`), `init-databases.sh` (crear bases de datos, aplicar schema.sql completo y colecciones MongoDB — **no genera migraciones Flyway**), `compile-services.sh` (compilar backend), `verify-frontend.sh` (verificar frontend), `create-all-secrets-dev.sh` (crear secrets floci). Si el proceso que se quiere documentar no tiene aún un script genérico, describir el paso como instrucción narrativa, no como loop con nombres fijos.
+- NO incluir loops o comandos bash con nombres de servicios o proyectos hardcodeados (ej: `for service in servicio-a servicio-b ...`). En su lugar, referenciar los scripts genéricos de `.claude/scripts/` que usan `find *-service` o `find *-project` para descubrir los componentes dinámicamente: `scaffold-all-services.sh` (generar scaffolding de microservicios y frontend, con `--backend nombre:db:messaging:puerto` y `--frontend nombre`), `init-databases.sh` (crear las bases PostgreSQL y MongoDB con usuario/clave de aplicación, aplicar schema.sql completo y colecciones MongoDB — recibe los **cuatro parámetros obligatorios** `-p <base-postgres> -m <base-mongo> -u <usuario> -w <clave>`; **no genera migraciones Flyway**), `compile-services.sh` (compilar backend), `verify-frontend.sh` (verificar frontend), `create-all-secrets-dev.sh` (crear secrets floci). Si el proceso que se quiere documentar no tiene aún un script genérico, describir el paso como instrucción narrativa, no como loop con nombres fijos.
 - NO generar código de aplicación dentro de los documentos de plan. Los documentos describen QUÉ implementar y cómo estructurarlo, no contienen implementaciones completas.
 - SÍ incluir fragmentos de código ilustrativos (firmas de métodos, ejemplos de configuración, comandos exactos) cuando sea necesario para claridad.
 - Las rutas de archivos en comandos deben ser relativas al directorio raíz del repositorio.

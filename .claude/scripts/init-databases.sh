@@ -6,12 +6,23 @@
 # Prerrequisito: Etapa 0 completada (init-dev-environment.sh finalizó con
 #                checklist ✓ y terraform output rds_port disponible).
 #
+# Uso:
+#   bash init-databases.sh -p <pg-db> -m <mongo-db> -u <usuario> -w <clave>
+#
+#   -p, --pg-db    NOMBRE   Base de datos PostgreSQL a crear   (obligatorio)
+#   -m, --mongo-db NOMBRE   Base de datos MongoDB a crear      (obligatorio)
+#   -u, --user     NOMBRE   Usuario de aplicación a crear      (obligatorio)
+#   -w, --password CLAVE    Clave del usuario de aplicación    (obligatorio)
+#   -h, --help              Muestra esta ayuda
+#
 # Qué hace:
 #   1. Verifica prerequisitos (psql, mongosh, terraform, docker)
 #   2. Verifica que los contenedores floci, floci-mongo y Kafka estén UP
-#   3. PostgreSQL — crea usuario flexicredit, base flexicredit, habilita pgcrypto
-#   4. PostgreSQL — aplica SDD-FlexiCredit-schema.sql (inicialización dev)
-#   5. MongoDB — ejecuta SDD-FlexiCredit-collections.js (colecciones + validadores)
+#   3. PostgreSQL — crea el usuario/clave indicados, crea la base (parámetro)
+#      con ese owner y habilita pgcrypto
+#   4. PostgreSQL — aplica SDD-FlexiCredit-schema.sql sobre la base creada
+#   5. MongoDB — crea la base (parámetro) con el usuario/clave indicados y
+#      ejecuta SDD-FlexiCredit-collections.js (colecciones + validadores)
 #   6. Verificación final: colecciones, tablas, extensión
 #   7. Checklist de criterios de aceptación
 # ===========================================================================
@@ -37,15 +48,44 @@ SCHEMA_SQL="${SCHEMA_FILES[0]}"
 COLLECTIONS_FILES=("$REPO_ROOT/docs/design/database"/*.js)
 COLLECTIONS_JS="${COLLECTIONS_FILES[0]}"
 
-MONGO_DB_NAME=$(mongosh "mongodb://localhost:27017" --quiet --eval \
-  'db.adminCommand({ listDatabases: 1 }).databases.filter(d => !["admin","config","local"].includes(d.name)).map(d => d.name)[0]' 2>/dev/null || echo "")
+# ──────────────────────────────────────────────────────────────────────────────
+# 0. Parámetros (nombres de BD y credenciales de aplicación — todos obligatorios)
+# ──────────────────────────────────────────────────────────────────────────────
+PG_DB_NAME=""
+MONGO_DB_NAME=""
+APP_USER=""
+APP_PASS=""
 
-if [[ -z "$MONGO_DB_NAME" ]]; then
-  log_err "No se encontró una base de datos de aplicación en MongoDB. Ejecute el script de inicialización de colecciones primero."
-  exit 1
+usage() {
+  sed -n '9,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  exit "${1:-0}"
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -p|--pg-db)    PG_DB_NAME="$2";   shift 2 ;;
+    -m|--mongo-db) MONGO_DB_NAME="$2"; shift 2 ;;
+    -u|--user)     APP_USER="$2";     shift 2 ;;
+    -w|--password) APP_PASS="$2";     shift 2 ;;
+    -h|--help)     usage 0 ;;
+    *) log_err "Opción desconocida: $1"; usage 1 ;;
+  esac
+done
+
+MISSING_ARGS=()
+[[ -z "$PG_DB_NAME"    ]] && MISSING_ARGS+=("-p/--pg-db")
+[[ -z "$MONGO_DB_NAME" ]] && MISSING_ARGS+=("-m/--mongo-db")
+[[ -z "$APP_USER"      ]] && MISSING_ARGS+=("-u/--user")
+[[ -z "$APP_PASS"      ]] && MISSING_ARGS+=("-w/--password")
+
+if [[ ${#MISSING_ARGS[@]} -gt 0 ]]; then
+  log_err "Faltan parámetros obligatorios: ${MISSING_ARGS[*]}"
+  usage 1
 fi
 
-MONGO_URI="mongodb://localhost:27017/$MONGO_DB_NAME"
+# URIs de MongoDB: con autenticación (usuario de app) y sin autenticación.
+MONGO_NOAUTH_URI="mongodb://localhost:27017/$MONGO_DB_NAME"
+MONGO_APP_URI="mongodb://$APP_USER:$APP_PASS@localhost:27017/$MONGO_DB_NAME?authSource=$MONGO_DB_NAME"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 1. Validación de prerequisitos
@@ -131,37 +171,37 @@ fi
 log_ok "PostgreSQL en localhost:$RDS_PORT"
 
 PGADMIN="postgresql://admin:changeme123@localhost:${RDS_PORT}"
-PGAPP="postgresql://flexicredit:flexicredit@localhost:${RDS_PORT}"
+PGAPP="postgresql://${APP_USER}:${APP_PASS}@localhost:${RDS_PORT}"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 4. PostgreSQL — crear usuario y base de datos de aplicación
 # ──────────────────────────────────────────────────────────────────────────────
-HEADER "4. PostgreSQL — usuario y base de datos de aplicación"
+HEADER "4. PostgreSQL — usuario y base de datos '$PG_DB_NAME'"
 
-log "Creando usuario flexicredit (idempotente)..."
+log "Creando usuario $APP_USER (idempotente)..."
 PGPASSWORD=changeme123 psql "$PGADMIN/postgres" \
-  -c "CREATE USER flexicredit WITH PASSWORD 'flexicredit'" 2>/dev/null || true
-log_ok "Usuario flexicredit listo."
+  -c "CREATE USER \"$APP_USER\" WITH PASSWORD '$APP_PASS'" 2>/dev/null || true
+log_ok "Usuario $APP_USER listo."
 
-log "Creando base de datos flexicredit si no existe..."
+log "Creando base de datos $PG_DB_NAME si no existe..."
 DB_EXISTS=$(PGPASSWORD=changeme123 psql "$PGADMIN/postgres" \
-  -tc "SELECT 1 FROM pg_database WHERE datname='flexicredit'" 2>/dev/null | tr -d '[:space:]')
+  -tc "SELECT 1 FROM pg_database WHERE datname='$PG_DB_NAME'" 2>/dev/null | tr -d '[:space:]')
 
 if [[ "$DB_EXISTS" == "1" ]]; then
-  log_ok "Base de datos flexicredit ya existe."
+  log_ok "Base de datos $PG_DB_NAME ya existe."
 else
   PGPASSWORD=changeme123 psql "$PGADMIN/postgres" \
-    -c "CREATE DATABASE flexicredit OWNER flexicredit"
-  log_ok "Base de datos flexicredit creada."
+    -c "CREATE DATABASE \"$PG_DB_NAME\" OWNER \"$APP_USER\""
+  log_ok "Base de datos $PG_DB_NAME creada (owner=$APP_USER)."
 fi
 
-log "Otorgando permisos de schema public a flexicredit..."
-PGPASSWORD=changeme123 psql "$PGADMIN/flexicredit" \
-  -c "GRANT ALL ON SCHEMA public TO flexicredit"
+log "Otorgando permisos de schema public a $APP_USER..."
+PGPASSWORD=changeme123 psql "$PGADMIN/$PG_DB_NAME" \
+  -c "GRANT ALL ON SCHEMA public TO \"$APP_USER\""
 log_ok "Permisos de schema public otorgados."
 
 log "Habilitando extensión pgcrypto..."
-PGPASSWORD=changeme123 psql "$PGADMIN/flexicredit" \
+PGPASSWORD=changeme123 psql "$PGADMIN/$PG_DB_NAME" \
   -c "CREATE EXTENSION IF NOT EXISTS pgcrypto"
 log_ok "Extensión pgcrypto habilitada."
 
@@ -171,21 +211,47 @@ log_ok "Extensión pgcrypto habilitada."
 HEADER "5. PostgreSQL — aplicando $(basename "$SCHEMA_SQL")"
 
 log "Aplicando esquema completo desde $SCHEMA_SQL ..."
-PGPASSWORD=flexicredit psql "$PGAPP/flexicredit" -f "$SCHEMA_SQL"
+PGPASSWORD="$APP_PASS" psql "$PGAPP/$PG_DB_NAME" -f "$SCHEMA_SQL"
 log_ok "Esquema aplicado exitosamente."
 
-TABLE_COUNT=$(PGPASSWORD=flexicredit psql "$PGAPP/flexicredit" -tc \
+TABLE_COUNT=$(PGPASSWORD="$APP_PASS" psql "$PGAPP/$PG_DB_NAME" -tc \
   "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE'" \
   2>/dev/null | tr -d '[:space:]')
-log_ok "Tablas en base flexicredit: $TABLE_COUNT"
+log_ok "Tablas en base $PG_DB_NAME: $TABLE_COUNT"
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 6. MongoDB — ejecutar script de colecciones y validadores
+# 6. MongoDB — crear base/usuario y ejecutar script de colecciones
 # ──────────────────────────────────────────────────────────────────────────────
-HEADER "6. MongoDB — aplicando $(basename "$COLLECTIONS_JS")"
+HEADER "6. MongoDB — base de datos '$MONGO_DB_NAME' y colecciones"
 
-log "Ejecutando $COLLECTIONS_JS contra $MONGO_URI ..."
-mongosh "$MONGO_URI" "$COLLECTIONS_JS"
+log "Creando usuario $APP_USER sobre la base $MONGO_DB_NAME (idempotente)..."
+mongosh "$MONGO_NOAUTH_URI" --quiet --eval "
+  db = db.getSiblingDB('$MONGO_DB_NAME');
+  const exists = db.getUsers().users.some(u => u.user === '$APP_USER');
+  if (exists) {
+    print('Usuario ya existe; omitiendo createUser.');
+  } else {
+    db.createUser({
+      user: '$APP_USER',
+      pwd: '$APP_PASS',
+      roles: [{ role: 'readWrite', db: '$MONGO_DB_NAME' }]
+    });
+    print('Usuario creado.');
+  }
+" 2>/dev/null || log_warn "No se pudo crear el usuario (posible auth deshabilitada en el contenedor dev); se continúa sin credenciales."
+
+# Selección de URI de ejecución: usa credenciales si la autenticación funciona,
+# de lo contrario cae a la conexión sin autenticación (contenedor dev sin --auth).
+if mongosh "$MONGO_APP_URI" --quiet --eval 'db.runCommand({ ping: 1 })' &>/dev/null; then
+  MONGO_RUN_URI="$MONGO_APP_URI"
+  log_ok "Usuario $APP_USER autenticado sobre $MONGO_DB_NAME."
+else
+  MONGO_RUN_URI="$MONGO_NOAUTH_URI"
+  log_warn "Autenticación no disponible; ejecutando colecciones sin credenciales."
+fi
+
+log "Ejecutando $COLLECTIONS_JS contra $MONGO_DB_NAME ..."
+mongosh "$MONGO_RUN_URI" "$COLLECTIONS_JS"
 log_ok "Colecciones MongoDB creadas con validadores e índices."
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -203,7 +269,7 @@ EXPECTED_COLLECTIONS=(
   "vistas_originacion"
 )
 
-MONGO_COLS=$(mongosh "$MONGO_URI" --quiet --eval \
+MONGO_COLS=$(mongosh "$MONGO_RUN_URI" --quiet --eval \
   'db.getCollectionNames().join("\n")' 2>/dev/null || echo "")
 
 MONGO_MISSING=()
@@ -217,7 +283,7 @@ for col in "${EXPECTED_COLLECTIONS[@]}"; do
 done
 
 log "Índices de eventos_auditoria:"
-mongosh "$MONGO_URI" --quiet --eval \
+mongosh "$MONGO_RUN_URI" --quiet --eval \
   'printjson(db.eventos_auditoria.getIndexes().map(i => i.name))' 2>/dev/null || true
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -243,34 +309,34 @@ check_item() {
 [[ -n "$RDS_PORT" ]] && check_item "terraform output rds_port disponible ($RDS_PORT)" 0 \
                       || check_item "terraform output rds_port disponible" 1
 
-# usuario flexicredit existe
+# usuario de aplicación existe
 USER_EXISTS=$(PGPASSWORD=changeme123 psql "$PGADMIN/postgres" \
-  -tc "SELECT 1 FROM pg_roles WHERE rolname='flexicredit'" 2>/dev/null | tr -d '[:space:]')
-[[ "$USER_EXISTS" == "1" ]] && check_item "Usuario flexicredit existe en PostgreSQL" 0 \
-                              || check_item "Usuario flexicredit existe en PostgreSQL" 1
+  -tc "SELECT 1 FROM pg_roles WHERE rolname='$APP_USER'" 2>/dev/null | tr -d '[:space:]')
+[[ "$USER_EXISTS" == "1" ]] && check_item "Usuario $APP_USER existe en PostgreSQL" 0 \
+                              || check_item "Usuario $APP_USER existe en PostgreSQL" 1
 
-# base flexicredit existe con owner correcto
+# base de datos existe con owner correcto
 DB_OWNER=$(PGPASSWORD=changeme123 psql "$PGADMIN/postgres" \
-  -tc "SELECT pg_catalog.pg_get_userbyid(datdba) FROM pg_database WHERE datname='flexicredit'" \
+  -tc "SELECT pg_catalog.pg_get_userbyid(datdba) FROM pg_database WHERE datname='$PG_DB_NAME'" \
   2>/dev/null | tr -d '[:space:]')
-[[ "$DB_OWNER" == "flexicredit" ]] && check_item "Base flexicredit existe (owner=flexicredit)" 0 \
-                                    || check_item "Base flexicredit existe (owner=flexicredit)" 1
+[[ "$DB_OWNER" == "$APP_USER" ]] && check_item "Base $PG_DB_NAME existe (owner=$APP_USER)" 0 \
+                                    || check_item "Base $PG_DB_NAME existe (owner=$APP_USER)" 1
 
 # extensión pgcrypto habilitada
-EXT_OK=$(PGPASSWORD=flexicredit psql "$PGAPP/flexicredit" \
+EXT_OK=$(PGPASSWORD="$APP_PASS" psql "$PGAPP/$PG_DB_NAME" \
   -tc "SELECT 1 FROM pg_extension WHERE extname='pgcrypto'" 2>/dev/null | tr -d '[:space:]')
 [[ "$EXT_OK" == "1" ]] && check_item "Extensión pgcrypto habilitada" 0 \
                         || check_item "Extensión pgcrypto habilitada" 1
 
 # schema.sql aplicado (al menos una tabla esperada)
-CLIENTES_OK=$(PGPASSWORD=flexicredit psql "$PGAPP/flexicredit" \
+CLIENTES_OK=$(PGPASSWORD="$APP_PASS" psql "$PGAPP/$PG_DB_NAME" \
   -tc "SELECT 1 FROM information_schema.tables WHERE table_name='clientes'" 2>/dev/null | tr -d '[:space:]')
 [[ "$CLIENTES_OK" == "1" ]] && check_item "schema.sql aplicado (tabla 'clientes' presente)" 0 \
                               || check_item "schema.sql aplicado (tabla 'clientes' presente)" 1
 
 # Las 7 colecciones MongoDB presentes
 if [[ ${#MONGO_MISSING[@]} -eq 0 ]]; then
-  check_item "7 colecciones MongoDB presentes en flexicredit_audit" 0
+  check_item "7 colecciones MongoDB presentes en $MONGO_DB_NAME" 0
 else
   check_item "7 colecciones MongoDB presentes (faltan: ${MONGO_MISSING[*]})" 1
 fi
@@ -283,8 +349,8 @@ echo ""
 HEADER "Resumen"
 
 echo ""
-printf "  %-35s %s\n" "PostgreSQL"    "localhost:$RDS_PORT  (base: flexicredit, user: flexicredit)"
-printf "  %-35s %s\n" "MongoDB"       "$MONGO_URI"
+printf "  %-35s %s\n" "PostgreSQL"    "localhost:$RDS_PORT  (base: $PG_DB_NAME, user: $APP_USER)"
+printf "  %-35s %s\n" "MongoDB"       "localhost:27017  (base: $MONGO_DB_NAME, user: $APP_USER)"
 printf "  %-35s %s\n" "Tablas creadas" "$TABLE_COUNT"
 printf "  %-35s %s\n" "Colecciones MongoDB" "${#EXPECTED_COLLECTIONS[@]} esperadas"
 echo ""
