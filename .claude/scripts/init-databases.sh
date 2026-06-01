@@ -11,11 +11,9 @@
 #   2. Verifica que los contenedores floci, floci-mongo y Kafka estén UP
 #   3. PostgreSQL — crea usuario flexicredit, base flexicredit, habilita pgcrypto
 #   4. PostgreSQL — aplica SDD-FlexiCredit-schema.sql (inicialización dev)
-#   5. PostgreSQL — genera V1__initial_schema.sql por microservicio (Flyway)
-#   6. seguridad-service — genera V2__seed_roles_permisos.sql
-#   7. MongoDB — ejecuta SDD-FlexiCredit-collections.js (colecciones + validadores)
-#   8. Verificación final: colecciones, tablas, extensión, migraciones
-#   9. Checklist de criterios de aceptación
+#   5. MongoDB — ejecuta SDD-FlexiCredit-collections.js (colecciones + validadores)
+#   6. Verificación final: colecciones, tablas, extensión
+#   7. Checklist de criterios de aceptación
 # ===========================================================================
 
 set -euo pipefail
@@ -33,73 +31,21 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 TF_DEV_DIR="$REPO_ROOT/terraform/backend/environments/dev"
-SCHEMA_SQL="$REPO_ROOT/docs/design/database/SDD-FlexiCredit-schema.sql"
-COLLECTIONS_JS="$REPO_ROOT/docs/design/database/SDD-FlexiCredit-collections.js"
+SCHEMA_FILES=("$REPO_ROOT/docs/design/database"/*.sql)
+SCHEMA_SQL="${SCHEMA_FILES[0]}"
 
-MONGO_URI="mongodb://localhost:27017/flexicredit_audit"
+COLLECTIONS_FILES=("$REPO_ROOT/docs/design/database"/*.js)
+COLLECTIONS_JS="${COLLECTIONS_FILES[0]}"
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Argumentos de línea de comandos
-#
-# --bc-tags servicio=TAG   (repetible, obligatorio)
-#   Mapea un microservicio PostgreSQL a su tag en el schema.sql.
-#   Se puede usar tantas veces como servicios haya.
-#   Ejemplo:
-#     bash init-databases.sh \
-#       --bc-tags clientes-service=BC-01 \
-#       --bc-tags configuracion-service=BC-02
-# ──────────────────────────────────────────────────────────────────────────────
-declare -A BC_TAGS
+MONGO_DB_NAME=$(mongosh "mongodb://localhost:27017" --quiet --eval \
+  'db.adminCommand({ listDatabases: 1 }).databases.filter(d => !["admin","config","local"].includes(d.name)).map(d => d.name)[0]' 2>/dev/null || echo "")
 
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --bc-tags)
-      PAIR="$2"
-      SERVICE="${PAIR%%=*}"
-      TAG="${PAIR#*=}"
-      if [[ -z "$SERVICE" || -z "$TAG" || "$SERVICE" == "$TAG" ]]; then
-        log_err "Formato inválido en --bc-tags: '$PAIR' (esperado servicio=TAG)"
-        exit 1
-      fi
-      BC_TAGS["$SERVICE"]="$TAG"
-      shift 2
-      ;;
-    --bc-tags=*)
-      PAIR="${1#*=}"
-      SERVICE="${PAIR%%=*}"
-      TAG="${PAIR#*=}"
-      if [[ -z "$SERVICE" || -z "$TAG" || "$SERVICE" == "$TAG" ]]; then
-        log_err "Formato inválido en --bc-tags: '$PAIR' (esperado servicio=TAG)"
-        exit 1
-      fi
-      BC_TAGS["$SERVICE"]="$TAG"
-      shift
-      ;;
-    -h|--help)
-      echo "Uso: $0 --bc-tags servicio=TAG [--bc-tags servicio=TAG] ..."
-      echo ""
-      echo "  --bc-tags   Par servicio=BC-XX. Repetir una vez por servicio (obligatorio)."
-      echo ""
-      echo "  Ejemplo:"
-      echo "    bash $0 \\"
-      echo "      --bc-tags clientes-service=BC-01 \\"
-      echo "      --bc-tags configuracion-service=BC-02"
-      exit 0
-      ;;
-    *)
-      log_err "Argumento desconocido: $1"
-      exit 1
-      ;;
-  esac
-done
-
-if [[ "${#BC_TAGS[@]}" -eq 0 ]]; then
-  log_err "Se requiere al menos un argumento --bc-tags servicio=TAG."
-  log_err "Ejemplo: bash $0 --bc-tags clientes-service=BC-01 --bc-tags originacion-service=BC-03"
+if [[ -z "$MONGO_DB_NAME" ]]; then
+  log_err "No se encontró una base de datos de aplicación en MongoDB. Ejecute el script de inicialización de colecciones primero."
   exit 1
 fi
 
-log "BC_TAGS cargados desde --bc-tags (${#BC_TAGS[@]} servicios)."
+MONGO_URI="mongodb://localhost:27017/$MONGO_DB_NAME"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 1. Validación de prerequisitos
@@ -222,7 +168,7 @@ log_ok "Extensión pgcrypto habilitada."
 # ──────────────────────────────────────────────────────────────────────────────
 # 5. PostgreSQL — aplicar esquema completo (inicialización dev)
 # ──────────────────────────────────────────────────────────────────────────────
-HEADER "5. PostgreSQL — aplicando SDD-FlexiCredit-schema.sql"
+HEADER "5. PostgreSQL — aplicando $(basename "$SCHEMA_SQL")"
 
 log "Aplicando esquema completo desde $SCHEMA_SQL ..."
 PGPASSWORD=flexicredit psql "$PGAPP/flexicredit" -f "$SCHEMA_SQL"
@@ -234,204 +180,18 @@ TABLE_COUNT=$(PGPASSWORD=flexicredit psql "$PGAPP/flexicredit" -tc \
 log_ok "Tablas en base flexicredit: $TABLE_COUNT"
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 6. PostgreSQL — generar migraciones Flyway V1 por microservicio
+# 6. MongoDB — ejecutar script de colecciones y validadores
 # ──────────────────────────────────────────────────────────────────────────────
-HEADER "6. PostgreSQL — generando migraciones Flyway por microservicio"
-
-# Módulo rest-api donde vive la carpeta de migraciones en la estructura hexagonal
-REST_MODULE="rest-api"
-MIGRATION_SUBPATH="src/main/resources/db/migration"
-
-for SERVICE in "${!BC_TAGS[@]}"; do
-  TAG="${BC_TAGS[$SERVICE]}"
-  MIGRATION_DIR="$REPO_ROOT/backend/$SERVICE/$REST_MODULE/$MIGRATION_SUBPATH"
-  V1_FILE="$MIGRATION_DIR/V1__initial_schema.sql"
-
-  # Extraer bloque del bounded context desde el schema.sql.
-  # Salta la línea del encabezado (-- BC-XX: ...) y acumula hasta el siguiente encabezado o EOF.
-  BLOCK=$(awk -v tag="-- $TAG:" '
-    $0 ~ tag        { found=1; next }
-    found && /^-- BC-[0-9]+:/ { exit }
-    found           { print }
-  ' "$SCHEMA_SQL" 2>/dev/null | sed '/^[[:space:]]*$/N;/^\n$/d' || true)
-
-  if [[ -z "$BLOCK" ]]; then
-    log_warn "$SERVICE ($TAG) — bloque no encontrado en schema.sql; se generará un archivo vacío con cabecera."
-    BLOCK="-- Extraer manualmente desde $SCHEMA_SQL las tablas de $TAG"
-  fi
-
-  if [[ -f "$V1_FILE" ]]; then
-    log_warn "$SERVICE — $V1_FILE ya existe; omitiendo (no se sobreescribe)."
-    continue
-  fi
-
-  if [[ ! -d "$MIGRATION_DIR" ]]; then
-    mkdir -p "$MIGRATION_DIR"
-    log "  Creado directorio: $MIGRATION_DIR"
-  fi
-
-  cat > "$V1_FILE" <<EOF
--- V1__initial_schema.sql
--- Microservicio: $SERVICE
--- Bounded Context: $TAG
--- Generado por: init-databases.sh
--- Fuente: docs/design/database/SDD-FlexiCredit-schema.sql
---
--- NOTA: Las tablas usan CREATE TABLE IF NOT EXISTS para ser idempotentes
--- en caso de que la base dev compartida ya las tenga del schema.sql global.
-
-$BLOCK
-EOF
-
-  log_ok "$SERVICE — $V1_FILE generado."
-done
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 7. seguridad-service — generar V2__seed_roles_permisos.sql
-# ──────────────────────────────────────────────────────────────────────────────
-HEADER "7. seguridad-service — generando V2__seed_roles_permisos.sql"
-
-SEGURIDAD_MIGRATION_DIR="$REPO_ROOT/backend/seguridad-service/$REST_MODULE/$MIGRATION_SUBPATH"
-V2_FILE="$SEGURIDAD_MIGRATION_DIR/V2__seed_roles_permisos.sql"
-
-if [[ -f "$V2_FILE" ]]; then
-  log_warn "seguridad-service — $V2_FILE ya existe; omitiendo."
-else
-  if [[ ! -d "$SEGURIDAD_MIGRATION_DIR" ]]; then
-    mkdir -p "$SEGURIDAD_MIGRATION_DIR"
-  fi
-
-  cat > "$V2_FILE" <<'EOF'
--- V2__seed_roles_permisos.sql
--- Microservicio: seguridad-service
--- Semilla: 7 roles del sistema, permisos por bounded context y mapeo roles_permisos
--- Generado por: init-databases.sh
-
--- Roles del sistema (7 roles definidos en el CHECK de la tabla roles)
-INSERT INTO roles (id, nombre, descripcion, activo, created_at, updated_at)
-VALUES
-  (gen_random_uuid(), 'ADMIN',              'Administrador del sistema con acceso total',         true, NOW(), NOW()),
-  (gen_random_uuid(), 'OFICIAL_CREDITO',    'Oficial de crédito — origina y evalúa solicitudes',  true, NOW(), NOW()),
-  (gen_random_uuid(), 'ANALISTA_RIESGO',    'Analista de riesgo — revisiones manuales',           true, NOW(), NOW()),
-  (gen_random_uuid(), 'CAJERO',             'Cajero — registro de pagos y desembolsos',           true, NOW(), NOW()),
-  (gen_random_uuid(), 'AUDITOR',            'Auditor — acceso de solo lectura a auditoría',       true, NOW(), NOW()),
-  (gen_random_uuid(), 'REPORTES',           'Usuario de reportes — acceso a vistas de cartera',   true, NOW(), NOW()),
-  (gen_random_uuid(), 'SOPORTE',            'Soporte técnico — consultas operativas',              true, NOW(), NOW())
-ON CONFLICT (nombre) DO NOTHING;
-
--- Permisos por bounded context y operación
-INSERT INTO permisos (id, nombre, descripcion, recurso, accion, created_at, updated_at)
-VALUES
-  -- Gestión de Clientes
-  (gen_random_uuid(), 'clientes:read',      'Leer clientes',          'clientes',      'READ',   NOW(), NOW()),
-  (gen_random_uuid(), 'clientes:write',     'Crear/editar clientes',  'clientes',      'WRITE',  NOW(), NOW()),
-  (gen_random_uuid(), 'clientes:delete',    'Eliminar clientes',      'clientes',      'DELETE', NOW(), NOW()),
-  -- Configuración
-  (gen_random_uuid(), 'configuracion:read', 'Leer configuración',     'configuracion', 'READ',   NOW(), NOW()),
-  (gen_random_uuid(), 'configuracion:write','Editar configuración',   'configuracion', 'WRITE',  NOW(), NOW()),
-  -- Originación
-  (gen_random_uuid(), 'originacion:read',   'Leer solicitudes',       'originacion',   'READ',   NOW(), NOW()),
-  (gen_random_uuid(), 'originacion:write',  'Crear solicitudes',      'originacion',   'WRITE',  NOW(), NOW()),
-  (gen_random_uuid(), 'originacion:approve','Aprobar solicitudes',    'originacion',   'APPROVE',NOW(), NOW()),
-  -- Tasas y Simulación
-  (gen_random_uuid(), 'tasas:read',         'Consultar tasas',        'tasas',         'READ',   NOW(), NOW()),
-  (gen_random_uuid(), 'tasas:write',        'Configurar tasas',       'tasas',         'WRITE',  NOW(), NOW()),
-  -- Ciclo de Vida
-  (gen_random_uuid(), 'ciclovida:read',     'Leer obligaciones',      'ciclovida',     'READ',   NOW(), NOW()),
-  (gen_random_uuid(), 'ciclovida:write',    'Registrar pagos/abonos', 'ciclovida',     'WRITE',  NOW(), NOW()),
-  -- Auditoría
-  (gen_random_uuid(), 'auditoria:read',     'Leer eventos de auditoría','auditoria',   'READ',   NOW(), NOW()),
-  -- Reportes
-  (gen_random_uuid(), 'reportes:read',      'Consultar reportes',     'reportes',      'READ',   NOW(), NOW())
-ON CONFLICT (nombre) DO NOTHING;
-
--- Mapeo roles_permisos: ADMIN obtiene todos los permisos
-INSERT INTO roles_permisos (rol_id, permiso_id, created_at)
-SELECT r.id, p.id, NOW()
-FROM roles r, permisos p
-WHERE r.nombre = 'ADMIN'
-ON CONFLICT DO NOTHING;
-
--- OFICIAL_CREDITO
-INSERT INTO roles_permisos (rol_id, permiso_id, created_at)
-SELECT r.id, p.id, NOW()
-FROM roles r
-JOIN permisos p ON p.nombre IN (
-  'clientes:read','clientes:write',
-  'originacion:read','originacion:write',
-  'tasas:read','configuracion:read'
-)
-WHERE r.nombre = 'OFICIAL_CREDITO'
-ON CONFLICT DO NOTHING;
-
--- ANALISTA_RIESGO
-INSERT INTO roles_permisos (rol_id, permiso_id, created_at)
-SELECT r.id, p.id, NOW()
-FROM roles r
-JOIN permisos p ON p.nombre IN (
-  'clientes:read',
-  'originacion:read','originacion:approve',
-  'tasas:read','configuracion:read'
-)
-WHERE r.nombre = 'ANALISTA_RIESGO'
-ON CONFLICT DO NOTHING;
-
--- CAJERO
-INSERT INTO roles_permisos (rol_id, permiso_id, created_at)
-SELECT r.id, p.id, NOW()
-FROM roles r
-JOIN permisos p ON p.nombre IN (
-  'clientes:read',
-  'ciclovida:read','ciclovida:write'
-)
-WHERE r.nombre = 'CAJERO'
-ON CONFLICT DO NOTHING;
-
--- AUDITOR
-INSERT INTO roles_permisos (rol_id, permiso_id, created_at)
-SELECT r.id, p.id, NOW()
-FROM roles r
-JOIN permisos p ON p.nombre IN ('auditoria:read')
-WHERE r.nombre = 'AUDITOR'
-ON CONFLICT DO NOTHING;
-
--- REPORTES
-INSERT INTO roles_permisos (rol_id, permiso_id, created_at)
-SELECT r.id, p.id, NOW()
-FROM roles r
-JOIN permisos p ON p.nombre IN ('reportes:read','ciclovida:read')
-WHERE r.nombre = 'REPORTES'
-ON CONFLICT DO NOTHING;
-
--- SOPORTE
-INSERT INTO roles_permisos (rol_id, permiso_id, created_at)
-SELECT r.id, p.id, NOW()
-FROM roles r
-JOIN permisos p ON p.nombre IN (
-  'clientes:read','originacion:read',
-  'ciclovida:read','tasas:read',
-  'configuracion:read'
-)
-WHERE r.nombre = 'SOPORTE'
-ON CONFLICT DO NOTHING;
-EOF
-
-  log_ok "seguridad-service — $V2_FILE generado."
-fi
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 8. MongoDB — ejecutar script de colecciones y validadores
-# ──────────────────────────────────────────────────────────────────────────────
-HEADER "8. MongoDB — aplicando SDD-FlexiCredit-collections.js"
+HEADER "6. MongoDB — aplicando $(basename "$COLLECTIONS_JS")"
 
 log "Ejecutando $COLLECTIONS_JS contra $MONGO_URI ..."
 mongosh "$MONGO_URI" "$COLLECTIONS_JS"
 log_ok "Colecciones MongoDB creadas con validadores e índices."
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 9. Verificación de MongoDB
+# 7. Verificación de MongoDB
 # ──────────────────────────────────────────────────────────────────────────────
-HEADER "9. Verificando colecciones MongoDB"
+HEADER "7. Verificando colecciones MongoDB"
 
 EXPECTED_COLLECTIONS=(
   "eventos_auditoria"
@@ -461,9 +221,9 @@ mongosh "$MONGO_URI" --quiet --eval \
   'printjson(db.eventos_auditoria.getIndexes().map(i => i.name))' 2>/dev/null || true
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 10. Checklist de criterios de aceptación
+# 8. Checklist de criterios de aceptación
 # ──────────────────────────────────────────────────────────────────────────────
-HEADER "10. Checklist de criterios de aceptación"
+HEADER "8. Checklist de criterios de aceptación"
 
 PASS="✓"
 FAIL="✗"
@@ -508,18 +268,6 @@ CLIENTES_OK=$(PGPASSWORD=flexicredit psql "$PGAPP/flexicredit" \
 [[ "$CLIENTES_OK" == "1" ]] && check_item "schema.sql aplicado (tabla 'clientes' presente)" 0 \
                               || check_item "schema.sql aplicado (tabla 'clientes' presente)" 1
 
-# Migraciones Flyway V1 generadas para los 6 servicios PostgreSQL
-for SERVICE in "${!BC_TAGS[@]}"; do
-  V1="$REPO_ROOT/backend/$SERVICE/$REST_MODULE/$MIGRATION_SUBPATH/V1__initial_schema.sql"
-  [[ -f "$V1" ]] && check_item "$SERVICE — V1__initial_schema.sql existe" 0 \
-                  || check_item "$SERVICE — V1__initial_schema.sql existe" 1
-done
-
-# seguridad-service V2 seed
-V2="$REPO_ROOT/backend/seguridad-service/$REST_MODULE/$MIGRATION_SUBPATH/V2__seed_roles_permisos.sql"
-[[ -f "$V2" ]] && check_item "seguridad-service — V2__seed_roles_permisos.sql existe" 0 \
-                || check_item "seguridad-service — V2__seed_roles_permisos.sql existe" 1
-
 # Las 7 colecciones MongoDB presentes
 if [[ ${#MONGO_MISSING[@]} -eq 0 ]]; then
   check_item "7 colecciones MongoDB presentes en flexicredit_audit" 0
@@ -530,7 +278,7 @@ fi
 echo ""
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 11. Resumen final
+# 9. Resumen final
 # ──────────────────────────────────────────────────────────────────────────────
 HEADER "Resumen"
 

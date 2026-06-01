@@ -14,7 +14,9 @@
 #   2. Crea el directorio backend/ y frontend/
 #   3. Backend — genera microservicios Spring Boot hexagonal
 #   4. Frontend — genera proyecto Next.js feature-based
-#   5. Checklist de verificación de directorios generados
+#   5. PostgreSQL — genera V1__initial_schema.sql por microservicio (Flyway)
+#   6. seguridad-service — genera V2__seed_roles_permisos.sql
+#   7. Checklist de verificación de directorios y migraciones generadas
 # ===========================================================================
 
 set -euo pipefail
@@ -38,6 +40,12 @@ NEXTJS_TEMPLATE="$TEMPLATES_DIR/nextjs_feature_scaffold.py"
 BACKEND_DIR="$REPO_ROOT/backend"
 FRONTEND_DIR="$REPO_ROOT/frontend"
 
+SCHEMA_FILES=("$REPO_ROOT/docs/design/database"/*.sql)
+SCHEMA_SQL="${SCHEMA_FILES[0]}"
+SCHEMA_BASENAME="$(basename "$SCHEMA_SQL" 2>/dev/null || echo "schema.sql")"
+REST_MODULE="rest-api"
+MIGRATION_SUBPATH="src/main/resources/db/migration"
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Argumentos de línea de comandos
 #
@@ -52,14 +60,21 @@ FRONTEND_DIR="$REPO_ROOT/frontend"
 #   Si se omite, no se genera frontend.
 #   Ejemplo:
 #     --frontend flexicredit-web
+#
+# --bc-tags servicio=TAG                  (repetible, opcional)
+#   Mapea un microservicio PostgreSQL a su tag en el schema.sql para generar
+#   las migraciones Flyway V1. Si se omite, no se generan migraciones.
+#   Ejemplo:
+#     --bc-tags clientes-service=BC-01
 # ──────────────────────────────────────────────────────────────────────────────
 BACKEND_SERVICES=()
 FRONTEND_NAME=""
 HAS_FRONTEND=0
+declare -A BC_TAGS
 
 usage() {
   cat <<EOF
-Uso: $0 --backend nombre:db:messaging:puerto [--backend ...] [--frontend nombre]
+Uso: $0 --backend nombre:db:messaging:puerto [--backend ...] [--frontend nombre] [--bc-tags servicio=TAG ...]
 
   --backend   Par nombre:db:messaging:puerto. Repetir una vez por servicio (obligatorio).
               db       = postgres | mongo
@@ -69,12 +84,18 @@ Uso: $0 --backend nombre:db:messaging:puerto [--backend ...] [--frontend nombre]
   --frontend  Nombre del proyecto frontend Next.js (opcional).
               Si se omite, no se genera frontend.
 
+  --bc-tags   Par servicio=BC-XX (opcional, repetible).
+              Mapea un servicio PostgreSQL a su tag en el schema.sql para
+              generar V1__initial_schema.sql por Flyway.
+
 Ejemplo:
   bash $0 \\
     --backend seguridad-service:postgres:none:8081 \\
     --backend clientes-service:postgres:kafka-producer:8082 \\
     --backend configuracion-service:postgres:kafka-producer:8083 \\
-    --frontend flexicredit-web
+    --frontend flexicredit-web \\
+    --bc-tags clientes-service=BC-01 \\
+    --bc-tags configuracion-service=BC-02
 
 EOF
   exit 0
@@ -117,6 +138,32 @@ while [[ $# -gt 0 ]]; do
       HAS_FRONTEND=1
       shift
       ;;
+    --bc-tags)
+      if [[ -z "${2:-}" ]]; then
+        log_err "--bc-tags requiere un valor (servicio=TAG)."
+        exit 1
+      fi
+      PAIR="$2"
+      SERVICE="${PAIR%%=*}"
+      TAG="${PAIR#*=}"
+      if [[ -z "$SERVICE" || -z "$TAG" || "$SERVICE" == "$TAG" ]]; then
+        log_err "Formato inválido en --bc-tags: '$PAIR' (esperado servicio=TAG)"
+        exit 1
+      fi
+      BC_TAGS["$SERVICE"]="$TAG"
+      shift 2
+      ;;
+    --bc-tags=*)
+      PAIR="${1#*=}"
+      SERVICE="${PAIR%%=*}"
+      TAG="${PAIR#*=}"
+      if [[ -z "$SERVICE" || -z "$TAG" || "$SERVICE" == "$TAG" ]]; then
+        log_err "Formato inválido en --bc-tags: '$PAIR' (esperado servicio=TAG)"
+        exit 1
+      fi
+      BC_TAGS["$SERVICE"]="$TAG"
+      shift
+      ;;
     -h|--help)
       usage
       ;;
@@ -138,6 +185,11 @@ if [[ "$HAS_FRONTEND" -eq 1 ]]; then
   log "Frontend: $FRONTEND_NAME"
 else
   log "Frontend: omitido (no se especificó --frontend)."
+fi
+if [[ "${#BC_TAGS[@]}" -gt 0 ]]; then
+  log "BC_TAGS: ${#BC_TAGS[@]} servicios para migraciones Flyway."
+else
+  log "BC_TAGS: omitidos (no se generarán migraciones Flyway V1)."
 fi
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -239,9 +291,201 @@ else
 fi
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 5. Checklist de verificación
+# 5. PostgreSQL — generar migraciones Flyway V1 por microservicio
 # ──────────────────────────────────────────────────────────────────────────────
-HEADER "5. Checklist de verificación"
+HEADER "5. PostgreSQL — generando migraciones Flyway V1 por microservicio"
+
+if [[ "${#BC_TAGS[@]}" -gt 0 ]]; then
+  if [[ ! -f "$SCHEMA_SQL" ]]; then
+    log_warn "Schema SQL no encontrado: $SCHEMA_SQL — omitiendo generación Flyway V1."
+  else
+    for SERVICE in "${!BC_TAGS[@]}"; do
+      TAG="${BC_TAGS[$SERVICE]}"
+      MIGRATION_DIR="$BACKEND_DIR/$SERVICE/$REST_MODULE/$MIGRATION_SUBPATH"
+      V1_FILE="$MIGRATION_DIR/V1__initial_schema.sql"
+
+      BLOCK=$(awk -v tag="-- $TAG:" '
+        $0 ~ tag        { found=1; next }
+        found && /^-- BC-[0-9]+:/ { exit }
+        found           { print }
+      ' "$SCHEMA_SQL" 2>/dev/null | sed '/^[[:space:]]*$/N;/^\n$/d' || true)
+
+      if [[ -z "$BLOCK" ]]; then
+        log_warn "$SERVICE ($TAG) — bloque no encontrado en schema.sql; se generará un archivo vacío con cabecera."
+        BLOCK="-- Extraer manualmente desde $SCHEMA_SQL las tablas de $TAG"
+      fi
+
+      if [[ -f "$V1_FILE" ]]; then
+        log_warn "$SERVICE — $V1_FILE ya existe; omitiendo (no se sobreescribe)."
+        continue
+      fi
+
+      if [[ ! -d "$MIGRATION_DIR" ]]; then
+        mkdir -p "$MIGRATION_DIR"
+        log "  Creado directorio: $MIGRATION_DIR"
+      fi
+
+      cat > "$V1_FILE" <<EOF
+-- V1__initial_schema.sql
+-- Microservicio: $SERVICE
+-- Bounded Context: $TAG
+-- Generado por: scaffold-all-services.sh
+-- Fuente: docs/design/database/$SCHEMA_BASENAME
+--
+-- NOTA: Las tablas usan CREATE TABLE IF NOT EXISTS para ser idempotentes
+-- en caso de que la base dev compartida ya las tenga del schema.sql global.
+
+$BLOCK
+EOF
+
+      log_ok "$SERVICE — $V1_FILE generado."
+    done
+  fi
+else
+  log "Sin --bc-tags definidos; omitiendo generación de migraciones Flyway V1."
+fi
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 6. seguridad-service — generar V2__seed_roles_permisos.sql
+# ──────────────────────────────────────────────────────────────────────────────
+HEADER "6. seguridad-service — generando V2__seed_roles_permisos.sql"
+
+SEGURIDAD_MIGRATION_DIR="$BACKEND_DIR/seguridad-service/$REST_MODULE/$MIGRATION_SUBPATH"
+V2_FILE="$SEGURIDAD_MIGRATION_DIR/V2__seed_roles_permisos.sql"
+
+if [[ -d "$BACKEND_DIR/seguridad-service" ]]; then
+  if [[ -f "$V2_FILE" ]]; then
+    log_warn "seguridad-service — $V2_FILE ya existe; omitiendo."
+  else
+    if [[ ! -d "$SEGURIDAD_MIGRATION_DIR" ]]; then
+      mkdir -p "$SEGURIDAD_MIGRATION_DIR"
+    fi
+
+    cat > "$V2_FILE" <<'EOF'
+-- V2__seed_roles_permisos.sql
+-- Microservicio: seguridad-service
+-- Semilla: 7 roles del sistema, permisos por bounded context y mapeo roles_permisos
+-- Generado por: scaffold-all-services.sh
+
+-- Roles del sistema (7 roles definidos en el CHECK de la tabla roles)
+INSERT INTO roles (id, nombre, descripcion, activo, created_at, updated_at)
+VALUES
+  (gen_random_uuid(), 'ADMIN',              'Administrador del sistema con acceso total',         true, NOW(), NOW()),
+  (gen_random_uuid(), 'OFICIAL_CREDITO',    'Oficial de crédito — origina y evalúa solicitudes',  true, NOW(), NOW()),
+  (gen_random_uuid(), 'ANALISTA_RIESGO',    'Analista de riesgo — revisiones manuales',           true, NOW(), NOW()),
+  (gen_random_uuid(), 'CAJERO',             'Cajero — registro de pagos y desembolsos',           true, NOW(), NOW()),
+  (gen_random_uuid(), 'AUDITOR',            'Auditor — acceso de solo lectura a auditoría',       true, NOW(), NOW()),
+  (gen_random_uuid(), 'REPORTES',           'Usuario de reportes — acceso a vistas de cartera',   true, NOW(), NOW()),
+  (gen_random_uuid(), 'SOPORTE',            'Soporte técnico — consultas operativas',              true, NOW(), NOW())
+ON CONFLICT (nombre) DO NOTHING;
+
+-- Permisos por bounded context y operación
+INSERT INTO permisos (id, nombre, descripcion, recurso, accion, created_at, updated_at)
+VALUES
+  -- Gestión de Clientes
+  (gen_random_uuid(), 'clientes:read',      'Leer clientes',          'clientes',      'READ',   NOW(), NOW()),
+  (gen_random_uuid(), 'clientes:write',     'Crear/editar clientes',  'clientes',      'WRITE',  NOW(), NOW()),
+  (gen_random_uuid(), 'clientes:delete',    'Eliminar clientes',      'clientes',      'DELETE', NOW(), NOW()),
+  -- Configuración
+  (gen_random_uuid(), 'configuracion:read', 'Leer configuración',     'configuracion', 'READ',   NOW(), NOW()),
+  (gen_random_uuid(), 'configuracion:write','Editar configuración',   'configuracion', 'WRITE',  NOW(), NOW()),
+  -- Originación
+  (gen_random_uuid(), 'originacion:read',   'Leer solicitudes',       'originacion',   'READ',   NOW(), NOW()),
+  (gen_random_uuid(), 'originacion:write',  'Crear solicitudes',      'originacion',   'WRITE',  NOW(), NOW()),
+  (gen_random_uuid(), 'originacion:approve','Aprobar solicitudes',    'originacion',   'APPROVE',NOW(), NOW()),
+  -- Tasas y Simulación
+  (gen_random_uuid(), 'tasas:read',         'Consultar tasas',        'tasas',         'READ',   NOW(), NOW()),
+  (gen_random_uuid(), 'tasas:write',        'Configurar tasas',       'tasas',         'WRITE',  NOW(), NOW()),
+  -- Ciclo de Vida
+  (gen_random_uuid(), 'ciclovida:read',     'Leer obligaciones',      'ciclovida',     'READ',   NOW(), NOW()),
+  (gen_random_uuid(), 'ciclovida:write',    'Registrar pagos/abonos', 'ciclovida',     'WRITE',  NOW(), NOW()),
+  -- Auditoría
+  (gen_random_uuid(), 'auditoria:read',     'Leer eventos de auditoría','auditoria',   'READ',   NOW(), NOW()),
+  -- Reportes
+  (gen_random_uuid(), 'reportes:read',      'Consultar reportes',     'reportes',      'READ',   NOW(), NOW())
+ON CONFLICT (nombre) DO NOTHING;
+
+-- Mapeo roles_permisos: ADMIN obtiene todos los permisos
+INSERT INTO roles_permisos (rol_id, permiso_id, created_at)
+SELECT r.id, p.id, NOW()
+FROM roles r, permisos p
+WHERE r.nombre = 'ADMIN'
+ON CONFLICT DO NOTHING;
+
+-- OFICIAL_CREDITO
+INSERT INTO roles_permisos (rol_id, permiso_id, created_at)
+SELECT r.id, p.id, NOW()
+FROM roles r
+JOIN permisos p ON p.nombre IN (
+  'clientes:read','clientes:write',
+  'originacion:read','originacion:write',
+  'tasas:read','configuracion:read'
+)
+WHERE r.nombre = 'OFICIAL_CREDITO'
+ON CONFLICT DO NOTHING;
+
+-- ANALISTA_RIESGO
+INSERT INTO roles_permisos (rol_id, permiso_id, created_at)
+SELECT r.id, p.id, NOW()
+FROM roles r
+JOIN permisos p ON p.nombre IN (
+  'clientes:read',
+  'originacion:read','originacion:approve',
+  'tasas:read','configuracion:read'
+)
+WHERE r.nombre = 'ANALISTA_RIESGO'
+ON CONFLICT DO NOTHING;
+
+-- CAJERO
+INSERT INTO roles_permisos (rol_id, permiso_id, created_at)
+SELECT r.id, p.id, NOW()
+FROM roles r
+JOIN permisos p ON p.nombre IN (
+  'clientes:read',
+  'ciclovida:read','ciclovida:write'
+)
+WHERE r.nombre = 'CAJERO'
+ON CONFLICT DO NOTHING;
+
+-- AUDITOR
+INSERT INTO roles_permisos (rol_id, permiso_id, created_at)
+SELECT r.id, p.id, NOW()
+FROM roles r
+JOIN permisos p ON p.nombre IN ('auditoria:read')
+WHERE r.nombre = 'AUDITOR'
+ON CONFLICT DO NOTHING;
+
+-- REPORTES
+INSERT INTO roles_permisos (rol_id, permiso_id, created_at)
+SELECT r.id, p.id, NOW()
+FROM roles r
+JOIN permisos p ON p.nombre IN ('reportes:read','ciclovida:read')
+WHERE r.nombre = 'REPORTES'
+ON CONFLICT DO NOTHING;
+
+-- SOPORTE
+INSERT INTO roles_permisos (rol_id, permiso_id, created_at)
+SELECT r.id, p.id, NOW()
+FROM roles r
+JOIN permisos p ON p.nombre IN (
+  'clientes:read','originacion:read',
+  'ciclovida:read','tasas:read',
+  'configuracion:read'
+)
+WHERE r.nombre = 'SOPORTE'
+ON CONFLICT DO NOTHING;
+EOF
+
+    log_ok "seguridad-service — $V2_FILE generado."
+  fi
+else
+  log "seguridad-service no encontrado en backend/; omitiendo V2 seed."
+fi
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 7. Checklist de verificación
+# ──────────────────────────────────────────────────────────────────────────────
+HEADER "7. Checklist de verificación"
 
 PASS="✓"
 FAIL="✗"
@@ -272,10 +516,26 @@ if [[ "$HAS_FRONTEND" -eq 1 ]]; then
                               || check_item "$FRONTEND_NAME — package.json existe" 1
 fi
 
+# Verificar migraciones Flyway V1
+if [[ "${#BC_TAGS[@]}" -gt 0 ]]; then
+  for SERVICE in "${!BC_TAGS[@]}"; do
+    V1="$BACKEND_DIR/$SERVICE/$REST_MODULE/$MIGRATION_SUBPATH/V1__initial_schema.sql"
+    [[ -f "$V1" ]] && check_item "$SERVICE — V1__initial_schema.sql existe" 0 \
+                    || check_item "$SERVICE — V1__initial_schema.sql existe" 1
+  done
+fi
+
+# Verificar V2 seed de seguridad-service
+if [[ -d "$BACKEND_DIR/seguridad-service" ]]; then
+  V2="$BACKEND_DIR/seguridad-service/$REST_MODULE/$MIGRATION_SUBPATH/V2__seed_roles_permisos.sql"
+  [[ -f "$V2" ]] && check_item "seguridad-service — V2__seed_roles_permisos.sql existe" 0 \
+                  || check_item "seguridad-service — V2__seed_roles_permisos.sql existe" 1
+fi
+
 echo ""
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 6. Resumen
+# 8. Resumen
 # ──────────────────────────────────────────────────────────────────────────────
 HEADER "Resumen"
 
@@ -286,6 +546,11 @@ if [[ "$HAS_FRONTEND" -eq 1 ]]; then
   printf "  %-35s %s\n" "Frontend" "$([[ -d "$FRONTEND_DIR/$FRONTEND_NAME" ]] && echo "$FRONTEND_NAME" || echo "NO generado")"
 else
   printf "  %-35s %s\n" "Frontend" "omitido"
+fi
+if [[ "${#BC_TAGS[@]}" -gt 0 ]]; then
+  printf "  %-35s %s\n" "Migraciones Flyway V1" "${#BC_TAGS[@]} servicios"
+else
+  printf "  %-35s %s\n" "Migraciones Flyway V1" "omitidas (sin --bc-tags)"
 fi
 echo ""
 
@@ -302,9 +567,9 @@ fi
 log_ok "Scaffolding completado exitosamente."
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 7. Compilación backend
+# 9. Compilación backend
 # ──────────────────────────────────────────────────────────────────────────────
-HEADER "7. Compilación backend"
+HEADER "9. Compilación backend"
 
 log "Ejecutando compile-services.sh..."
 if bash "$SCRIPT_DIR/compile-services.sh"; then
@@ -315,10 +580,10 @@ else
 fi
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 8. Verificación frontend
+# 10. Verificación frontend
 # ──────────────────────────────────────────────────────────────────────────────
 if [[ "$HAS_FRONTEND" -eq 1 ]]; then
-  HEADER "8. Verificación frontend"
+  HEADER "10. Verificación frontend"
 
   log "Ejecutando verify-frontend.sh..."
   if bash "$SCRIPT_DIR/verify-frontend.sh"; then
@@ -328,14 +593,14 @@ if [[ "$HAS_FRONTEND" -eq 1 ]]; then
     exit 1
   fi
 else
-  HEADER "8. Verificación frontend omitida"
+  HEADER "10. Verificación frontend omitida"
   log "No se especificó --frontend; sin frontend que verificar."
 fi
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 9. Secrets floci
+# 11. Secrets floci
 # ──────────────────────────────────────────────────────────────────────────────
-HEADER "9. Secrets floci"
+HEADER "11. Secrets floci"
 
 log "Ejecutando create-all-secrets-dev.sh..."
 if bash "$SCRIPT_DIR/create-all-secrets-dev.sh"; then
@@ -346,9 +611,9 @@ else
 fi
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 10. Terraform apply (dev — ECR + Secrets Manager)
+# 12. Terraform apply (dev — ECR + Secrets Manager)
 # ──────────────────────────────────────────────────────────────────────────────
-HEADER "10. Terraform apply (dev)"
+HEADER "12. Terraform apply (dev)"
 
 TERRAFORM_DEV_DIR="$REPO_ROOT/terraform/backend/environments/dev"
 
@@ -366,9 +631,9 @@ else
 fi
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 11. Verificación — repositorios ECR en floci
+# 13. Verificación — repositorios ECR en floci
 # ──────────────────────────────────────────────────────────────────────────────
-HEADER "11. Verificación ECR en floci"
+HEADER "13. Verificación ECR en floci"
 
 log "Listando repositorios ECR en floci (localhost:4566)..."
 aws --endpoint-url=http://localhost:4566 ecr describe-repositories \
@@ -379,9 +644,9 @@ aws --endpoint-url=http://localhost:4566 ecr describe-repositories \
   || log_warn "No se pudieron listar los repositorios ECR (floci puede no estar levantado)."
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 12. Verificación — secrets en floci
+# 14. Verificación — secrets en floci
 # ──────────────────────────────────────────────────────────────────────────────
-HEADER "12. Verificación de secrets en floci"
+HEADER "14. Verificación de secrets en floci"
 
 log "Listando secrets flexicredit/dev/* en Secrets Manager de floci..."
 aws --endpoint-url=http://localhost:4566 secretsmanager list-secrets \
