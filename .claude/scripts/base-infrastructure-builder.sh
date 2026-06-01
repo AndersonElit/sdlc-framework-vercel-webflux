@@ -445,6 +445,11 @@ resource "aws_eks_cluster" "main" {
     Project     = var.project_name
   }
 
+  # floci no soporta UpdateClusterConfig; ignorar drift en access_config.
+  lifecycle {
+    ignore_changes = [access_config]
+  }
+
   depends_on = [aws_iam_role_policy_attachment.cluster_policy]
 }
 
@@ -655,6 +660,11 @@ resource "aws_db_instance" "main" {
   tags = {
     Environment = var.environment
     Project     = var.project_name
+  }
+
+  # floci no soporta AddTagsToResource para RDS; ignorar drift en tags.
+  lifecycle {
+    ignore_changes = [tags, tags_all]
   }
 }
 EOF
