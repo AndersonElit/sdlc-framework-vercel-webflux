@@ -113,7 +113,7 @@ done
 detect_db_type() {
   local svc_path="$1"
   if find "$svc_path/infrastructure/driven-adapters" -maxdepth 1 -type d \
-       -name "r2dbc-postgresql" 2>/dev/null | grep -q .; then
+       -name "postgres" 2>/dev/null | grep -q .; then
     echo "postgres"
   elif find "$svc_path/infrastructure/driven-adapters" -maxdepth 1 -type d \
        -name "mongo" 2>/dev/null | grep -q .; then
