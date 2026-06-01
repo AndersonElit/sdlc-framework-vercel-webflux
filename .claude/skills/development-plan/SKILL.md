@@ -132,44 +132,41 @@ Título H1: `# Etapa 2 — Scaffolding de Proyectos`
 Secciones en orden exacto:
 
 1. **Objetivo** — generar la estructura base de todos los proyectos.
-2. **Directorio de trabajo** — indicar que los microservicios se crean en `backend/` y el frontend en `frontend/`; crear estos directorios antes de ejecutar los scripts.
-3. **Scaffolding de Microservicios**
-   - Para cada microservicio: comando exacto con flags `-n`, `-d`, `-m`, `-p` derivados del diseño técnico
-   - Tabla resumen: servicio → puerto local → comando completo → módulos generados
-   - Indicar si el servicio usa mensajería (kafka-producer / kafka-consumer / ambos / none)
-4. **Scaffolding del Frontend**
-   - Comando exacto para el proyecto Next.js
-5. **Artefactos CI/CD generados por el scaffold**
+2. **Scaffolding de Microservicios y Frontend**
+   - Referenciar el script `.claude/scripts/scaffold-all-services.sh` y explicar que es genérico: acepta `--backend nombre:db:messaging:puerto` (repetible) y `--frontend nombre` (opcional). No incluir comandos `python3` individuales.
+   - Bloque de ejemplo con la invocación completa del script con todos los `--backend` y `--frontend` derivados del diseño técnico.
+   - Tabla resumen: servicio → puerto local → DB → mensajería → módulos generados.
+   - Indicar si el servicio usa mensajería (kafka-producer / kafka-consumer / ambos / none).
    - Documentar los artefactos que produce el scaffold y que consume la Etapa 2b: `Jenkinsfile` (backend y frontend), `Dockerfile` multi-stage (backend) y charts Helm (`helm/<service>/`)
    - **Backend `Jenkinsfile`**: tabla de stages con el step de la shared library que invoca cada uno (`computeImageTag`, `buildBackendService`, `runIntegrationTests`, `runQualityGates`, `runSecurityScans`, `buildAndPushImage`, `scanImage`, `bumpImageTag`, `runSmokeTests`, `notify`). Explicar que el pod de agentes se carga desde `org/flexicredit/podBackend.yaml` de la shared library y que el ServiceAccount `jenkins-agent` usa IRSA.
    - **Frontend `Jenkinsfile`**: tabla de stages (Install, Type Check, Lint, Unit Tests, Pull config Vercel, Build, Deploy prebuilt, E2E Tests, Promote/Alias prod, Notify). Indicar que despliega a Vercel vía CLI y que la Git integration de Vercel se desactiva.
    - **`Dockerfile` backend**: imagen multi-stage (builder `maven:3.9-eclipse-temurin-21` + runtime `eclipse-temurin:21-jre-alpine`); Kaniko lo usa sin Docker daemon.
    - **Helm charts `helm/<service>/`**: `values.yaml` (base), `values-dev.yaml`, `values-staging.yaml`, `values-prod.yaml`; los campos `image.repository` e `image.tag` los escribe `bumpImageTag` en cada build y ArgoCD los lee para sincronizar el cluster.
-6. **Verificación Post-Scaffolding**
-   - Compilación backend: comando `bash .claude/scripts/compile-services.sh` — el script detecta automáticamente todos los directorios `*-service` en `backend/` usando `find`, sin hardcodear nombres; describe qué reporta y que sale con código 1 si algún servicio falla
-   - Verificación frontend: comando `bash .claude/scripts/verify-frontend.sh` — detecta automáticamente los proyectos en `frontend/`; describe qué pasos ejecuta (`npm install`, `npm run type-check`, `npm run lint`) y que omite pasos ausentes en `package.json`
-   - Estructura de directorios esperada por proyecto
-7. **Configuración Inicial Post-Scaffold**
-   - Secrets floci: comando `bash .claude/scripts/create-all-secrets-dev.sh` — el script itera sobre todos los directorios `*-service` en `backend/` usando `find`; describir que ejecuta el `scripts/create-secrets-dev.sh` de cada servicio y omite los que aún no existan; **no usar un loop con nombres de servicios hardcodeados**
-   - Pasos para aplicar el `.env` local a cada proyecto
-   - Ajustes mínimos al `application.yml` de cada microservicio para apuntar a floci
-8. **Re-aplicar Infraestructura Terraform (dev)**
-   - Explicar que `maven_hexagonal_scaffold.py` edita automáticamente `terraform/backend/environments/{dev,staging,prod}/main.tf` agregando el nombre del servicio a la lista `services = [...]` que alimenta `module.ecr` y `module.secrets_manager`
-   - Indicar que esta edición ocurre en los tres ambientes pero que **solo el ambiente `dev` se aplica en esta etapa**; `staging` y `prod` se provisiona a través del pipeline de CI/CD
-   - Comando a ejecutar después de generar todos los scaffolds backend (un solo apply al final, no uno por servicio):
-     ```bash
-     cd terraform/backend/environments/dev
-     terraform apply -target=module.ecr -target=module.secrets_manager
-     ```
-   - Comando de verificación de repositorios ECR creados en floci:
-     ```bash
-     aws --endpoint-url=http://localhost:4566 ecr describe-repositories \
-         --region us-east-1 \
-         --query 'repositories[].repositoryName' \
-         --output table
-     ```
-   - Criterio de aceptación de este paso: la salida del comando de verificación lista un repositorio por cada microservicio generado
-9. **Criterios de Aceptación** — lista de verificación; incluir como criterio verificable: `Los repositorios ECR de todos los microservicios existen en floci (terraform apply ejecutado)`.
+ 3. **Verificación Post-Scaffolding**
+    - Compilación backend: comando `bash .claude/scripts/compile-services.sh` — el script detecta automáticamente todos los directorios `*-service` en `backend/` usando `find`, sin hardcodear nombres; describe qué reporta y que sale con código 1 si algún servicio falla
+    - Verificación frontend: comando `bash .claude/scripts/verify-frontend.sh` — detecta automáticamente los proyectos en `frontend/`; describe qué pasos ejecuta (`npm install`, `npm run type-check`, `npm run lint`) y que omite pasos ausentes en `package.json`
+    - Estructura de directorios esperada por proyecto
+ 4. **Configuración Inicial Post-Scaffold**
+    - Secrets floci: comando `bash .claude/scripts/create-all-secrets-dev.sh` — el script itera sobre todos los directorios `*-service` en `backend/` usando `find`; describir que ejecuta el `scripts/create-secrets-dev.sh` de cada servicio y omite los que aún no existan; **no usar un loop con nombres de servicios hardcodeados**
+    - Pasos para aplicar el `.env` local a cada proyecto
+    - Ajustes mínimos al `application.yml` de cada microservicio para apuntar a floci
+ 5. **Re-aplicar Infraestructura Terraform (dev)**
+    - Explicar que `maven_hexagonal_scaffold.py` edita automáticamente `terraform/backend/environments/{dev,staging,prod}/main.tf` agregando el nombre del servicio a la lista `services = [...]` que alimenta `module.ecr` y `module.secrets_manager`
+    - Indicar que esta edición ocurre en los tres ambientes pero que **solo el ambiente `dev` se aplica en esta etapa**; `staging` y `prod` se provisiona a través del pipeline de CI/CD
+    - Comando a ejecutar después de generar todos los scaffolds backend (un solo apply al final, no uno por servicio):
+      ```bash
+      cd terraform/backend/environments/dev
+      terraform apply -target=module.ecr -target=module.secrets_manager
+      ```
+    - Comando de verificación de repositorios ECR creados en floci:
+      ```bash
+      aws --endpoint-url=http://localhost:4566 ecr describe-repositories \
+          --region us-east-1 \
+          --query 'repositories[].repositoryName' \
+          --output table
+      ```
+    - Criterio de aceptación de este paso: la salida del comando de verificación lista un repositorio por cada microservicio generado
+ 6. **Criterios de Aceptación** — lista de verificación; incluir como criterio verificable: `Los repositorios ECR de todos los microservicios existen en floci (terraform apply ejecutado)`. Incluir también: `bash .claude/scripts/scaffold-all-services.sh finalizó con checklist ✓`.
 
 ---
 
@@ -461,7 +458,7 @@ Antes de escribir los archivos, verifica que el directorio `docs/development/` e
 
 # REGLAS IMPORTANTES
 
-- NO incluir loops o comandos bash con nombres de servicios o proyectos hardcodeados (ej: `for service in servicio-a servicio-b ...`). En su lugar, referenciar los scripts genéricos de `.claude/scripts/` que usan `find *-service` o `find *-project` para descubrir los componentes dinámicamente: `init-databases.sh` (crear bases de datos, aplicar schema, generar migraciones Flyway y colecciones MongoDB), `compile-services.sh` (compilar backend), `verify-frontend.sh` (verificar frontend), `create-all-secrets-dev.sh` (crear secrets floci). Si el proceso que se quiere documentar no tiene aún un script genérico, describir el paso como instrucción narrativa, no como loop con nombres fijos.
+- NO incluir loops o comandos bash con nombres de servicios o proyectos hardcodeados (ej: `for service in servicio-a servicio-b ...`). En su lugar, referenciar los scripts genéricos de `.claude/scripts/` que usan `find *-service` o `find *-project` para descubrir los componentes dinámicamente: `scaffold-all-services.sh` (generar scaffolding de microservicios y frontend, con `--backend nombre:db:messaging:puerto` y `--frontend nombre`), `init-databases.sh` (crear bases de datos, aplicar schema, generar migraciones Flyway y colecciones MongoDB), `compile-services.sh` (compilar backend), `verify-frontend.sh` (verificar frontend), `create-all-secrets-dev.sh` (crear secrets floci). Si el proceso que se quiere documentar no tiene aún un script genérico, describir el paso como instrucción narrativa, no como loop con nombres fijos.
 - NO generar código de aplicación dentro de los documentos de plan. Los documentos describen QUÉ implementar y cómo estructurarlo, no contienen implementaciones completas.
 - SÍ incluir fragmentos de código ilustrativos (firmas de métodos, ejemplos de configuración, comandos exactos) cuando sea necesario para claridad.
 - Las rutas de archivos en comandos deben ser relativas al directorio raíz del repositorio.
