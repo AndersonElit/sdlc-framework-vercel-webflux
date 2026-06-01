@@ -289,9 +289,7 @@ else
 fi
 echo ""
 
-if [[ $checklist_ok -eq 0 ]] && [[ $FRONTEND_FAILED -eq 0 ]] && [[ ${#BACKEND_FAILED[@]} -eq 0 ]]; then
-  log_ok "Scaffolding completado exitosamente."
-else
+if [[ $checklist_ok -ne 0 ]] || [[ $FRONTEND_FAILED -ne 0 ]] || [[ ${#BACKEND_FAILED[@]} -gt 0 ]]; then
   if [[ ${#BACKEND_FAILED[@]} -gt 0 ]]; then
     log_err "Servicios backend fallidos: ${BACKEND_FAILED[*]}"
   fi
@@ -300,3 +298,97 @@ else
   fi
   exit 1
 fi
+
+log_ok "Scaffolding completado exitosamente."
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 7. Compilación backend
+# ──────────────────────────────────────────────────────────────────────────────
+HEADER "7. Compilación backend"
+
+log "Ejecutando compile-services.sh..."
+if bash "$SCRIPT_DIR/compile-services.sh"; then
+  log_ok "Compilación backend completada."
+else
+  log_err "Compilación backend falló."
+  exit 1
+fi
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 8. Verificación frontend
+# ──────────────────────────────────────────────────────────────────────────────
+if [[ "$HAS_FRONTEND" -eq 1 ]]; then
+  HEADER "8. Verificación frontend"
+
+  log "Ejecutando verify-frontend.sh..."
+  if bash "$SCRIPT_DIR/verify-frontend.sh"; then
+    log_ok "Verificación frontend completada."
+  else
+    log_err "Verificación frontend falló."
+    exit 1
+  fi
+else
+  HEADER "8. Verificación frontend omitida"
+  log "No se especificó --frontend; sin frontend que verificar."
+fi
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 9. Secrets floci
+# ──────────────────────────────────────────────────────────────────────────────
+HEADER "9. Secrets floci"
+
+log "Ejecutando create-all-secrets-dev.sh..."
+if bash "$SCRIPT_DIR/create-all-secrets-dev.sh"; then
+  log_ok "Secrets creados en floci."
+else
+  log_err "Creación de secrets falló."
+  exit 1
+fi
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 10. Terraform apply (dev — ECR + Secrets Manager)
+# ──────────────────────────────────────────────────────────────────────────────
+HEADER "10. Terraform apply (dev)"
+
+TERRAFORM_DEV_DIR="$REPO_ROOT/terraform/backend/environments/dev"
+
+if [[ ! -d "$TERRAFORM_DEV_DIR" ]]; then
+  log_err "Directorio Terraform no encontrado: $TERRAFORM_DEV_DIR"
+  exit 1
+fi
+
+log "Aplicando Terraform en $TERRAFORM_DEV_DIR..."
+if (cd "$TERRAFORM_DEV_DIR" && terraform apply -auto-approve); then
+  log_ok "Terraform apply completado."
+else
+  log_err "Terraform apply falló."
+  exit 1
+fi
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 11. Verificación — repositorios ECR en floci
+# ──────────────────────────────────────────────────────────────────────────────
+HEADER "11. Verificación ECR en floci"
+
+log "Listando repositorios ECR en floci (localhost:4566)..."
+aws --endpoint-url=http://localhost:4566 ecr describe-repositories \
+  --region us-east-1 \
+  --query 'repositories[].repositoryName' \
+  --output table \
+  && log_ok "Repositorios ECR verificados." \
+  || log_warn "No se pudieron listar los repositorios ECR (floci puede no estar levantado)."
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 12. Verificación — secrets en floci
+# ──────────────────────────────────────────────────────────────────────────────
+HEADER "12. Verificación de secrets en floci"
+
+log "Listando secrets flexicredit/dev/* en Secrets Manager de floci..."
+aws --endpoint-url=http://localhost:4566 secretsmanager list-secrets \
+  --region us-east-1 \
+  --query 'SecretList[?starts_with(Name, `flexicredit/dev/`)].Name' \
+  --output table \
+  && log_ok "Secrets verificados." \
+  || log_warn "No se pudieron listar los secrets (floci puede no estar levantado)."
+
+log_ok "Pipeline post-scaffolding completado exitosamente."
