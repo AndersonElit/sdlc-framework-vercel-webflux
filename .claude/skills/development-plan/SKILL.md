@@ -15,7 +15,7 @@ Transformar los documentos de Diseño Técnico (SDD) en planes de trabajo concre
 
 - definan los pasos exactos para implementar cada componente del sistema,
 - incluyan criterios de aceptación verificables,
-- incluyan especificaciones de pruebas unitarias por capa (dominio, aplicación, infraestructura),
+- apliquen **Test-Driven Development (TDD)**: la prueba se escribe antes que la implementación en cada capa (dominio, aplicación, infraestructura, rest-api) y en cada artefacto frontend (schemas, hooks, componentes),
 - sean ejecutables por un desarrollador sin ambigüedad,
 - respeten la secuencia de dependencias entre componentes,
 - mantengan coherencia con la arquitectura hexagonal y el diseño técnico aprobado.
@@ -54,6 +54,58 @@ El resultado debe parecer documentación técnica real utilizada por equipos de 
 
 ---
 
+# ESTRATEGIA DE PRUEBAS — TDD (REGLA TRANSVERSAL OBLIGATORIA)
+
+Todo el desarrollo de esta etapa —backend y frontend— se realiza bajo **Test-Driven Development (TDD)**. Es una regla obligatoria y transversal: **ningún componente se implementa sin una prueba que falle previamente**. Cada documento generado debe reflejar, exigir y hacer explícito este ciclo en sus secciones de implementación y en sus criterios de aceptación.
+
+## Ciclo Red-Green-Refactor
+
+Cada unidad de trabajo (regla de dominio, caso de uso, adaptador, endpoint, schema, hook, componente, slice) se construye en tres fases:
+
+1. **Red** — escribir una prueba que exprese el comportamiento esperado y verla fallar (la implementación aún no existe o no satisface el contrato).
+2. **Green** — escribir el mínimo código de producción necesario para que la prueba pase.
+3. **Refactor** — mejorar el diseño del código manteniendo todas las pruebas en verde.
+
+La prueba **siempre precede** a la implementación. No se admite código de producción sin una prueba previa que lo justifique.
+
+## TDD en el Backend (arquitectura hexagonal, Spring WebFlux)
+
+El ciclo se aplica capa por capa, respetando la dirección de dependencias (de adentro hacia afuera). En cada capa se escribe primero la prueba (Red), luego el código que la satisface (Green), luego se refactoriza:
+
+| Capa | Prueba primero (Red) | Herramienta de prueba | Implementación después (Green) |
+| --- | --- | --- | --- |
+| `domain` | invariante / regla de negocio / validación de entidad | JUnit 5 (+ StepVerifier si es reactivo) | entidad, value object, evento de dominio |
+| `application` | caso de uso con puertos secundarios mockeados (happy path + error) | JUnit 5 + Mockito + StepVerifier | use case |
+| `infrastructure` | adaptador contra dependencia real | Testcontainers (PostgreSQL / MongoDB), embedded Kafka | adaptador R2DBC / Mongo / productor / consumidor / WebClient |
+| `rest-api` | contrato HTTP del endpoint (status, body, validación) | WebTestClient | Router Function / `@RestController` |
+
+- Los tipos reactivos (`Mono` / `Flux`) se verifican con **StepVerifier**, nunca con `block()`.
+- El orden de implementación dentro de un microservicio es **test-first por capa**: `domain` → `application` → `infrastructure` → `rest-api`, y dentro de cada capa siempre Red → Green → Refactor.
+
+## TDD en el Frontend (Next.js, Vitest)
+
+Cada artefacto del feature se construye también test-first:
+
+| Artefacto | Prueba primero (Red) | Herramienta | Implementación después (Green) |
+| --- | --- | --- | --- |
+| schema Zod | validación de inputs válidos e inválidos | Vitest | schema |
+| hook (TanStack Query) | comportamiento con API mockeada (loading / success / error) | Vitest + MSW | hook `useQuery` / `useMutation` |
+| componente | render, estados e interacción del usuario | Vitest + React Testing Library | componente (Server / Client) |
+| slice Zustand | acciones y transiciones de estado | Vitest | slice |
+
+- Los flujos de usuario completos se cubren con **Playwright** bajo enfoque ATDD (Acceptance-Test-Driven): el escenario E2E se describe **antes** de integrar el feature y se valida al final como criterio de aceptación.
+
+## Definición de Done relacionada con TDD
+
+Un componente solo se considera *Done* si:
+
+- toda funcionalidad fue precedida por una prueba que falló (Red) y luego pasó (Green),
+- la suite de pruebas completa está en verde,
+- se cumplen los umbrales de cobertura mínima por capa indicados en cada documento,
+- no existe lógica de negocio ni rama de error sin prueba asociada.
+
+---
+
 # ESTRUCTURA OBLIGATORIA POR TIPO DE DOCUMENTO
 
 ---
@@ -70,7 +122,7 @@ Secciones en orden exacto:
 4. **Mapa de Microservicios** — tabla con: nombre del servicio, bounded context, base de datos, mensajería, dependencias REST entre servicios.
 5. **Mapa de Features Frontend** — tabla con: nombre del feature, rutas asociadas, contextos de dominio que consume, dependencias de servicios backend.
 6. **Ambiente Local (floci)** — descripción de la configuración local: puertos de PostgreSQL, MongoDB, Kafka y Cognito expuestos por floci; variables de entorno base.
-7. **Criterios de Done (Definition of Done)** — criterios que debe cumplir cada componente para considerarse completo en esta etapa.
+7. **Criterios de Done (Definition of Done)** — criterios que debe cumplir cada componente para considerarse completo en esta etapa. Debe incluir explícitamente los criterios de TDD: toda funcionalidad fue precedida por una prueba que falló y luego pasó (Red-Green-Refactor); la suite de pruebas está en verde; se cumplen los umbrales de cobertura mínima por capa; no existe lógica de negocio ni rama de error sin prueba asociada.
 
 ---
 
@@ -243,32 +295,35 @@ Secciones en orden exacto:
    - Indicar que esta condición se cumple con el esqueleto generado por el scaffold más la configuración del `application.yml`; no requiere ningún caso de uso implementado
    - Diagrama ASCII del ciclo por caso de uso: `Implementar caso de uso → mvn test (local) → git push → Jenkins pipeline → bumpImageTag → ArgoCD sync → EKS dev → endpoint disponible`
    - Indicar que cada caso de uso que se implementa y pushea queda disponible en EKS dev sin intervención manual
-4. **Capa de Dominio (`domain`)**
+   > **Cada capa se implementa bajo TDD (Red-Green-Refactor): la prueba descrita en la Sección 8 para esa capa se escribe y se ve fallar ANTES de implementar el código de producción.** Las secciones 4 a 7 describen QUÉ implementar; la prueba que precede a cada elemento está especificada en la Sección 8.
+4. **Capa de Dominio (`domain`)** — _test-first: la prueba de cada invariante/regla precede a su implementación_
    - Entidades a implementar (derivadas del schema.sql y el diseño): nombre, campos clave, reglas de negocio
    - Value Objects relevantes
    - Eventos de dominio (nombre del evento, payload mínimo)
    - Interfaces de puertos secundarios (repository interfaces, messaging ports): firma de los métodos
    - Reglas de dominio a validar (invariantes)
-5. **Capa de Aplicación (`application`)**
+5. **Capa de Aplicación (`application`)** — _test-first: el test del caso de uso (puertos mockeados) precede al use case_
    - Tabla de casos de uso: nombre del use case, descripción, puerto primario que expone, puerto secundario que consume
    - DTOs de entrada y salida por caso de uso
    - Flujo de orquestación para los casos de uso más importantes
-6. **Capa de Infraestructura (`infrastructure`)**
+6. **Capa de Infraestructura (`infrastructure`)** — _test-first: el test con Testcontainers precede al adaptador_
    - Adaptadores R2DBC: tablas que gestiona, operaciones a implementar
    - Productores Kafka: tópicos, estructura del evento, cuándo se publica
    - Consumidores Kafka (si aplica): tópicos que consume, lógica de procesamiento
    - Clientes REST (WebClient): servicios externos a llamar, endpoints, contrato esperado
    - Configuración de Spring Security para este servicio
-7. **API REST (`rest-api`)**
+7. **API REST (`rest-api`)** — _test-first: el test con WebTestClient (contrato HTTP) precede al endpoint_
    - Tabla de endpoints: método, ruta, descripción, request body, response, códigos HTTP
    - Referencia a la especificación OpenAPI para el contrato completo
    - Configuración de rutas en Router Functions o `@RestController`
-8. **Pruebas Unitarias**
-   - **Dominio**: casos de prueba para reglas de negocio, invariantes, validaciones de entidades
-   - **Aplicación**: casos de prueba para cada use case (mocks de puertos secundarios con Mockito); happy path + casos de error
-   - **Infraestructura**: pruebas de repositorios con Testcontainers (PostgreSQL o MongoDB real)
-   - Tabla de cobertura mínima esperada por capa
-9. **Criterios de Aceptación** — lista de verificación.
+8. **Especificación TDD por Capa (Red-Green-Refactor)**
+   - Encabezar la sección recordando la regla: cada prueba se escribe y se ve **fallar (Red)** antes de escribir el código de producción que la hace **pasar (Green)**, seguido de **Refactor**. Los tipos reactivos se verifican con **StepVerifier**, no con `block()`.
+   - **Dominio**: tabla con nombre de la clase de test, método de test, invariante/regla que valida, y el elemento de la Sección 4 que esta prueba precede
+   - **Aplicación**: tabla con clase de test, método de test, escenario (happy path + cada caso de error), puertos secundarios mockeados con Mockito, y el use case de la Sección 5 que precede
+   - **Infraestructura**: pruebas de adaptadores con Testcontainers (PostgreSQL o MongoDB real); clase de test, método, operación que valida, y el adaptador de la Sección 6 que precede
+   - **REST**: pruebas de contrato con WebTestClient; clase de test, método, endpoint y status/body esperado que precede al elemento de la Sección 7
+   - Tabla de cobertura mínima esperada por capa (umbral verificable; p. ej. dominio ≥ 90%, aplicación ≥ 85%)
+9. **Criterios de Aceptación** — lista de verificación. Incluir como criterios de TDD: cada elemento de cada capa tuvo su prueba escrita primero (Red) y luego pasó (Green); `mvn test` finaliza en verde; la cobertura por capa cumple los umbrales declarados; no hay caso de uso ni rama de error sin prueba.
 
 ### Reglas para los documentos de microservicio
 
@@ -276,7 +331,7 @@ Secciones en orden exacto:
 - Derivar los endpoints exactamente de los paths del bounded context en `docs/design/api/SDD-[proyecto]-openapi.yaml`.
 - Derivar las dependencias REST del diseño de flujos técnicos en `SDD-[proyecto]-design.md`.
 - Los tópicos Kafka deben seguir el patrón `[proyecto].[bounded-context].[evento]` (ej: `flexicredit.originacion.solicitud-radicada`).
-- El orden de implementación sugerido dentro del documento es: dominio → aplicación → infraestructura → rest-api → pruebas.
+- El orden de implementación dentro del documento es **test-first por capa** (TDD Red-Green-Refactor): dominio → aplicación → infraestructura → rest-api, y dentro de cada capa la prueba se escribe y se ve fallar antes del código de producción. No se documenta una fase de "pruebas al final": las pruebas conducen la implementación de cada capa.
 - Indicar explícitamente el orden de microservicios a implementar en el roadmap según dependencias (los servicios sin dependencias externas primero).
 
 ---
@@ -297,30 +352,34 @@ Secciones en orden exacto:
 3. **Rutas y Páginas**
    - Tabla de rutas: path, tipo de ruta (public/protected), componente de página, descripción
    - Indicar si es SSR, ISR o CSR según el diseño
-4. **Componentes**
+   > **Todos los artefactos del feature se construyen bajo TDD (Red-Green-Refactor): la prueba Vitest descrita en la Sección 9 se escribe y se ve fallar ANTES de implementar el schema, hook o componente correspondiente.** El flujo E2E (Sección 10) se describe antes de integrar el feature (ATDD) y se valida al final.
+4. **Componentes** — _test-first: el test de render/interacción (RTL) precede al componente_
    - Tabla de componentes: nombre, tipo (Server Component / Client Component), responsabilidad
    - Para componentes de formulario: campos, validaciones Zod, comportamiento de submit
    - Para componentes de listado/tabla: columnas, paginación, filtros
-5. **Integración con API (TanStack Query)**
+5. **Integración con API (TanStack Query)** — _test-first: el test del hook con MSW precede al hook_
    - Tabla de hooks: nombre del hook, endpoint que llama, tipo (useQuery / useMutation), descripción
    - Estrategia de caché: staleTime, gcTime, invalidaciones
-6. **Estado Global (Zustand)**
+6. **Estado Global (Zustand)** — _test-first: el test de acciones/estado precede al slice_
    - Nombre del slice, estado que maneja, acciones
    - Solo si el feature requiere estado compartido entre componentes
-7. **Esquemas de Validación (Zod)**
+7. **Esquemas de Validación (Zod)** — _test-first: el test de validación (inputs válidos/inválidos) precede al schema_
    - Schemas a definir con sus campos y reglas de validación
 8. **Autenticación y Autorización**
    - Roles que pueden acceder (RBAC)
    - Protección de rutas con NextAuth.js middleware
    - Manejo del JWT en las llamadas a la API
-9. **Pruebas Unitarias (Vitest)**
-   - Casos de prueba para componentes clave (React Testing Library)
-   - Casos de prueba para hooks (mock de API con MSW)
-   - Casos de prueba para schemas Zod (validación de inputs)
-10. **Pruebas E2E (Playwright)**
-    - Flujos principales a cubrir con Playwright
+9. **Especificación TDD — Pruebas Unitarias (Vitest)**
+   - Encabezar la sección recordando la regla: cada prueba se escribe y se ve **fallar (Red)** antes de implementar el artefacto que la hace **pasar (Green)**, seguido de **Refactor**.
+   - **Schemas Zod**: tabla con nombre del archivo de test, caso (input válido / cada input inválido) y el schema de la Sección 7 que precede
+   - **Hooks**: tabla con archivo de test, escenario (loading / success / error) mockeado con MSW, y el hook de la Sección 5 que precede
+   - **Componentes**: tabla con archivo de test (React Testing Library), interacción/estado que valida, y el componente de la Sección 4 que precede
+   - **Slices Zustand** (si aplica): test de acciones que precede al slice de la Sección 6
+   - Umbral de cobertura mínima del feature (verificable)
+10. **Pruebas E2E (Playwright, ATDD)**
+    - Flujos principales a cubrir con Playwright, descritos **antes** de integrar el feature
     - Tabla: nombre del test, flujo descrito, precondiciones
-11. **Criterios de Aceptación** — lista de verificación.
+11. **Criterios de Aceptación** — lista de verificación. Incluir como criterios de TDD: cada schema, hook y componente tuvo su prueba escrita primero (Red) y luego pasó (Green); `npm run test` finaliza en verde; la cobertura del feature cumple el umbral declarado; los flujos E2E de la Sección 10 pasan en Playwright.
 
 ### Segmentación de features frontend
 
@@ -460,6 +519,7 @@ Antes de escribir los archivos, verifica que el directorio `docs/development/` e
 
 # REGLAS IMPORTANTES
 
+- **TDD es obligatorio y transversal** (ver sección "ESTRATEGIA DE PRUEBAS — TDD"). Todo documento de microservicio (Etapa 3) y de feature frontend (Etapa 4) debe presentar la implementación como **test-first** (Red-Green-Refactor): la prueba precede al código de producción en cada capa/artefacto. No describir una "fase de pruebas al final"; las pruebas conducen cada capa. Los criterios de aceptación de esos documentos deben incluir la verificación de que cada elemento tuvo su prueba escrita primero, que la suite está en verde y que se cumplen los umbrales de cobertura. Backend: JUnit 5 + Mockito + StepVerifier + Testcontainers + WebTestClient; los tipos reactivos se verifican con StepVerifier, nunca con `block()`. Frontend: Vitest + React Testing Library + MSW (unitario) y Playwright bajo ATDD (E2E).
 - NO incluir loops o comandos bash con nombres de servicios o proyectos hardcodeados (ej: `for service in servicio-a servicio-b ...`). En su lugar, referenciar los scripts genéricos de `.claude/scripts/` que usan `find *-service` o `find *-project` para descubrir los componentes dinámicamente: `scaffold-all-services.sh` (generar scaffolding de microservicios y frontend — acepta `--backend nombre:db:messaging:puerto`, `--frontend nombre`, `--bc-tags servicio=BC-XX` y los **cuatro parámetros de BD obligatorios** `-p <pg-db> -m <mongo-db> -u <usuario> -w <clave>`, que reenvía automáticamente a `create-all-secrets-dev.sh` en el paso 11), `init-databases.sh` (crear las bases PostgreSQL y MongoDB con usuario/clave de aplicación, aplicar schema.sql completo y colecciones MongoDB — recibe los **cuatro parámetros obligatorios** `-p <base-postgres> -m <base-mongo> -u <usuario> -w <clave>`; **no genera migraciones Flyway**), `compile-services.sh` (compilar backend), `verify-frontend.sh` (verificar frontend), `create-all-secrets-dev.sh` (crear secrets floci — recibe **cuatro parámetros obligatorios** `-p <pg-db> -m <mongo-db> -u <usuario> -w <clave>`, los mismos valores que `init-databases.sh`; normalmente invocado por `scaffold-all-services.sh`), `setup-cicd-pipeline.sh` (configurar el pipeline CI/CD completo — Jenkins shared library, imagen del controller, bootstrap del cluster, variables JCasC, jobs Jenkins, bootstrap ArgoCD y verificación; todas las secciones son autocontenidas y ejecutables en orden, con el ambiente auto-detectado desde `terraform output`). Si el proceso que se quiere documentar no tiene aún un script genérico, describir el paso como instrucción narrativa, no como loop con nombres fijos.
 - NO generar código de aplicación dentro de los documentos de plan. Los documentos describen QUÉ implementar y cómo estructurarlo, no contienen implementaciones completas.
 - SÍ incluir fragmentos de código ilustrativos (firmas de métodos, ejemplos de configuración, comandos exactos) cuando sea necesario para claridad.
