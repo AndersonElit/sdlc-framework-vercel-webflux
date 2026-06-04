@@ -59,7 +59,7 @@ MIGRATION_SUBPATH="src/main/resources/db/migration"
 #   Nombre del proyecto frontend Next.js a generar.
 #   Si se omite, no se genera frontend.
 #   Ejemplo:
-#     --frontend flexicredit-web
+#     --frontend miproyecto-web
 #
 # --bc-tags servicio=TAG                  (repetible, opcional)
 #   Mapea un microservicio PostgreSQL a su tag en el schema.sql para generar
@@ -71,6 +71,7 @@ BACKEND_SERVICES=()
 FRONTEND_NAME=""
 HAS_FRONTEND=0
 declare -A BC_TAGS
+PROJECT_NAME=""
 PG_DB_NAME=""
 MONGO_DB_NAME=""
 DB_USER=""
@@ -78,9 +79,13 @@ DB_PASSWORD=""
 
 usage() {
   cat <<EOF
-Uso: $0 --backend nombre:db:messaging:puerto [--backend ...] \
+Uso: $0 -P <proyecto> --backend nombre:db:messaging:puerto [--backend ...] \
         -p <pg-db> -m <mongo-db> -u <usuario> -w <clave> \
         [--frontend nombre] [--bc-tags servicio=TAG ...]
+
+  -P, --project NOMBRE   Slug del proyecto. Se propaga como --org a los templates
+                         (organización Gitea, prefijo de secrets, path del recurso
+                         de la shared library). (obligatorio)
 
   --backend   Par nombre:db:messaging:puerto. Repetir una vez por servicio (obligatorio).
               db       = postgres | mongo
@@ -101,12 +106,13 @@ Uso: $0 --backend nombre:db:messaging:puerto [--backend ...] \
 
 Ejemplo:
   bash $0 \\
+    -P miproyecto \\
     --backend seguridad-service:postgres:none:8081 \\
     --backend clientes-service:postgres:kafka-producer:8082 \\
     --backend configuracion-service:postgres:kafka-producer:8083 \\
-    -p flexicredit_dev -m flexicredit_audit \\
-    -u flexiapp -w secret123 \\
-    --frontend flexicredit-web \\
+    -p miproyecto_dev -m miproyecto_audit \\
+    -u appuser -w secret123 \\
+    --frontend miproyecto-web \\
     --bc-tags clientes-service=BC-01 \\
     --bc-tags configuracion-service=BC-02
 
@@ -116,6 +122,18 @@ EOF
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    -P|--project)
+      if [[ -z "${2:-}" ]]; then
+        log_err "--project requiere un valor (slug del proyecto)."
+        exit 1
+      fi
+      PROJECT_NAME="$2"
+      shift 2
+      ;;
+    --project=*)
+      PROJECT_NAME="${1#*=}"
+      shift
+      ;;
     --backend)
       if [[ -z "${2:-}" ]]; then
         log_err "--backend requiere un valor (nombre:db:messaging:puerto)."
@@ -236,6 +254,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 MISSING_ARGS=()
+[[ -z "$PROJECT_NAME" ]] && MISSING_ARGS+=("-P/--project")
 [[ "${#BACKEND_SERVICES[@]}" -eq 0 ]] && MISSING_ARGS+=("--backend")
 [[ -z "$PG_DB_NAME"    ]] && MISSING_ARGS+=("-p/--pg-db")
 [[ -z "$MONGO_DB_NAME" ]] && MISSING_ARGS+=("-m/--mongo-db")
@@ -325,7 +344,7 @@ for svc_spec in "${BACKEND_SERVICES[@]}"; do
   fi
 
   log "Generando $name (db=$db, messaging=$messaging, port=$port)..."
-  if (cd "$BACKEND_DIR" && python3 "$MAVEN_TEMPLATE" -n "$name" -d "$db" -m "$messaging" -p "$port"); then
+  if (cd "$BACKEND_DIR" && python3 "$MAVEN_TEMPLATE" -n "$name" -d "$db" -m "$messaging" -p "$port" --org "$PROJECT_NAME"); then
     log_ok "$name generado."
   else
     log_err "$name — falló la generación."
@@ -345,7 +364,7 @@ if [[ "$HAS_FRONTEND" -eq 1 ]]; then
     log_warn "frontend/$FRONTEND_NAME — directorio ya existe; omitiendo."
   else
     log "Generando $FRONTEND_NAME..."
-    if (cd "$FRONTEND_DIR" && python3 "$NEXTJS_TEMPLATE" -n "$FRONTEND_NAME"); then
+    if (cd "$FRONTEND_DIR" && python3 "$NEXTJS_TEMPLATE" -n "$FRONTEND_NAME" --org "$PROJECT_NAME"); then
       log_ok "$FRONTEND_NAME generado."
     else
       log_err "$FRONTEND_NAME — falló la generación."
@@ -672,6 +691,7 @@ HEADER "11. Secrets floci"
 
 log "Ejecutando create-all-secrets-dev.sh..."
 if bash "$SCRIPT_DIR/create-all-secrets-dev.sh" \
+     --project  "$PROJECT_NAME" \
      --pg-db    "$PG_DB_NAME" \
      --mongo-db "$MONGO_DB_NAME" \
      --user     "$DB_USER" \
@@ -720,10 +740,10 @@ aws --endpoint-url=http://localhost:4566 ecr describe-repositories \
 # ──────────────────────────────────────────────────────────────────────────────
 HEADER "14. Verificación de secrets en floci"
 
-log "Listando secrets flexicredit/dev/* en Secrets Manager de floci..."
+log "Listando secrets ${PROJECT_NAME}/dev/* en Secrets Manager de floci..."
 aws --endpoint-url=http://localhost:4566 secretsmanager list-secrets \
   --region us-east-1 \
-  --query 'SecretList[?starts_with(Name, `flexicredit/dev/`)].Name' \
+  --query "SecretList[?starts_with(Name, \`${PROJECT_NAME}/dev/\`)].Name" \
   --output table \
   && log_ok "Secrets verificados." \
   || log_warn "No se pudieron listar los secrets (floci puede no estar levantado)."

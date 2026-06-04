@@ -1880,13 +1880,16 @@ CMD ["node", "server.js"]
 """
 
 
-def get_jenkinsfile() -> str:
+def get_jenkinsfile(org: str = "myproject") -> str:
     """Jenkinsfile del frontend: calidad + build + deploy a Vercel vía CLI + E2E.
 
     Jenkins es el único disparador de despliegues; la Git integration de Vercel
     se desactiva (ver vercel.json / dashboard).
     """
-    return """\
+    # Slug saneado para el path del recurso (debe coincidir con el paquete
+    # org.<slug> de la Shared Library: sin guiones ni mayúsculas).
+    lib_org = "".join(c for c in org.lower() if c.isascii() and c.isalnum()) or "myproject"
+    template = """\
 @Library('jenkins-shared-library@main') _
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -1894,16 +1897,17 @@ def get_jenkinsfile() -> str:
 // La Git integration de Vercel está desactivada: el único disparador de
 // despliegues es este pipeline.
 //
-// Modelo de agentes: Kubernetes plugin. Corre en un pod efímero en EKS con un
-// contenedor 'node' (definido en org/flexicredit/podFrontend.yaml de la Shared
-// Library). defaultContainer 'node' hace que todos los sh corran ahí.
+// Modelo de agentes: Kubernetes plugin. Corre en un pod efímero (EKS en
+// staging/prod, K3d en dev) con un contenedor 'node' (definido en
+// org/__LIB_ORG__/podFrontend.yaml de la Shared Library). defaultContainer 'node'
+// hace que todos los sh corran ahí. El deploy sigue siendo a Vercel (no al cluster).
 // ───────────────────────────────────────────────────────────────────────────
 
 pipeline {
     agent {
         kubernetes {
             defaultContainer 'node'
-            yaml libraryResource('org/flexicredit/podFrontend.yaml')
+            yaml libraryResource('org/__LIB_ORG__/podFrontend.yaml')
         }
     }
 
@@ -2000,6 +2004,7 @@ pipeline {
     }
 }
 """
+    return template.replace("__LIB_ORG__", lib_org)
 
 
 def get_vercel_json() -> str:
@@ -2111,7 +2116,7 @@ describe('utils', () => {
 
 # ─── SCAFFOLD ORCHESTRATOR ────────────────────────────────────────────────────
 
-def scaffold(project_name: str) -> None:
+def scaffold(project_name: str, org: str = "myproject") -> None:
     root = Path(project_name)
     logger.info("Creando arquetipo Next.js: %s", project_name)
 
@@ -2134,7 +2139,7 @@ def scaffold(project_name: str) -> None:
         ".husky/pre-commit": get_husky_pre_commit(),
         "Dockerfile": get_dockerfile(),
         ".dockerignore": get_dockerignore(),
-        "Jenkinsfile": get_jenkinsfile(),
+        "Jenkinsfile": get_jenkinsfile(org),
         "vercel.json": get_vercel_json(),
 
         # Middleware (Next.js root)
@@ -2237,11 +2242,11 @@ def scaffold(project_name: str) -> None:
         logger.debug("Creado: %s", relative_path)
 
     logger.info("Arquetipo generado exitosamente en: %s", root.resolve())
-    _setup_gitea_repo(project_name, root)
+    _setup_gitea_repo(project_name, root, org)
     _print_run_instructions(project_name, root)
 
 
-def _setup_gitea_repo(project_name: str, root: Path) -> None:
+def _setup_gitea_repo(project_name: str, root: Path, org: str = "myproject") -> None:
     import base64
     import json as _json
     import subprocess
@@ -2249,7 +2254,6 @@ def _setup_gitea_repo(project_name: str, root: Path) -> None:
     import urllib.request
 
     gitea_host = "http://localhost:3000"
-    org = "flexicredit"
     credentials = base64.b64encode(b"gitea-admin:gitea-admin").decode()
 
     try:
@@ -2279,6 +2283,12 @@ def _setup_gitea_repo(project_name: str, root: Path) -> None:
     except urllib.error.HTTPError as e:
         if e.code == 409:
             logger.info("[Gitea] Repo %s/%s ya existe.", org, project_name)
+        elif e.code == 401:
+            logger.warning(
+                "[Gitea] HTTP 401: el usuario admin no existe. Correr "
+                "base-infrastructure-builder.sh primero."
+            )
+            return
         else:
             logger.warning("[Gitea] No se pudo crear el repo: HTTP %s", e.code)
             return
@@ -2287,15 +2297,23 @@ def _setup_gitea_repo(project_name: str, root: Path) -> None:
         subprocess.run(["git", "init", "-q", "-b", "main"], cwd=root, check=True)
         result = subprocess.run(["git", "config", "user.email"], cwd=root, capture_output=True)
         if result.returncode != 0:
-            subprocess.run(["git", "config", "user.email", "cicd@flexicredit.local"], cwd=root, check=True)
-            subprocess.run(["git", "config", "user.name", "FlexiCredit CI"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.email", f"cicd@{org}.local"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", f"{org} CI"], cwd=root, check=True)
         subprocess.run(["git", "add", "-A"], cwd=root, check=True)
         subprocess.run(["git", "commit", "-q", "-m", f"chore: scaffold {project_name}"], cwd=root, check=True)
         remote_url = f"{gitea_host}/{org}/{project_name}.git"
         subprocess.run(["git", "remote", "add", "origin", remote_url], cwd=root, check=False)
         logger.info("[Gitea] Remote 'origin' → %s", remote_url)
         logger.info("[Gitea] URL interna (Jenkins/ArgoCD): http://gitea:3000/%s/%s.git", org, project_name)
-        logger.info("[Gitea] Para publicar: cd %s && git push -u origin main", root)
+        # Auto-push con credenciales embebidas (sin guardarlas en .git/config).
+        push_url = remote_url.replace("http://", "http://gitea-admin:gitea-admin@", 1)
+        push = subprocess.run(
+            ["git", "push", push_url, "main"], cwd=root, capture_output=True
+        )
+        if push.returncode == 0:
+            logger.info("[Gitea] Push a %s/%s completado (rama main).", org, project_name)
+        else:
+            logger.info("[Gitea] Para publicar: cd %s && git push -u origin main", root)
     except (subprocess.CalledProcessError, FileNotFoundError) as e:
         logger.warning("[Gitea] No se pudo inicializar el repo git: %s", e)
 
@@ -2396,6 +2414,14 @@ def main() -> None:
         help="Nombre del proyecto (ej: my-saas-app)",
     )
     parser.add_argument(
+        "--org",
+        default="myproject",
+        metavar="ORG",
+        help="Slug del proyecto/organización. Se usa para la organización Gitea "
+             "y el paquete de la Shared Library (org.<org>). Debe coincidir con el "
+             "-P/--project usado en los scripts. (default: myproject)",
+    )
+    parser.add_argument(
         "-v", "--verbose",
         action="store_true",
         help="Mostrar logs detallados (DEBUG)",
@@ -2412,7 +2438,7 @@ def main() -> None:
     )
 
     try:
-        scaffold(args.project_name)
+        scaffold(args.project_name, args.org)
     except OSError as e:
         logger.error("No se pudo crear el proyecto: %s", e)
         sys.exit(1)

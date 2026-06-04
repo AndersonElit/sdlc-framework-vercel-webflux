@@ -10,6 +10,17 @@ log_err() { echo "[$(date '+%H:%M:%S')] ERR $*" >&2; }
 
 log "Iniciando limpieza de Docker..."
 
+# Eliminar primero el cluster K3d: si solo se borraran sus contenedores con docker rm,
+# k3d quedaría con estado inconsistente (cluster "fantasma"). 'k3d cluster delete --all'
+# limpia nodos, load balancer y registries asociados.
+delete_k3d() {
+  if command -v k3d &>/dev/null; then
+    log "Eliminando clusters K3d..."
+    k3d cluster delete --all &>/dev/null && log_ok "Clusters K3d eliminados" || log "No había clusters K3d"
+    k3d registry delete --all &>/dev/null || true
+  fi
+}
+
 stop_containers() {
   local ids
   ids=$(docker ps -q)
@@ -61,6 +72,7 @@ purge_networks() {
 
 failed=()
 
+delete_k3d        || failed+=("delete_k3d")
 stop_containers   || failed+=("stop_containers")
 remove_containers || failed+=("remove_containers")
 remove_images     || failed+=("remove_images")

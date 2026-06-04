@@ -12,8 +12,12 @@
 # módulo Terraform 'argocd' (ver base-infrastructure-builder.sh).
 #
 # Uso:
-#   bash .claude/scripts/jenkins-shared-library-builder.sh [-o DIR] [--no-git]
+#   bash .claude/scripts/jenkins-shared-library-builder.sh -P <proyecto> [-o DIR] [--no-git]
 #
+#   -P, --project NOMBRE   Slug del proyecto (obligatorio). Determina el paquete
+#                          Java de la librería (org.<slug>), el path de los
+#                          recursos (org/<slug>/podBackend.yaml) y la organización
+#                          Gitea donde se publica el repo.
 #   -o DIR     Directorio de salida (por defecto: ./jenkins-shared-library)
 #   --no-git   No inicializar repositorio git ni hacer commit inicial
 
@@ -28,9 +32,12 @@ log_err() { echo "[$(date '+%H:%M:%S')] ERR $*" >&2; }
 # ---------------------------------------------------------------------------
 OUT_DIR="jenkins-shared-library"
 DO_GIT=1
+PROJECT_NAME=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    -P|--project) PROJECT_NAME="${2:-}"; shift 2 ;;
+    --project=*)  PROJECT_NAME="${1#*=}"; shift ;;
     -o|--output) OUT_DIR="$2"; shift 2 ;;
     --no-git) DO_GIT=0; shift ;;
     -h|--help)
@@ -40,13 +47,25 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if [[ -z "$PROJECT_NAME" ]]; then
+  log_err "Falta el parámetro obligatorio -P/--project."
+  exit 1
+fi
+
+# Slug saneado para el paquete Java / path de recursos (sin guiones ni mayúsculas).
+ORG_SLUG="$(echo "$PROJECT_NAME" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9')"
+if [[ -z "$ORG_SLUG" ]]; then
+  log_err "El proyecto '$PROJECT_NAME' no produce un slug alfanumérico válido para el paquete Java."
+  exit 1
+fi
+
 if [[ -e "$OUT_DIR" ]]; then
   log_err "El directorio '$OUT_DIR' ya existe. Elimínalo o usa -o para otro destino."
   exit 1
 fi
 
-log "Creando estructura de la Shared Library en: $OUT_DIR"
-mkdir -p "$OUT_DIR/vars" "$OUT_DIR/src/org/flexicredit" "$OUT_DIR/resources"
+log "Creando estructura de la Shared Library en: $OUT_DIR (proyecto: $PROJECT_NAME, paquete: org.$ORG_SLUG)"
+mkdir -p "$OUT_DIR/vars" "$OUT_DIR/src/org/$ORG_SLUG" "$OUT_DIR/resources"
 
 # ---------------------------------------------------------------------------
 # vars/ — pasos reutilizables (cada archivo define call(...))
@@ -116,9 +135,11 @@ def call(Map args = [:]) {
 }
 EOF
 
-# buildAndPushImage — Kaniko build + push a ECR
+# buildAndPushImage — Kaniko build + push al registry (ECR o registry de K3d en dev)
 cat > "$OUT_DIR/vars/buildAndPushImage.groovy" <<'EOF'
-// Construye la imagen multi-stage con Kaniko y la publica en ECR.
+// Construye la imagen multi-stage con Kaniko y la publica en el registry.
+// staging/prod: Amazon ECR (HTTPS, auth IRSA). dev: registry de k3d (HTTP, anónimo)
+// → env.REGISTRY_INSECURE='true' activa los flags de Kaniko para registry inseguro.
 // Producción usa solo el tag inmutable; otros ambientes añaden 'latest'.
 def call(Map args = [:]) {
     def ecrRepo  = args.ecrRepo  ?: error('buildAndPushImage: falta ecrRepo')
@@ -130,11 +151,18 @@ def call(Map args = [:]) {
         destinations += " --destination ${registry}/${ecrRepo}:latest"
     }
 
+    // Registry inseguro (HTTP) en dev: el registry de k3d no tiene TLS ni auth.
+    def insecureFlags = ""
+    if (env.REGISTRY_INSECURE == 'true') {
+        insecureFlags = "--insecure --skip-tls-verify"
+    }
+
     container('kaniko') {
         sh """
             /kaniko/executor \\
               --context dir://${WORKSPACE} \\
               --dockerfile Dockerfile \\
+              ${insecureFlags} \\
               ${destinations}
         """
     }
@@ -149,8 +177,10 @@ def call(Map args = [:]) {
     def imageTag = args.imageTag ?: error('scanImage: falta imageTag')
     def registry = env.ECR_REGISTRY ?: error('scanImage: falta env.ECR_REGISTRY')
     def image = "${registry}/${ecrRepo}:${imageTag}"
+    // Registry inseguro (HTTP) en dev: Trivy necesita --insecure para extraer la imagen.
+    def insecure = env.REGISTRY_INSECURE == 'true' ? "--insecure " : ""
     container('trivy') {
-        sh "trivy image --exit-code 1 --severity CRITICAL --no-progress ${image}"
+        sh "trivy image ${insecure}--exit-code 1 --severity CRITICAL --no-progress ${image}"
     }
 }
 EOF
@@ -219,10 +249,16 @@ def call(Map args = [:]) {
     def service   = args.service   ?: error('runSmokeTests: falta service')
     def namespace = args.namespace ?: error('runSmokeTests: falta namespace')
     def imageTag  = args.imageTag  ?: error('runSmokeTests: falta imageTag')
-    def cluster   = env.EKS_CLUSTER_NAME ?: error('runSmokeTests: falta env.EKS_CLUSTER_NAME')
     def region    = env.AWS_REGION ?: 'us-east-1'
+    // dev (K3d): el agente corre DENTRO del cluster con el SA jenkins-agent, así que
+    // kubectl usa la config in-cluster y no hay 'aws eks update-kubeconfig'.
+    // staging/prod (EKS): el agente obtiene kubeconfig vía IRSA + aws eks.
+    def inCluster = env.SMOKE_USE_INCLUSTER == 'true'
     container('deploy') {
-        sh "aws eks update-kubeconfig --name ${cluster} --region ${region}"
+        if (!inCluster) {
+            def cluster = env.EKS_CLUSTER_NAME ?: error('runSmokeTests: falta env.EKS_CLUSTER_NAME')
+            sh "aws eks update-kubeconfig --name ${cluster} --region ${region}"
+        }
         sh """
             # Espera a que ArgoCD aplique el nuevo tag (imagen viva == *:${imageTag}).
             for i in \$(seq 1 60); do
@@ -251,10 +287,16 @@ def call(Map args = [:]) {
     def color   = status == 'SUCCESS' ? 'good' : 'danger'
     def message = "[${status}] ${service} (${envName}) — ${env.JOB_NAME} #${env.BUILD_NUMBER}\n${env.BUILD_URL}"
 
+    // Slack es opcional (p. ej. en dev): si SLACK_TEAM está vacío no se intenta
+    // notificar y se registra el resultado en el log. Nunca falla el build por Slack.
+    if (!env.SLACK_TEAM?.trim()) {
+        echo "Slack no configurado (SLACK_TEAM vacío); resultado: ${message}"
+        return
+    }
     try {
         slackSend(channel: '#cicd', color: color, message: message)
     } catch (ignored) {
-        echo "Slack no configurado; resultado: ${message}"
+        echo "Slack no disponible; resultado: ${message}"
     }
 }
 EOF
@@ -264,7 +306,7 @@ log_ok "Pasos vars/ generados (10 archivos)."
 # ---------------------------------------------------------------------------
 # src/ — clases auxiliares
 # ---------------------------------------------------------------------------
-cat > "$OUT_DIR/src/org/flexicredit/PipelineDefaults.groovy" <<'EOF'
+cat > "$OUT_DIR/src/org/$ORG_SLUG/PipelineDefaults.groovy" <<'EOF'
 package org.flexicredit
 
 // Constantes y utilidades compartidas por los pasos de la Shared Library.
@@ -282,19 +324,21 @@ class PipelineDefaults implements Serializable {
 }
 EOF
 
-log_ok "Clase auxiliar src/org/flexicredit/PipelineDefaults.groovy generada."
+log_ok "Clase auxiliar src/org/$ORG_SLUG/PipelineDefaults.groovy generada."
 
 # ---------------------------------------------------------------------------
 # resources/ — pods de agentes (cargados con libraryResource desde los
 # Jenkinsfile vía agent { kubernetes { yaml libraryResource(...) } }).
-# El ServiceAccount jenkins-agent lleva la anotación IRSA (eks.amazonaws.com/
+# staging/prod: el SA jenkins-agent lleva la anotación IRSA (eks.amazonaws.com/
 # role-arn) que la infra crea; así kaniko (ECR) y deploy (EKS) obtienen creds.
+# dev (K3d): no hay IRSA; kaniko empuja al registry de k3d (HTTP, anónimo) y los
+# smoke tests usan la config in-cluster del propio SA (RBAC en jenkins-agent-rbac-dev.yaml).
 # ---------------------------------------------------------------------------
-mkdir -p "$OUT_DIR/resources/org/flexicredit"
+mkdir -p "$OUT_DIR/resources/org/$ORG_SLUG"
 
 # Pod backend — build/test (maven), imagen (kaniko), escaneos (trivy/gitleaks),
 # deploy (alpine/k8s) y un sidecar dind para Testcontainers.
-cat > "$OUT_DIR/resources/org/flexicredit/podBackend.yaml" <<'EOF'
+cat > "$OUT_DIR/resources/org/$ORG_SLUG/podBackend.yaml" <<'EOF'
 apiVersion: v1
 kind: Pod
 spec:
@@ -341,7 +385,7 @@ spec:
 EOF
 
 # Pod frontend — solo Node (build + deploy a Vercel via CLI + Playwright).
-cat > "$OUT_DIR/resources/org/flexicredit/podFrontend.yaml" <<'EOF'
+cat > "$OUT_DIR/resources/org/$ORG_SLUG/podFrontend.yaml" <<'EOF'
 apiVersion: v1
 kind: Pod
 spec:
@@ -401,6 +445,7 @@ kubernetes
 workflow-aggregator
 git
 gitea
+multibranch-scan-webhook-trigger
 pipeline-utility-steps
 sonar
 slack
@@ -428,18 +473,20 @@ EOF
 cat > "$OUT_DIR/docker/jenkins.yaml" <<'EOF'
 jenkins:
   systemMessage: "FlexiCredit CI/CD — configurado con JCasC"
-  numExecutors: 0   # el controller no ejecuta builds; todo va a agentes EKS
+  numExecutors: 0   # el controller no ejecuta builds; todo va a agentes en el cluster
 
   clouds:
     - kubernetes:
-        name: "eks"
-        # Endpoint del API server del cluster EKS (controller externo en EC2).
+        name: "k8s"
+        # API server del cluster: EKS en staging/prod; K3d (serverlb:6443) en dev.
+        # El controller es externo (EC2 en prod; contenedor en floci-net en dev).
         serverUrl: "${EKS_API_SERVER}"
         namespace: "jenkins"
-        # URL por la que los pods agente alcanzan al controller (ALB interno).
+        # URL por la que los pods agente alcanzan al controller.
         jenkinsUrl: "${JENKINS_URL}"
         jenkinsTunnel: "${JENKINS_TUNNEL}"   # host:50000 del controller
-        # Credencial kubeconfig (exec auth: aws eks get-token) generada en la EC2.
+        # Credencial kubeconfig: exec auth (aws eks get-token) en EKS; cert de
+        # cliente del kubeconfig de k3d en dev. Montada en /var/jenkins_home/.kube/config.
         credentialsId: "eks-kubeconfig"
         directConnection: false
         # Los pod templates vienen de los Jenkinsfile (yaml libraryResource);
@@ -455,6 +502,15 @@ jenkins:
             value: "${EKS_CLUSTER_NAME}"
           - key: "AWS_REGION"
             value: "${AWS_REGION}"
+          # dev (K3d): registry HTTP sin auth → Kaniko/Trivy en modo inseguro.
+          - key: "REGISTRY_INSECURE"
+            value: "${REGISTRY_INSECURE:-false}"
+          # dev (K3d): el agente corre dentro del cluster → smoke tests sin 'aws eks'.
+          - key: "SMOKE_USE_INCLUSTER"
+            value: "${SMOKE_USE_INCLUSTER:-false}"
+          # Team domain de Slack (no secreto). Vacío en dev → notify omite Slack.
+          - key: "SLACK_TEAM"
+            value: "${SLACK_TEAM}"
 
 credentials:
   system:
@@ -617,6 +673,21 @@ EOF
 log_ok "README.md y .gitignore generados."
 
 # ---------------------------------------------------------------------------
+# Genericidad: los heredocs de arriba se emiten con los literales "flexicredit"/
+# "FlexiCredit" por legibilidad. Aquí se sustituyen por el proyecto real en TODO
+# el contenido generado. El paquete Java / path de recursos usan el slug saneado
+# (org.<slug>); el resto (organización Gitea, dominios, marca) usa el nombre tal cual.
+# Las reglas de "org/" y "org." se aplican primero para que coincidan con los
+# directorios ya creados con $ORG_SLUG.
+# ---------------------------------------------------------------------------
+find "$OUT_DIR" -type f -print0 | xargs -0 --no-run-if-empty sed -i \
+  -e "s#org/flexicredit#org/${ORG_SLUG}#g" \
+  -e "s#org\.flexicredit#org.${ORG_SLUG}#g" \
+  -e "s#flexicredit#${PROJECT_NAME}#g" \
+  -e "s#FlexiCredit#${PROJECT_NAME}#g"
+log_ok "Nombre de proyecto '$PROJECT_NAME' aplicado al contenido de la Shared Library."
+
+# ---------------------------------------------------------------------------
 # git init + commit inicial
 # ---------------------------------------------------------------------------
 if [[ "$DO_GIT" -eq 1 ]]; then
@@ -624,29 +695,43 @@ if [[ "$DO_GIT" -eq 1 ]]; then
     git -C "$OUT_DIR" init -q -b main
     # Identidad local de respaldo solo si no hay ninguna configurada.
     if ! git -C "$OUT_DIR" config user.email &>/dev/null; then
-      git -C "$OUT_DIR" config user.email "cicd@flexicredit.local"
-      git -C "$OUT_DIR" config user.name "FlexiCredit CI"
+      git -C "$OUT_DIR" config user.email "cicd@${PROJECT_NAME}.local"
+      git -C "$OUT_DIR" config user.name "${PROJECT_NAME} CI"
     fi
     git -C "$OUT_DIR" add -A
     git -C "$OUT_DIR" commit -q -m "chore: scaffold jenkins-shared-library"
     # Crear el repo en Gitea si el contenedor está activo, luego apuntar el remote.
     # URL de host (localhost:3000) para push desde la máquina de desarrollo.
-    # Jenkins y ArgoCD usan la URL interna: http://gitea:3000/flexicredit/jenkins-shared-library.git
+    # Jenkins y ArgoCD usan la URL interna: http://gitea:3000/${PROJECT_NAME}/jenkins-shared-library.git
     if curl -sf http://localhost:3000/api/healthz &>/dev/null; then
-      curl -sf -u "gitea-admin:gitea-admin" -X POST \
-        "http://localhost:3000/api/v1/orgs/flexicredit/repos" \
+      # Capturar el código HTTP para distinguir creado (201) / ya existe (409)
+      # de un fallo de auth (401 → el admin no existe, correr base-infrastructure-builder.sh).
+      repo_code=$(curl -s -o /dev/null -w "%{http_code}" -u "gitea-admin:gitea-admin" -X POST \
+        "http://localhost:3000/api/v1/orgs/${PROJECT_NAME}/repos" \
         -H "Content-Type: application/json" \
-        -d '{"name":"jenkins-shared-library","private":true,"auto_init":false,"default_branch":"main"}' \
-        &>/dev/null \
-        && log_ok "Repo flexicredit/jenkins-shared-library creado en Gitea." \
-        || log "Repo jenkins-shared-library ya existe en Gitea."
+        -d '{"name":"jenkins-shared-library","private":true,"auto_init":false,"default_branch":"main"}')
+      case "$repo_code" in
+        201) log_ok "Repo ${PROJECT_NAME}/jenkins-shared-library creado en Gitea." ;;
+        409) log "Repo jenkins-shared-library ya existe en Gitea." ;;
+        401) log_err "Gitea devolvió HTTP 401: el usuario admin no existe. Correr base-infrastructure-builder.sh primero." ;;
+        *)   log_err "Gitea devolvió HTTP $repo_code al crear el repo jenkins-shared-library." ;;
+      esac
     else
       log "Gitea no está activo — el repo se creará manualmente. Correr base-infrastructure-builder.sh primero."
     fi
-    git -C "$OUT_DIR" remote add origin http://localhost:3000/flexicredit/jenkins-shared-library.git \
-      2>/dev/null || git -C "$OUT_DIR" remote set-url origin http://localhost:3000/flexicredit/jenkins-shared-library.git
+    git -C "$OUT_DIR" remote add origin "http://localhost:3000/${PROJECT_NAME}/jenkins-shared-library.git" \
+      2>/dev/null || git -C "$OUT_DIR" remote set-url origin "http://localhost:3000/${PROJECT_NAME}/jenkins-shared-library.git"
     log_ok "Repositorio git inicializado (rama main) con commit inicial."
-    log_ok "Remote 'origin' → http://localhost:3000/flexicredit/jenkins-shared-library.git"
+    log_ok "Remote 'origin' → http://localhost:3000/${PROJECT_NAME}/jenkins-shared-library.git"
+    # Auto-push con credenciales embebidas (sin guardarlas en .git/config).
+    # Si falla (Gitea caído / repo inexistente) queda el push manual como fallback.
+    if curl -sf http://localhost:3000/api/healthz &>/dev/null; then
+      if git -C "$OUT_DIR" push "http://gitea-admin:gitea-admin@localhost:3000/${PROJECT_NAME}/jenkins-shared-library.git" main &>/dev/null; then
+        log_ok "Push a Gitea completado (rama main)."
+      else
+        log "Push automático no realizado — publicá manualmente: cd $OUT_DIR && git push -u origin main"
+      fi
+    fi
   else
     log "git no está instalado; se omite la inicialización del repositorio."
   fi
@@ -664,7 +749,7 @@ echo "       git push -u origin main"
 echo "       # Credenciales: gitea-admin / gitea-admin"
 echo ""
 echo "     URL interna (para Jenkins y ArgoCD en floci-net):"
-echo "       SHARED_LIBRARY_REPO=http://gitea:3000/flexicredit/jenkins-shared-library.git"
+echo "       SHARED_LIBRARY_REPO=http://gitea:3000/${PROJECT_NAME}/jenkins-shared-library.git"
 echo ""
 echo "  2. Construye y publica la imagen del controller (docker/) en ECR y apunta"
 echo "     var.jenkins_image del módulo Jenkins de Terraform a esa imagen."
@@ -672,5 +757,5 @@ echo "  3. Aplica bootstrap/jenkins-agent-rbac.yaml en el cluster (namespace +"
 echo "     ServiceAccount IRSA) usando el output agent_role_arn de Terraform."
 echo "  4. Los Jenkinsfile generados por los scaffolds ya referencian la librería"
 echo "     con @Library('jenkins-shared-library@main') _ y cargan los pods con"
-echo "     libraryResource('org/flexicredit/podBackend.yaml' | 'podFrontend.yaml')."
+echo "     libraryResource('org/${ORG_SLUG}/podBackend.yaml' | 'podFrontend.yaml')."
 echo

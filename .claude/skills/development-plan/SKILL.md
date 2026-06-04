@@ -7,7 +7,7 @@ Eres un Staff Engineer, Technical Lead y DevOps Architect especializado en plani
 
 Tu tarea es generar un conjunto de planes de desarrollo detallados, secuenciales y accionables en formato Markdown, para la etapa de Implementación del SDLC. Cada plan es un documento independiente que un desarrollador puede seguir de forma autónoma.
 
-El enfoque del ambiente de desarrollo es **local con floci** (emulador local de servicios AWS), según la configuración del script `.claude/scripts/base-infrastructure-builder.sh`.
+El enfoque del ambiente de desarrollo es **local con floci** (emulador local de servicios AWS) **+ K3d** (K3s en Docker como cluster Kubernetes real de dev), según la configuración del script `.claude/scripts/base-infrastructure-builder.sh`. En `dev` NO se usa EKS: el EKS de floci es solo emulación de metadatos (sin API server ni pods reales), por lo que el lazo CI/CD+GitOps no podría cerrarse; K3d provee un Kubernetes real en `floci-net` con su propio registry, sobre el que se instala ArgoCD y donde Jenkins lanza agentes como pods. EKS se reserva para `staging`/`prod`.
 
 # OBJETIVO PRINCIPAL
 
@@ -27,7 +27,7 @@ La skill genera los siguientes archivos en `docs/development/`:
 ```
 docs/development/
 ├── DEV-[proyecto]-roadmap.md              # Índice maestro y visión general
-├── DEV-[proyecto]-00-infrastructure.md   # Etapa 0: Infraestructura local (Terraform + floci)
+├── DEV-[proyecto]-00-infrastructure.md   # Etapa 0: Infraestructura local (Terraform + floci + K3d)
 ├── DEV-[proyecto]-01-databases.md        # Etapa 1: Bases de datos y migraciones
 ├── DEV-[proyecto]-02-scaffold.md         # Etapa 2: Scaffolding de proyectos
 ├── DEV-[proyecto]-02b-cicd.md            # Etapa 2b: Configuración del pipeline CI/CD (Jenkins + ArgoCD)
@@ -116,12 +116,12 @@ Título H1: `# Plan de Desarrollo — [Nombre del Proyecto]`
 
 Secciones en orden exacto:
 
-1. **Introducción** — objetivo de la etapa de desarrollo, ambiente objetivo (local/floci), tecnologías involucradas.
-2. **Prerrequisitos Globales** — herramientas a instalar antes de comenzar (Docker, Terraform, Java 21, Node.js, Python 3, floci CLI).
+1. **Introducción** — objetivo de la etapa de desarrollo, ambiente objetivo (local: floci + K3d), tecnologías involucradas.
+2. **Prerrequisitos Globales** — herramientas a instalar antes de comenzar (Docker, Terraform, **k3d**, **kubectl**, Java 21, Node.js, Python 3, floci CLI).
 3. **Secuencia de Etapas** — tabla con todas las etapas, su documento, dependencias previas y estimación de esfuerzo.
 4. **Mapa de Microservicios** — tabla con: nombre del servicio, bounded context, base de datos, mensajería, dependencias REST entre servicios.
 5. **Mapa de Features Frontend** — tabla con: nombre del feature, rutas asociadas, contextos de dominio que consume, dependencias de servicios backend.
-6. **Ambiente Local (floci)** — descripción de la configuración local: puertos de PostgreSQL, MongoDB, Kafka y Cognito expuestos por floci; variables de entorno base.
+6. **Ambiente Local (floci + K3d)** — descripción de la configuración local: puertos de PostgreSQL, MongoDB, Kafka y Cognito expuestos por floci; el contenedor **SonarQube** (`[proyecto]-sonarqube`, quality gate del CI) en `floci-net`, expuesto en `localhost:9000` e interno como `[proyecto]-sonarqube:9000` (con `SONAR_URL`/`SONAR_TOKEN` persistidos en `terraform/backend/environments/dev/.sonar-env`); el cluster Kubernetes de dev **K3d** (`[proyecto]-dev`) en `floci-net` con su registry (`k3d-[proyecto]-registry:5100`) y los kubeconfig en `terraform/backend/environments/dev/.kube/`; sobre K3d corre ArgoCD; variables de entorno base.
 7. **Criterios de Done (Definition of Done)** — criterios que debe cumplir cada componente para considerarse completo en esta etapa. Debe incluir explícitamente los criterios de TDD: toda funcionalidad fue precedida por una prueba que falló y luego pasó (Red-Green-Refactor); la suite de pruebas está en verde; se cumplen los umbrales de cobertura mínima por capa; no existe lógica de negocio ni rama de error sin prueba asociada.
 
 ---
@@ -135,17 +135,18 @@ Secciones en orden exacto:
 1. **Objetivo** — descripción breve de lo que se configura en esta etapa.
 2. **Prerrequisitos** — software requerido con versión mínima.
 3. **Paso 1: Ejecutar el script de infraestructura base**
-   - Comando exacto: `bash .claude/scripts/base-infrastructure-builder.sh`
-   - Descripción de qué genera (árbol Terraform multi-ambiente)
+   - Comando exacto: `bash .claude/scripts/base-infrastructure-builder.sh -P <nombre-proyecto>`
+   - Descripción de qué genera (árbol Terraform multi-ambiente) y qué levanta en dev: contenedores floci (AWS emulado), MongoDB, Kafka, Gitea (crea el usuario admin `gitea-admin` y la organización `[proyecto]`), **SonarQube** (`[proyecto]-sonarqube`, levantado **antes** de K3d para que CoreDNS lo resuelva en `floci-net`; aprovisiona el token CI y lo persiste en `terraform/backend/environments/dev/.sonar-env`) **y el cluster K3d `[proyecto]-dev` con su registry**, escribiendo los kubeconfig de K3d en `terraform/backend/environments/dev/.kube/`
+   - Indicar que SonarQube requiere `vm.max_map_count >= 262144` (el script lo eleva vía `sudo` si puede; si no, arranca con `SONAR_ES_BOOTSTRAP_CHECKS_DISABLE=true`)
    - Directorio de salida esperado
-4. **Paso 2: Inicializar el ambiente dev (floci)**
-   - Comando exacto: `bash .claude/scripts/init-dev-environment.sh`
-   - Descripción de qué hace (init/plan/apply Terraform, verificación de recursos floci, conectividad, outputs, checklist)
-   - Tabla de endpoints locales y puertos esperados
+4. **Paso 2: Inicializar el ambiente dev (floci + K3d)**
+   - Comando exacto: `bash .claude/scripts/init-dev-environment.sh -P <nombre-proyecto>`
+   - Descripción de qué hace (init/plan/apply Terraform, **verificación de los contenedores de soporte en `floci-net`: floci, `floci-mongo`, `[proyecto]-kafka-dev`, `gitea` y `[proyecto]-sonarqube`**, verificación de recursos floci, **verificación del cluster K3d y de ArgoCD**, conectividad, outputs, checklist). En dev los providers `kubernetes`/`helm` apuntan al kubeconfig de K3d y el módulo `argocd` instala ArgoCD en el cluster (sin `-target`, porque K3d ya existe)
+   - Tabla de endpoints locales y puertos esperados (incluir registry K3d `localhost:5100`, **SonarQube UI/API `localhost:9000` (interno `[proyecto]-sonarqube:9000`)** y el `port-forward` de la UI de ArgoCD)
 5. **Paso 3: Variables de entorno base**
    - Tabla de variables de entorno necesarias para el desarrollo local
    - Indicar qué archivo `.env` debe crearse en cada proyecto
-6. **Criterios de Aceptación** — lista de verificación (`- [ ]`) para dar esta etapa por completada. Debe incluir una entrada para `bash .claude/scripts/init-dev-environment.sh`.
+6. **Criterios de Aceptación** — lista de verificación (`- [ ]`) para dar esta etapa por completada. Debe incluir una entrada para `bash .claude/scripts/init-dev-environment.sh -P <nombre-proyecto>` y una entrada que verifique que el contenedor `[proyecto]-sonarqube` está `UP` (`http://localhost:9000/api/system/status`) y que `terraform/backend/environments/dev/.sonar-env` existe con `SONAR_URL`/`SONAR_TOKEN`.
 
 ---
 
@@ -158,6 +159,7 @@ Secciones en orden exacto:
 0. **Automatización** — bloque inicial antes del Objetivo, con el comando de ejecución del script. `init-databases.sh` recibe **cuatro parámetros obligatorios** (no tiene valores por defecto): el nombre de la base PostgreSQL, el nombre de la base MongoDB y el usuario/clave de aplicación a crear. Mostrar el comando con los valores concretos derivados del diseño (nombres de BD desde `docs/design/SDD-[proyecto]-infrastructure.md` / la estrategia de persistencia; usuario y clave de aplicación para el ambiente local):
    ```bash
    bash .claude/scripts/init-databases.sh \
+     -P <nombre-proyecto> \
      -p <base-postgres> \
      -m <base-mongo> \
      -u <usuario-app> \
@@ -194,7 +196,8 @@ Secciones en orden exacto:
    - Tabla resumen: servicio → puerto local → DB → mensajería → módulos generados.
    - Indicar si el servicio usa mensajería (kafka-producer / kafka-consumer / ambos / none).
    - Documentar los artefactos que produce el scaffold y que consume la Etapa 2b: `Jenkinsfile` (backend y frontend), `Dockerfile` multi-stage (backend) y charts Helm (`helm/<service>/`)
-   - **Backend `Jenkinsfile`**: tabla de stages con el step de la shared library que invoca cada uno (`computeImageTag`, `buildBackendService`, `runIntegrationTests`, `runQualityGates`, `runSecurityScans`, `buildAndPushImage`, `scanImage`, `bumpImageTag`, `runSmokeTests`, `notify`). Explicar que el pod de agentes se carga desde `org/flexicredit/podBackend.yaml` de la shared library y que el ServiceAccount `jenkins-agent` usa IRSA.
+   - Indicar que, en dev, cada scaffold (`maven_hexagonal_scaffold.py` / `nextjs_feature_scaffold.py`) además **crea el repositorio en Gitea** dentro de la organización `[proyecto]` y **hace push automático de la rama `main`** usando las credenciales fijas `gitea-admin:gitea-admin` (sin guardarlas en `.git/config`); si Gitea no está activo o el admin no existe, deja el push manual como fallback. No es necesario un `git push` manual en dev. La URL interna que consumen Jenkins/ArgoCD es `http://gitea:3000/[proyecto]/<servicio>.git`
+   - **Backend `Jenkinsfile`**: tabla de stages con el step de la shared library que invoca cada uno (`computeImageTag`, `buildBackendService`, `runIntegrationTests`, `runQualityGates`, `runSecurityScans`, `buildAndPushImage`, `scanImage`, `bumpImageTag`, `runSmokeTests`, `notify`). Explicar que el pod de agentes se carga desde `org/[proyecto]/podBackend.yaml` de la shared library y corre en el cluster del ambiente (K3d en dev, EKS en staging/prod); el ServiceAccount `jenkins-agent` usa IRSA en EKS y RBAC plano en K3d (sin IRSA).
    - **Frontend `Jenkinsfile`**: tabla de stages (Install, Type Check, Lint, Unit Tests, Pull config Vercel, Build, Deploy prebuilt, E2E Tests, Promote/Alias prod, Notify). Indicar que despliega a Vercel vía CLI y que la Git integration de Vercel se desactiva.
    - **`Dockerfile` backend**: imagen multi-stage (builder `maven:3.9-eclipse-temurin-21` + runtime `eclipse-temurin:21-jre-alpine`); Kaniko lo usa sin Docker daemon.
    - **Helm charts `helm/<service>/`**: `values.yaml` (base), `values-dev.yaml`, `values-staging.yaml`, `values-prod.yaml`; los campos `image.repository` e `image.tag` los escribe `bumpImageTag` en cada build y ArgoCD los lee para sincronizar el cluster.
@@ -213,8 +216,8 @@ Secciones en orden exacto:
     - Explicar que `maven_hexagonal_scaffold.py` edita automáticamente `terraform/backend/environments/{dev,staging,prod}/main.tf` agregando el nombre del servicio a la lista `services = [...]` que alimenta `module.ecr` y `module.secrets_manager`; la edición ocurre en los tres ambientes pero **solo `dev` se aplica en esta etapa**; `staging`/`prod` se provisionan vía CI/CD
     - **Paso 12 — Terraform apply** (**automático**): el script ejecuta `terraform apply -auto-approve` desde `terraform/backend/environments/dev/`
     - **Paso 13 — Verificación ECR** (**automático**): el script lista repositorios con `aws --endpoint-url=http://localhost:4566 ecr describe-repositories --region us-east-1 --query 'repositories[].repositoryName' --output table`; criterio: un repositorio por cada microservicio generado
-    - **Paso 14 — Verificación secrets** (**automático**): el script lista secretos con `aws --endpoint-url=http://localhost:4566 secretsmanager list-secrets --region us-east-1 --query 'SecretList[?starts_with(Name, \`flexicredit/dev/\`)].Name' --output table`; criterio: un secreto `flexicredit/dev/<servicio>` por cada microservicio generado
- 7. **Criterios de Aceptación** — lista de verificación; el criterio principal es `bash .claude/scripts/scaffold-all-services.sh finalizó los 14 pasos con código de salida 0`. Incluir también: `V1__initial_schema.sql generado en cada servicio PostgreSQL (paso 5)`, `V2__seed_roles_permisos.sql generado en seguridad-service (paso 6)`, `Los repositorios ECR de todos los microservicios existen en floci (verificado en paso 13)`, `Los secrets flexicredit/dev/<servicio> existen en floci con los valores reales de Terraform (verificado en paso 14)`, `.env.local del frontend creado con outputs de Terraform`.
+    - **Paso 14 — Verificación secrets** (**automático**): el script lista secretos con `aws --endpoint-url=http://localhost:4566 secretsmanager list-secrets --region us-east-1 --query 'SecretList[?starts_with(Name, \`[proyecto]/dev/\`)].Name' --output table`; criterio: un secreto `[proyecto]/dev/<servicio>` por cada microservicio generado
+ 7. **Criterios de Aceptación** — lista de verificación; el criterio principal es `bash .claude/scripts/scaffold-all-services.sh finalizó los 14 pasos con código de salida 0`. Incluir también: `V1__initial_schema.sql generado en cada servicio PostgreSQL (paso 5)`, `V2__seed_roles_permisos.sql generado en seguridad-service (paso 6)`, `Los repositorios ECR de todos los microservicios existen en floci (verificado en paso 13)`, `Los secrets [proyecto]/dev/<servicio> existen en floci con los valores reales de Terraform (verificado en paso 14)`, `.env.local del frontend creado con outputs de Terraform`.
 
 ---
 
@@ -226,52 +229,58 @@ Título H1: `# Etapa 2b — Configuración del Pipeline CI/CD`
 
 Secciones en orden exacto:
 
-1. **Objetivo** — describir que el CI/CD se configura antes de la implementación para validar el código a medida que se genera. Indicar el modelo: Jenkins CI → `bumpImageTag` → ArgoCD CD (auto-sync dev/staging; manual prod). Incluir un diagrama ASCII del flujo: `git push → Jenkins stages → helm/<service>/values-<env>.yaml → ArgoCD → EKS`.
-2. **Prerrequisitos** — Etapa 2 completa (Jenkinsfile + Dockerfile + Helm charts generados); módulos Terraform `jenkins` y `argocd` aplicados (Etapa 0).
+1. **Objetivo** — describir que el CI/CD se configura antes de la implementación para validar el código a medida que se genera. Indicar el modelo: Jenkins CI → `bumpImageTag` → ArgoCD CD (auto-sync dev/staging; manual prod). Incluir un diagrama ASCII del flujo: `git push → Jenkins stages → helm/<service>/values-<env>.yaml → ArgoCD → cluster` (el cluster es **K3d en dev**, EKS en staging/prod).
+2. **Prerrequisitos** — Etapa 2 completa (Jenkinsfile + Dockerfile + Helm charts generados). En dev: cluster K3d `[proyecto]-dev` levantado y módulo `argocd` aplicado (Etapa 0); Jenkins corre como contenedor en `floci-net` (no hay módulo `jenkins` en dev). En staging/prod: módulos `jenkins` y `argocd` aplicados sobre EKS.
 0. **Ejecución automatizada (recomendado)**
    - El script `.claude/scripts/setup-cicd-pipeline.sh` unifica todos los pasos de esta etapa en secciones ejecutables. Cada sección es una función autocontenida que valida prerequisitos, ejecuta comandos, verifica resultados y reporta variables pendientes.
-   - Invocación: `bash .claude/scripts/setup-cicd-pipeline.sh` (por defecto ejecuta todas las secciones en orden; editar `main()` para control manual).
+   - Invocación: `bash .claude/scripts/setup-cicd-pipeline.sh -P <nombre-proyecto>` (por defecto ejecuta todas las secciones en orden; editar `main()` para control manual).
    - Secciones: 0 (Shared Library) → 1 (Imagen controller) → 2 (Bootstrap cluster) → 3 (.env JCasC) → 4 (Jobs Jenkins) → 5 (Bootstrap ArgoCD) → 6 (Verificación pipeline).
+   - **En dev el script es completamente autónomo: no requiere intervención manual.** La Sección 3 **levanta** el controller Jenkins (`docker run` idempotente en `floci-net`) y autocompleta `SONAR_URL`/`SONAR_TOKEN` desde `.sonar-env` y `GITOPS_GIT_USERNAME`/`GITOPS_GIT_TOKEN` con `gitea-admin`/`gitea-admin`; la Sección 4 **crea los jobs** en el controller vía `/scriptText` (auth anónima = admin, con crumb) y **crea los webhooks en Gitea** (push + pull_request) apuntando a Jenkins; la Sección 6 verifica jobs y webhooks. Slack (`SLACK_TEAM`/`SLACK_TOKEN`) es **opcional en dev** (`notify` hace fallback a `echo`) y obligatorio solo en staging/prod, igual que las variables Vercel.
    - Los pasos siguientes documentan lo que cada sección del script realiza; pueden ejecutarse manualmente o delegarse al script unificado.
 3. **Paso 1: Generar la Shared Library**
-   - Comando directo: `bash .claude/scripts/jenkins-shared-library-builder.sh -o jenkins-shared-library`
-   - Comando vía script unificado: `bash .claude/scripts/setup-cicd-pipeline.sh` (Sección 0)
+   - Comando directo: `bash .claude/scripts/jenkins-shared-library-builder.sh -P <nombre-proyecto> -o jenkins-shared-library`
+   - Comando vía script unificado: `bash .claude/scripts/setup-cicd-pipeline.sh -P <nombre-proyecto>` (Sección 0)
    - Árbol de directorios generado: `vars/` (10 steps), `src/org/[proyecto]/PipelineDefaults.groovy`, `resources/org/[proyecto]/podBackend.yaml` y `podFrontend.yaml`, `bootstrap/jenkins-agent-rbac.yaml`, `docker/` (Dockerfile + plugins.txt + jenkins.yaml JCasC)
-   - Tabla de steps de `vars/`: nombre del archivo → stage del pipeline que invoca → descripción
-   - Instrucción para publicar el directorio como repositorio remoto (GitHub / GitLab); la URL se usa en el paso de credenciales como `SHARED_LIBRARY_REPO`
-4. **Paso 2: Construir y publicar la imagen del controller**
-   - Comandos: `docker build` de `docker/Dockerfile`, `aws ecr get-login-password | docker login`, `docker push`
-   - Indicar que se debe actualizar `var.jenkins_image` en el módulo Terraform `jenkins` y hacer `terraform apply`
-5. **Paso 3: Bootstrap del cluster (namespace + ServiceAccount IRSA)**
-   - Sustituir `<JENKINS_AGENT_ROLE_ARN>` con el output `agent_role_arn` de Terraform
-   - Comando: `kubectl apply -f jenkins-shared-library/bootstrap/jenkins-agent-rbac.yaml`
+   - Tabla de steps de `vars/`: nombre del archivo → stage del pipeline que invoca → descripción. El step `notify` trata Slack como **opcional**: si `SLACK_TEAM` está vacío (caso dev) registra el resultado en el log y no falla el build
+   - Lista de plugins del controller (`docker/plugins.txt`) — incluir `multibranch-scan-webhook-trigger` (habilita el endpoint `/multibranch-webhook-trigger/invoke?token=<job>` que dispara el escaneo del multibranch desde el webhook de Gitea)
+   - **En dev** `jenkins-shared-library-builder.sh` **crea el repo `[proyecto]/jenkins-shared-library` en Gitea y hace push automático de `main`** con `gitea-admin:gitea-admin`; no hay `git push` manual. En staging/prod se publica el directorio como repositorio remoto (GitHub / GitLab). La URL interna (`http://gitea:3000/[proyecto]/jenkins-shared-library.git` en dev) se usa en el paso de credenciales como `SHARED_LIBRARY_REPO`
+4. **Paso 2: Construir (y publicar) la imagen del controller**
+   - staging/prod: `docker build` de `docker/Dockerfile`, `aws ecr get-login-password | docker login`, `docker push`; actualizar `var.jenkins_image` en el módulo Terraform `jenkins` y hacer `terraform apply`.
+   - **dev (K3d): solo `docker build`** de la imagen `[proyecto]-jenkins:latest`; **no se publica** en ningún registry. El controller lo **levanta automáticamente la Sección 3** (`docker run` idempotente en `floci-net`, recrear conserva el volumen `jenkins_home`), montando el kubeconfig interno de K3d (`.../dev/.kube/config-k3d-internal`) en `/var/jenkins_home/.kube/config`; la sección espera a que Jenkins responda en `http://localhost:8080`. En staging/prod el controller lo gestiona Terraform (módulo `jenkins` en EKS), no este script.
+5. **Paso 3: Bootstrap del cluster (namespace + ServiceAccount)**
+   - staging/prod (EKS, IRSA): sustituir `<JENKINS_AGENT_ROLE_ARN>` con el output `agent_role_arn` de Terraform y `kubectl apply -f jenkins-shared-library/bootstrap/jenkins-agent-rbac.yaml`.
+   - **dev (K3d, sin IRSA)**: `kubectl --kubeconfig terraform/backend/environments/dev/.kube/config-k3d apply -f terraform/backend/environments/dev/argocd-bootstrap/jenkins-agent-rbac-dev.yaml` (namespace `jenkins` + SA `jenkins-agent` + Role/RoleBinding para smoke tests en el namespace `dev`).
    - Verificación: `kubectl get namespace jenkins` y `kubectl get serviceaccount jenkins-agent -n jenkins`
 6. **Paso 4: Proveer variables de entorno y credenciales al controller (JCasC)**
-   - Tabla de variables de entorno inyectadas al controller (EC2 user_data o SSM): `ECR_REGISTRY`, `EKS_API_SERVER`, `EKS_CLUSTER_NAME`, `AWS_REGION`, `JENKINS_URL`, `JENKINS_TUNNEL`, `SHARED_LIBRARY_REPO`, `SONAR_URL`, `SLACK_TEAM`, `VERCEL_TOKEN`, `VERCEL_ORG_ID`, `VERCEL_PROJECT_ID`, `GITOPS_GIT_USERNAME`, `GITOPS_GIT_TOKEN`; fuente de cada variable (Terraform output o configuración manual)
-   - Tabla de credenciales gestionadas por el JCasC: `sonar-token`, `slack-token`, `eks-kubeconfig`, `gitops-git-credentials`; tipo de credencial y descripción
-7. **Paso 5: Crear los jobs de pipeline en Jenkins**
-   - Tipo de job: Multibranch Pipeline
+   - Tabla de variables de entorno inyectadas al controller: `ECR_REGISTRY` (en dev = registry de K3d `k3d-[proyecto]-registry:5100`), `EKS_API_SERVER` (en dev = `https://k3d-[proyecto]-dev-serverlb:6443`), `EKS_CLUSTER_NAME`, `AWS_REGION`, **`REGISTRY_INSECURE`** (dev=`true`: Kaniko/Trivy contra registry HTTP), **`SMOKE_USE_INCLUSTER`** (dev=`true`: smoke tests in-cluster sin `aws eks`), `JENKINS_URL`, `JENKINS_TUNNEL`, `SHARED_LIBRARY_REPO`, `SONAR_URL`, `SLACK_TEAM`, `VERCEL_TOKEN`, `VERCEL_ORG_ID`, `VERCEL_PROJECT_ID`, `GITOPS_GIT_USERNAME`, `GITOPS_GIT_TOKEN`; fuente de cada variable (Terraform output o configuración manual). En staging/prod `REGISTRY_INSECURE`/`SMOKE_USE_INCLUSTER` quedan en `false`.
+   - **Auto-relleno en dev (sin intervención manual):** `SONAR_URL`/`SONAR_TOKEN` se leen de `terraform/backend/environments/dev/.sonar-env` (generado por `base-infrastructure-builder.sh`); `GITOPS_GIT_USERNAME`/`GITOPS_GIT_TOKEN` toman por defecto `gitea-admin`/`gitea-admin` (los repos GitOps viven en Gitea local); `SLACK_TEAM`/`SLACK_TOKEN` son **opcionales** (`notify` hace fallback a `echo`) y `VERCEL_*` no aplican. La validación de variables faltantes solo exige `SLACK_*`/`VERCEL_*` en staging/prod.
+   - Indicar que en dev esta sección, además de generar `.env.jenkins`, **levanta el controller** (`docker run`, ver Paso 2).
+   - Tabla de credenciales gestionadas por el JCasC: `sonar-token`, `slack-token` (opcional en dev), `eks-kubeconfig` (en dev = kubeconfig de K3d), `gitops-git-credentials` (en dev = `gitea-admin`/`gitea-admin`); tipo de credencial y descripción
+7. **Paso 5: Crear los jobs de pipeline en Jenkins y los webhooks de Gitea**
+   - Tipo de job: Multibranch Pipeline; cada job recibe un trigger del plugin `multibranch-scan-webhook-trigger` con `token=<repo>`
    - Tabla de jobs a crear: job name → repositorio → `SERVICE_NAME` por defecto
    - Configuración de cada job: Branch Sources, Build Configuration, Scan Triggers (webhook + periódico)
-   - Instrucción para configurar webhooks en GitHub/GitLab (URL del webhook, eventos `Push` y `Pull Request`)
+   - **En dev (automático):** la Sección 4 aplica el script Groovy de jobs en el controller vía `/scriptText` (auth anónima = admin, con crumb + cookie) y luego **crea un webhook por cada repo de la org en Gitea** (eventos `push` + `pull_request`) apuntando a `http://jenkins-controller:8080/multibranch-webhook-trigger/invoke?token=<repo>` (idempotente: omite los que ya existen; excluye `jenkins-shared-library`). No hay configuración manual de jobs ni de webhooks en dev.
+   - **En staging/prod (manual):** se aplica el script Groovy con `JENKINS_TOKEN` vía REST API (o `Manage Jenkins → Script Console`) y se configuran los webhooks en el SCM (GitHub/GitLab) con los eventos `Push` y `Pull Request`.
 8. **Paso 6: Bootstrap de ArgoCD (ApplicationSet por servicio)**
-   - Comandos: `kubectl apply -f terraform/backend/environments/<env>/argocd-bootstrap/`
-   - Indicar que el `ApplicationSet` generado tiene un elemento de lista por microservicio con la URL del repositorio vacía; completar esa URL antes de aplicar
+   - Comandos: `kubectl apply -f terraform/backend/environments/<env>/argocd-bootstrap/` (en dev, anteponer `--kubeconfig terraform/backend/environments/dev/.kube/config-k3d`). Se genera también para `dev` (no solo staging/prod).
+   - Indicar que el `ApplicationSet` generado tiene un elemento de lista por microservicio con la URL del repositorio (en dev, Gitea: `http://gitea:3000/[proyecto]/<servicio>.git`); las entradas las añade `maven_hexagonal_scaffold.py`
    - Tabla de política de sync por ambiente: `dev`/`staging` → automated (prune + selfHeal); `prod` → sync manual en UI de ArgoCD
-   - Verificación: `argocd app list`
+   - Verificación: `kubectl get applications -n argocd` (o `argocd app list`)
 9. **Verificación del pipeline completo**
    - Hacer un commit trivial en el primer microservicio (el que no tiene dependencias externas)
    - Checklist de stages que deben aparecer como exitosos en Jenkins
    - Verificar que el app en ArgoCD queda en estado `Synced` tras el pipeline
-10. **Criterios de Aceptación** — lista de verificación.
+10. **Criterios de Aceptación** — lista de verificación. En dev, los criterios que `setup-cicd-pipeline.sh` resuelve de forma automática (push de la shared library a Gitea, `.env.jenkins` con `SONAR_*`/`GITOPS_*` autocompletados, controller levantado, jobs multibranch creados, webhooks de Gitea creados) deben marcarse como ✓ automáticos; quedan como pendientes manuales el commit trivial de verificación end-to-end y el estado `Synced` en ArgoCD. En staging/prod estos pasos son manuales (□).
 
 ### Reglas para el documento de CI/CD
 
 - Derivar los nombres de los jobs exactamente de la lista de microservicios identificados en el roadmap.
-- La tabla de variables de entorno del JCasC debe listar todas las variables que usa `docker/jenkins.yaml`; no omitir ninguna.
+- La tabla de variables de entorno del JCasC debe listar todas las variables que usa `docker/jenkins.yaml`; no omitir ninguna (incluir `SLACK_TEAM`).
 - El diagrama ASCII del flujo CI/CD (sección Objetivo) debe mostrar la frontera CI→CD claramente: Jenkins escribe en Git, ArgoCD lee de Git.
-- Indicar explícitamente que el frontend despliega a Vercel (no a EKS) y que ArgoCD no gestiona el frontend.
-- El paso de bootstrap de ArgoCD debe ser posterior a que el cluster EKS esté disponible (depende del módulo Terraform `eks`).
+- Indicar explícitamente que el frontend despliega a Vercel (no al cluster) y que ArgoCD no gestiona el frontend.
+- El paso de bootstrap de ArgoCD debe ser posterior a que el cluster esté disponible: en dev el cluster K3d lo crea `floci-start` (Etapa 0); en staging/prod depende del módulo Terraform `eks`.
+- Distinguir claramente el flujo **dev (totalmente automatizado por `setup-cicd-pipeline.sh`)** del flujo **staging/prod (manual)**: en dev el controller se levanta solo, los jobs se crean vía `/scriptText`, los webhooks se crean en Gitea, Slack es opcional y las credenciales Sonar/GitOps se autocompletan; en staging/prod se requiere `JENKINS_TOKEN`, configuración manual de webhooks en el SCM y completar `SLACK_*`/`VERCEL_*`.
 
 ---
 
@@ -289,12 +298,12 @@ Secciones en orden exacto:
 2. **Prerrequisitos**
    - Etapas anteriores que deben estar completas
    - Servicios que deben estar corriendo
-3. **Ciclo de Desarrollo Incremental en EKS dev**
-   - Explicar que con la Etapa 2b completada, cada commit que pasa el pipeline CI despliega automáticamente el microservicio en EKS dev vía ArgoCD, sin necesidad de terminar la implementación completa
-   - Tabla de condición mínima para el primer despliegue: contexto Spring arranca sin errores (`Started ...Application in X seconds`), `/actuator/health/readiness` responde `UP` (`readinessProbe` del chart Helm pasa), secret `flexicredit/dev/<servicio>` existe en floci
+3. **Ciclo de Desarrollo Incremental en K3d dev**
+   - Explicar que con la Etapa 2b completada, cada commit que pasa el pipeline CI despliega automáticamente el microservicio en el cluster K3d de dev vía ArgoCD, sin necesidad de terminar la implementación completa
+   - Tabla de condición mínima para el primer despliegue: contexto Spring arranca sin errores (`Started ...Application in X seconds`), `/actuator/health/readiness` responde `UP` (`readinessProbe` del chart Helm pasa), secret `[proyecto]/dev/<servicio>` existe en floci
    - Indicar que esta condición se cumple con el esqueleto generado por el scaffold más la configuración del `application.yml`; no requiere ningún caso de uso implementado
-   - Diagrama ASCII del ciclo por caso de uso: `Implementar caso de uso → mvn test (local) → git push → Jenkins pipeline → bumpImageTag → ArgoCD sync → EKS dev → endpoint disponible`
-   - Indicar que cada caso de uso que se implementa y pushea queda disponible en EKS dev sin intervención manual
+   - Diagrama ASCII del ciclo por caso de uso: `Implementar caso de uso → mvn test (local) → git push → Jenkins pipeline → bumpImageTag → ArgoCD sync → K3d dev → endpoint disponible`
+   - Indicar que cada caso de uso que se implementa y pushea queda disponible en K3d dev sin intervención manual
    > **Cada capa se implementa bajo TDD (Red-Green-Refactor): la prueba descrita en la Sección 8 para esa capa se escribe y se ve fallar ANTES de implementar el código de producción.** Las secciones 4 a 7 describen QUÉ implementar; la prueba que precede a cada elemento está especificada en la Sección 8.
 4. **Capa de Dominio (`domain`)** — _test-first: la prueba de cada invariante/regla precede a su implementación_
    - Entidades a implementar (derivadas del schema.sql y el diseño): nombre, campos clave, reglas de negocio
@@ -330,7 +339,7 @@ Secciones en orden exacto:
 - Derivar las entidades exactamente de las tablas asignadas a ese bounded context en `docs/design/database/SDD-[proyecto]-schema.sql`.
 - Derivar los endpoints exactamente de los paths del bounded context en `docs/design/api/SDD-[proyecto]-openapi.yaml`.
 - Derivar las dependencias REST del diseño de flujos técnicos en `SDD-[proyecto]-design.md`.
-- Los tópicos Kafka deben seguir el patrón `[proyecto].[bounded-context].[evento]` (ej: `flexicredit.originacion.solicitud-radicada`).
+- Los tópicos Kafka deben seguir el patrón `[proyecto].[bounded-context].[evento]` (ej: `[proyecto].originacion.solicitud-radicada`).
 - El orden de implementación dentro del documento es **test-first por capa** (TDD Red-Green-Refactor): dominio → aplicación → infraestructura → rest-api, y dentro de cada capa la prueba se escribe y se ve fallar antes del código de producción. No se documenta una fase de "pruebas al final": las pruebas conducen la implementación de cada capa.
 - Indicar explícitamente el orden de microservicios a implementar en el roadmap según dependencias (los servicios sin dependencias externas primero).
 
@@ -519,8 +528,21 @@ Antes de escribir los archivos, verifica que el directorio `docs/development/` e
 
 # REGLAS IMPORTANTES
 
+- **Parámetros mandatorios por script y template** — todos los scripts `.sh` de `.claude/scripts/` que generan o configuran recursos del proyecto reciben el nombre del proyecto vía `-P <nombre-proyecto>` (obligatorio, sin valor por defecto). Los templates Python de `.claude/templates/` reciben el nombre del componente vía `-n <nombre>` (obligatorio) y el slug del proyecto vía `--org <nombre-proyecto>` (debe coincidir con el `-P` pasado a los scripts). **Nunca omitir estos parámetros en los comandos documentados en los planes de desarrollo.**
+
+  | Script / Template | Parámetro proyecto | Parámetro nombre componente | Obligatorio |
+  |---|---|---|---|
+  | `base-infrastructure-builder.sh` | `-P <nombre-proyecto>` | — | Sí |
+  | `jenkins-shared-library-builder.sh` | `-P <nombre-proyecto>` | — | Sí |
+  | `setup-cicd-pipeline.sh` | `-P <nombre-proyecto>` | — | Sí |
+  | `scaffold-all-services.sh` | `-P <nombre-proyecto>` | — | Sí |
+  | `init-databases.sh` | `-P <nombre-proyecto>` | — | Sí |
+  | `create-all-secrets-dev.sh` | `-P <nombre-proyecto>` | — | Sí |
+  | `maven_hexagonal_scaffold.py` | `--org <nombre-proyecto>` | `-n <nombre-servicio>` | Ambos sí |
+  | `nextjs_feature_scaffold.py` | `--org <nombre-proyecto>` | `-n <nombre-proyecto-fe>` | `-n` sí |
+
 - **TDD es obligatorio y transversal** (ver sección "ESTRATEGIA DE PRUEBAS — TDD"). Todo documento de microservicio (Etapa 3) y de feature frontend (Etapa 4) debe presentar la implementación como **test-first** (Red-Green-Refactor): la prueba precede al código de producción en cada capa/artefacto. No describir una "fase de pruebas al final"; las pruebas conducen cada capa. Los criterios de aceptación de esos documentos deben incluir la verificación de que cada elemento tuvo su prueba escrita primero, que la suite está en verde y que se cumplen los umbrales de cobertura. Backend: JUnit 5 + Mockito + StepVerifier + Testcontainers + WebTestClient; los tipos reactivos se verifican con StepVerifier, nunca con `block()`. Frontend: Vitest + React Testing Library + MSW (unitario) y Playwright bajo ATDD (E2E).
-- NO incluir loops o comandos bash con nombres de servicios o proyectos hardcodeados (ej: `for service in servicio-a servicio-b ...`). En su lugar, referenciar los scripts genéricos de `.claude/scripts/` que usan `find *-service` o `find *-project` para descubrir los componentes dinámicamente: `scaffold-all-services.sh` (generar scaffolding de microservicios y frontend — acepta `--backend nombre:db:messaging:puerto`, `--frontend nombre`, `--bc-tags servicio=BC-XX` y los **cuatro parámetros de BD obligatorios** `-p <pg-db> -m <mongo-db> -u <usuario> -w <clave>`, que reenvía automáticamente a `create-all-secrets-dev.sh` en el paso 11), `init-databases.sh` (crear las bases PostgreSQL y MongoDB con usuario/clave de aplicación, aplicar schema.sql completo y colecciones MongoDB — recibe los **cuatro parámetros obligatorios** `-p <base-postgres> -m <base-mongo> -u <usuario> -w <clave>`; **no genera migraciones Flyway**), `compile-services.sh` (compilar backend), `verify-frontend.sh` (verificar frontend), `create-all-secrets-dev.sh` (crear secrets floci — recibe **cuatro parámetros obligatorios** `-p <pg-db> -m <mongo-db> -u <usuario> -w <clave>`, los mismos valores que `init-databases.sh`; normalmente invocado por `scaffold-all-services.sh`), `setup-cicd-pipeline.sh` (configurar el pipeline CI/CD completo — Jenkins shared library, imagen del controller, bootstrap del cluster, variables JCasC, jobs Jenkins, bootstrap ArgoCD y verificación; todas las secciones son autocontenidas y ejecutables en orden, con el ambiente auto-detectado desde `terraform output`). Si el proceso que se quiere documentar no tiene aún un script genérico, describir el paso como instrucción narrativa, no como loop con nombres fijos.
+- NO incluir loops o comandos bash con nombres de servicios o proyectos hardcodeados (ej: `for service in servicio-a servicio-b ...`). En su lugar, referenciar los scripts genéricos de `.claude/scripts/` que usan `find *-service` o `find *-project` para descubrir los componentes dinámicamente: `scaffold-all-services.sh` (generar scaffolding de microservicios y frontend — recibe **`-P <nombre-proyecto>`** obligatorio más `--backend nombre:db:messaging:puerto`, `--frontend nombre`, `--bc-tags servicio=BC-XX` y los **cuatro parámetros de BD obligatorios** `-p <pg-db> -m <mongo-db> -u <usuario> -w <clave>`, que reenvía automáticamente a `create-all-secrets-dev.sh` en el paso 11), `init-databases.sh` (crear las bases PostgreSQL y MongoDB con usuario/clave de aplicación, aplicar schema.sql completo y colecciones MongoDB — recibe **`-P <nombre-proyecto>`** obligatorio más los **cuatro parámetros de BD obligatorios** `-p <base-postgres> -m <base-mongo> -u <usuario> -w <clave>`; **no genera migraciones Flyway**), `compile-services.sh` (compilar backend), `verify-frontend.sh` (verificar frontend), `create-all-secrets-dev.sh` (crear secrets floci — recibe **`-P <nombre-proyecto>`** obligatorio más los **cuatro parámetros de BD obligatorios** `-p <pg-db> -m <mongo-db> -u <usuario> -w <clave>`, los mismos valores que `init-databases.sh`; normalmente invocado por `scaffold-all-services.sh`), `setup-cicd-pipeline.sh` (configurar el pipeline CI/CD completo — recibe **`-P <nombre-proyecto>`** obligatorio; orquesta Jenkins shared library, imagen del controller, bootstrap del cluster, variables JCasC, jobs Jenkins, bootstrap ArgoCD y verificación; todas las secciones son autocontenidas y ejecutables en orden, con el ambiente auto-detectado desde `terraform output`. **En dev es totalmente autónomo:** levanta el controller (`docker run`), autocompleta `SONAR_*` desde `.sonar-env` y `GITOPS_*` con `gitea-admin`, crea los jobs multibranch vía `/scriptText` y los webhooks en Gitea; Slack es opcional). Si el proceso que se quiere documentar no tiene aún un script genérico, describir el paso como instrucción narrativa, no como loop con nombres fijos.
 - NO generar código de aplicación dentro de los documentos de plan. Los documentos describen QUÉ implementar y cómo estructurarlo, no contienen implementaciones completas.
 - SÍ incluir fragmentos de código ilustrativos (firmas de métodos, ejemplos de configuración, comandos exactos) cuando sea necesario para claridad.
 - Las rutas de archivos en comandos deben ser relativas al directorio raíz del repositorio.

@@ -8,8 +8,9 @@
 #
 # Uso:
 #   bash .claude/scripts/create-all-secrets-dev.sh \
-#     -p <pg-db> -m <mongo-db> -u <usuario> -w <clave>
+#     -P <proyecto> -p <pg-db> -m <mongo-db> -u <usuario> -w <clave>
 #
+#   -P, --project  NOMBRE   Slug del proyecto (prefijo de secrets <proyecto>/dev)  (obligatorio)
 #   -p, --pg-db    NOMBRE   Base de datos PostgreSQL (obligatorio)
 #   -m, --mongo-db NOMBRE   Base de datos MongoDB    (obligatorio)
 #   -u, --user     NOMBRE   Usuario de aplicación    (obligatorio)
@@ -30,7 +31,7 @@ BACKEND_DIR="${REPO_ROOT}/backend"
 TF_DEV_DIR="${REPO_ROOT}/terraform/backend/environments/dev"
 FLOCI_ENDPOINT="${FLOCI_ENDPOINT:-http://localhost:4566}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
-SECRET_PREFIX="flexicredit/dev"
+SECRET_PREFIX=""   # se deriva de -P/--project: <proyecto>/dev
 
 AWS_CMD="aws --endpoint-url=$FLOCI_ENDPOINT --region $AWS_REGION"
 
@@ -47,18 +48,20 @@ HEADER() {
 }
 
 # ── Parámetros ────────────────────────────────────────────────────────────────
+PROJECT_NAME=""
 PG_DB_NAME=""
 MONGO_DB_NAME=""
 DB_USER=""
 DB_PASSWORD=""
 
 usage() {
-  sed -n '9,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '9,17p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
   exit "${1:-0}"
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    -P|--project)  PROJECT_NAME="$2";  shift 2 ;;
     -p|--pg-db)    PG_DB_NAME="$2";    shift 2 ;;
     -m|--mongo-db) MONGO_DB_NAME="$2"; shift 2 ;;
     -u|--user)     DB_USER="$2";       shift 2 ;;
@@ -69,6 +72,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 MISSING_ARGS=()
+[[ -z "$PROJECT_NAME"  ]] && MISSING_ARGS+=("-P/--project")
 [[ -z "$PG_DB_NAME"    ]] && MISSING_ARGS+=("-p/--pg-db")
 [[ -z "$MONGO_DB_NAME" ]] && MISSING_ARGS+=("-m/--mongo-db")
 [[ -z "$DB_USER"       ]] && MISSING_ARGS+=("-u/--user")
@@ -78,6 +82,8 @@ if [[ ${#MISSING_ARGS[@]} -gt 0 ]]; then
   log_err "Faltan parámetros obligatorios: ${MISSING_ARGS[*]}"
   usage 1
 fi
+
+SECRET_PREFIX="${PROJECT_NAME}/dev"
 
 # ── Dependencias ──────────────────────────────────────────────────────────────
 for dep in aws jq terraform; do

@@ -11,13 +11,13 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
-def get_yaml_content(project_name: str, database: str, messaging_system: str, port: int = 8080) -> str:
+def get_yaml_content(project_name: str, database: str, messaging_system: str, port: int = 8080, org: str = "myproject") -> str:
     lines = [
         "spring:",
         "  application:",
         f"    name: {project_name}",
         "  config:",
-        f'    import: "aws-secretsmanager:/flexicredit/${{APP_ENV:dev}}/{project_name}"',
+        f'    import: "aws-secretsmanager:/{org}/${{APP_ENV:dev}}/{project_name}"',
         "  cloud:",
         "    aws:",
         "      region:",
@@ -76,7 +76,7 @@ spring:
 """
 
 
-def get_secrets_setup_content(project_name: str, database: str, messaging_system: str, port: int = 8080) -> str:
+def get_secrets_setup_content(project_name: str, database: str, messaging_system: str, port: int = 8080, org: str = "myproject") -> str:
     secret: dict = {"SERVER_PORT": str(port)}
     if database.lower() == "mongo":
         secret["MONGODB_URI"] = "mongodb://localhost:27017/mydb"
@@ -103,7 +103,7 @@ def get_secrets_setup_content(project_name: str, database: str, messaging_system
 # Crea (o actualiza) el secret de desarrollo en floci (emulador AWS).
 # Requiere que floci esté corriendo en http://localhost:4566.
 
-SECRET_NAME="flexicredit/dev/{project_name}"
+SECRET_NAME="{org}/dev/{project_name}"
 ENDPOINT="http://localhost:4566"
 REGION="us-east-1"
 
@@ -176,7 +176,7 @@ ENTRYPOINT ["java", "-jar", "app.jar"]
 """
 
 
-def get_jenkinsfile_content(project_name: str, database: str) -> str:
+def get_jenkinsfile_content(project_name: str, database: str, org: str = "myproject") -> str:
     """Jenkinsfile declarativo genérico parametrizado por servicio.
 
     Delega en la Shared Library `jenkins-shared-library` y se mantiene mínimo:
@@ -184,6 +184,9 @@ def get_jenkinsfile_content(project_name: str, database: str) -> str:
     parámetros.
     """
     db_type = "mongo" if database.lower() == "mongo" else "postgres"
+    # Slug saneado para el path del recurso (debe coincidir con el paquete
+    # org.<slug> de la Shared Library: sin guiones ni mayúsculas).
+    lib_org = "".join(c for c in org.lower() if c.isascii() and c.isalnum()) or "myproject"
 
     template = """\
 @Library('jenkins-shared-library@main') _
@@ -195,10 +198,11 @@ def get_jenkinsfile_content(project_name: str, database: str) -> str:
 // (vars/) para mantener este archivo mínimo.
 //
 // Modelo de agentes: Kubernetes plugin. Todo el pipeline corre en un único pod
-// efímero en EKS (definido en org/flexicredit/podBackend.yaml de la Shared
-// Library), por lo que el workspace se comparte entre stages sin stash/unstash.
-// El pod usa el ServiceAccount 'jenkins-agent' (IRSA) para autenticar kaniko
-// (push a ECR). El despliegue NO ocurre aquí: este pipeline es CI y su frontera
+// efímero (definido en org/__LIB_ORG__/podBackend.yaml de la Shared Library) en
+// el cluster del ambiente: EKS en staging/prod, K3d en dev. El workspace se
+// comparte entre stages sin stash/unstash. El pod usa el ServiceAccount
+// 'jenkins-agent': IRSA para kaniko→ECR en staging/prod; en dev kaniko empuja al
+// registry de k3d (HTTP). El despliegue NO ocurre aquí: este pipeline es CI y su frontera
 // con el CD es escribir el nuevo image tag en Git (bumpImageTag). El CD lo hace
 // ArgoCD por GitOps (auto-sync en dev/staging; sync manual en prod). Ver el
 // módulo Terraform 'argocd'.
@@ -208,7 +212,7 @@ pipeline {
     agent {
         kubernetes {
             defaultContainer 'maven'
-            yaml libraryResource('org/flexicredit/podBackend.yaml')
+            yaml libraryResource('org/__LIB_ORG__/podBackend.yaml')
         }
     }
 
@@ -325,7 +329,10 @@ pipeline {
     }
 }
 """
-    return template.replace("__SERVICE_NAME__", project_name).replace("__DB_TYPE__", db_type)
+    return (template
+            .replace("__SERVICE_NAME__", project_name)
+            .replace("__DB_TYPE__", db_type)
+            .replace("__LIB_ORG__", lib_org))
 
 
 def get_dockerignore_content() -> str:
@@ -1024,7 +1031,7 @@ public class MessageConsumer {{
     logger.info("Módulo kafka-consumer generado")
 
 
-def scaffold(project_name: str, database: str, messaging_system: str, port: int = 8080) -> None:
+def scaffold(project_name: str, database: str, messaging_system: str, port: int = 8080, org: str = "myproject") -> None:
     safe_name = project_name.replace("-", "")
     root = Path(project_name)
     logger.info("Creando proyecto: %s (db=%s, messaging=%s, port=%d)", project_name, database, messaging_system, port)
@@ -1142,7 +1149,7 @@ public class ApplicationConfig {{
 
             resources_dir = root / module / "src/main/resources"
             resources_dir.mkdir(parents=True, exist_ok=True)
-            (resources_dir / "application.yml").write_text(get_yaml_content(project_name, database, messaging_system, port))
+            (resources_dir / "application.yml").write_text(get_yaml_content(project_name, database, messaging_system, port, org))
             (resources_dir / "application-dev.yml").write_text(get_dev_yaml_content())
             logger.debug("application.yml creado en: %s", resources_dir)
 
@@ -1160,7 +1167,7 @@ public class ApplicationConfig {{
     secrets_dir = root / "scripts"
     secrets_dir.mkdir(parents=True, exist_ok=True)
     secrets_script = secrets_dir / "create-secrets-dev.sh"
-    secrets_script.write_text(get_secrets_setup_content(project_name, database, messaging_system, port))
+    secrets_script.write_text(get_secrets_setup_content(project_name, database, messaging_system, port, org))
     secrets_script.chmod(0o755)
     logger.debug("scripts/create-secrets-dev.sh creado")
 
@@ -1196,7 +1203,7 @@ bin/
     (root / ".dockerignore").write_text(get_dockerignore_content())
     logger.debug(".dockerignore creado")
 
-    (root / "Jenkinsfile").write_text(get_jenkinsfile_content(project_name, database))
+    (root / "Jenkinsfile").write_text(get_jenkinsfile_content(project_name, database, org))
     logger.debug("Jenkinsfile creado")
 
     # Helm chart consumido por deployToEks() de la Shared Library.
@@ -1209,12 +1216,12 @@ bin/
 
     logger.info("Proyecto creado exitosamente en: %s", root.resolve())
     _update_terraform_services(project_name)
-    _update_argocd_applicationset(project_name)
-    _setup_gitea_repo(project_name, root)
-    _print_run_instructions(project_name, root, messaging_system, port)
+    _update_argocd_applicationset(project_name, org)
+    _setup_gitea_repo(project_name, root, org)
+    _print_run_instructions(project_name, root, messaging_system, port, org)
 
 
-def _setup_gitea_repo(project_name: str, root: Path) -> None:
+def _setup_gitea_repo(project_name: str, root: Path, org: str = "myproject") -> None:
     import base64
     import json as _json
     import subprocess
@@ -1222,7 +1229,6 @@ def _setup_gitea_repo(project_name: str, root: Path) -> None:
     import urllib.request
 
     gitea_host = "http://localhost:3000"
-    org = "flexicredit"
     credentials = base64.b64encode(b"gitea-admin:gitea-admin").decode()
 
     try:
@@ -1252,6 +1258,12 @@ def _setup_gitea_repo(project_name: str, root: Path) -> None:
     except urllib.error.HTTPError as e:
         if e.code == 409:
             logger.info("[Gitea] Repo %s/%s ya existe.", org, project_name)
+        elif e.code == 401:
+            logger.warning(
+                "[Gitea] HTTP 401: el usuario admin no existe. Correr "
+                "base-infrastructure-builder.sh primero."
+            )
+            return
         else:
             logger.warning("[Gitea] No se pudo crear el repo: HTTP %s", e.code)
             return
@@ -1260,26 +1272,34 @@ def _setup_gitea_repo(project_name: str, root: Path) -> None:
         subprocess.run(["git", "init", "-q", "-b", "main"], cwd=root, check=True)
         result = subprocess.run(["git", "config", "user.email"], cwd=root, capture_output=True)
         if result.returncode != 0:
-            subprocess.run(["git", "config", "user.email", "cicd@flexicredit.local"], cwd=root, check=True)
-            subprocess.run(["git", "config", "user.name", "FlexiCredit CI"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.email", f"cicd@{org}.local"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", f"{org} CI"], cwd=root, check=True)
         subprocess.run(["git", "add", "-A"], cwd=root, check=True)
         subprocess.run(["git", "commit", "-q", "-m", f"chore: scaffold {project_name}"], cwd=root, check=True)
         remote_url = f"{gitea_host}/{org}/{project_name}.git"
         subprocess.run(["git", "remote", "add", "origin", remote_url], cwd=root, check=False)
         logger.info("[Gitea] Remote 'origin' → %s", remote_url)
         logger.info("[Gitea] URL interna (Jenkins/ArgoCD): http://gitea:3000/%s/%s.git", org, project_name)
-        logger.info("[Gitea] Para publicar: cd %s && git push -u origin main", root)
+        # Auto-push con credenciales embebidas (sin guardarlas en .git/config).
+        push_url = remote_url.replace("http://", "http://gitea-admin:gitea-admin@", 1)
+        push = subprocess.run(
+            ["git", "push", push_url, "main"], cwd=root, capture_output=True
+        )
+        if push.returncode == 0:
+            logger.info("[Gitea] Push a %s/%s completado (rama main).", org, project_name)
+        else:
+            logger.info("[Gitea] Para publicar: cd %s && git push -u origin main", root)
     except (subprocess.CalledProcessError, FileNotFoundError) as e:
         logger.warning("[Gitea] No se pudo inicializar el repo git: %s", e)
 
 
-def _update_argocd_applicationset(service_name: str) -> None:
+def _update_argocd_applicationset(service_name: str, org: str = "myproject") -> None:
     repo_root = Path(__file__).parent.parent.parent
     envs = ["dev", "staging", "prod"]
     sentinel = "          # -- services managed by scaffold --\n"
     entry = (
         f"          - service: {service_name}\n"
-        f"            repoURL: http://gitea:3000/flexicredit/{service_name}.git\n"
+        f"            repoURL: http://gitea:3000/{org}/{service_name}.git\n"
         f"            revision: main\n"
     )
 
@@ -1335,7 +1355,7 @@ def _update_terraform_services(service_name: str) -> None:
         logger.info("[Terraform] Agregado '%s' a services en %s", service_name, env)
 
 
-def _print_run_instructions(project_name: str, root: Path, messaging_system: str, port: int = 8080) -> None:
+def _print_run_instructions(project_name: str, root: Path, messaging_system: str, port: int = 8080, org: str = "myproject") -> None:
     rabbit_note = ""
     if messaging_system.lower() in ("rabbit-producer", "rabbit-consumer"):
         rabbit_note = "\n  # Asegúrate de tener RabbitMQ corriendo antes de iniciar:\n  docker run -d --name rabbitmq -p 5672:5672 -p 15672:15672 rabbitmq:3-management\n"
@@ -1387,7 +1407,7 @@ def _print_run_instructions(project_name: str, root: Path, messaging_system: str
 
  ── AWS Secrets Manager ────────────────────────────────────────────────
 
- Secret path:  flexicredit/<APP_ENV>/{project_name}
+ Secret path:  {org}/<APP_ENV>/{project_name}
  Perfil dev:   application-dev.yml apunta a floci (http://localhost:4566)
  Staging/prod: usa IRSA (ServiceAccount 'jenkins-agent' en EKS), sin credenciales
                hardcodeadas. Cambiar APP_ENV=staging|prod al desplegar.
@@ -1411,6 +1431,11 @@ def main() -> None:
                         help="Sistema de mensajería a configurar")
     parser.add_argument("-p", "--port", type=int, default=8080,
                         metavar="PORT", help="Puerto HTTP del servidor (default: 8080)")
+    parser.add_argument("--org", default="myproject", metavar="ORG",
+                        help="Slug del proyecto/organización. Se usa para el prefijo de "
+                             "secrets (<org>/dev/<servicio>), la organización Gitea y el "
+                             "paquete de la Shared Library (org.<org>). Debe coincidir con "
+                             "el -P/--project usado en los scripts. (default: myproject)")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Mostrar logs detallados (DEBUG)")
 
@@ -1425,7 +1450,7 @@ def main() -> None:
     )
 
     try:
-        scaffold(args.service_name, args.database, args.messaging_system, args.port)
+        scaffold(args.service_name, args.database, args.messaging_system, args.port, args.org)
     except OSError as e:
         logger.error("No se pudo crear el proyecto: %s", e)
         sys.exit(1)

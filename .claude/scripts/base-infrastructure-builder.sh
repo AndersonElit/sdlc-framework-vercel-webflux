@@ -6,7 +6,38 @@ log() { echo "[$(date '+%H:%M:%S')] $*"; }
 log_ok() { echo "[$(date '+%H:%M:%S')] OK  $*"; }
 log_err() { echo "[$(date '+%H:%M:%S')] ERR $*" >&2; }
 
-log "Iniciando floci-start..."
+# ---------------------------------------------------------------------------
+# Argumentos
+# ---------------------------------------------------------------------------
+PROJECT_NAME=""
+usage() {
+  cat <<USAGE
+Uso: $0 -P <proyecto>
+
+  -P, --project NOMBRE   Slug del proyecto en minúsculas (p. ej. 'mibanco').
+                         Nombra el cluster K3d (<proyecto>-dev), su registry,
+                         la organización Gitea, el contenedor Kafka, la base
+                         PostgreSQL de dev (<proyecto>_dev) y los recursos
+                         emitidos en el árbol Terraform. (obligatorio)
+                         Recomendado: solo [a-z0-9-]; sin guiones para máxima
+                         compatibilidad con nombres de base de datos.
+USAGE
+  exit "${1:-0}"
+}
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -P|--project) PROJECT_NAME="${2:-}"; shift 2 ;;
+    --project=*)  PROJECT_NAME="${1#*=}"; shift ;;
+    -h|--help)    usage 0 ;;
+    *) log_err "Argumento desconocido: $1"; usage 1 ;;
+  esac
+done
+if [[ -z "$PROJECT_NAME" ]]; then
+  log_err "Falta el parámetro obligatorio -P/--project."
+  usage 1
+fi
+
+log "Iniciando floci-start (proyecto: $PROJECT_NAME)..."
 
 log "Verificando dependencias..."
 check_cmd() {
@@ -19,6 +50,15 @@ check_cmd() {
 }
 check_cmd docker
 check_cmd terraform
+check_cmd k3d
+check_cmd kubectl
+
+# El prune de Docker de más abajo borraría los contenedores del cluster K3d, pero
+# dejaría a k3d con estado inconsistente (cluster "fantasma"). Lo eliminamos limpio
+# primero para poder recrearlo desde cero.
+log "Eliminando cluster K3d previo (si existe)..."
+k3d cluster delete "${PROJECT_NAME}-dev" &>/dev/null && log_ok "Cluster K3d ${PROJECT_NAME}-dev eliminado." || log "No había cluster K3d previo."
+k3d registry delete "k3d-${PROJECT_NAME}-registry" &>/dev/null || true
 
 log "Deteniendo contenedores activos..."
 if docker ps -aq | grep -q .; then
@@ -92,18 +132,18 @@ log_ok "MongoDB listo (interno floci-mongo:27017 / host localhost:27017)."
 # dev (enabled=false) y reservado para staging/prod (AWS real).
 #
 # Doble listener para cubrir ambos consumidores:
-#   - INTERNAL (flexicredit-kafka-dev:9092) → microservicios como contenedores en floci-net.
+#   - INTERNAL (<proyecto>-kafka-dev:9092) → microservicios como contenedores en floci-net.
 #   - EXTERNAL (localhost:29092)            → herramientas/CLI desde el host.
 # ---------------------------------------------------------------------------
 log "Levantando contenedor Apache Kafka (dev, KRaft)..."
 docker run -d \
-  --name flexicredit-kafka-dev \
+  --name "${PROJECT_NAME}-kafka-dev" \
   --network floci-net \
   -p 29092:29092 \
   -e KAFKA_NODE_ID=1 \
   -e KAFKA_PROCESS_ROLES=broker,controller \
   -e KAFKA_LISTENERS=INTERNAL://0.0.0.0:9092,EXTERNAL://0.0.0.0:29092,CONTROLLER://0.0.0.0:9093 \
-  -e KAFKA_ADVERTISED_LISTENERS=INTERNAL://flexicredit-kafka-dev:9092,EXTERNAL://localhost:29092 \
+  -e KAFKA_ADVERTISED_LISTENERS=INTERNAL://${PROJECT_NAME}-kafka-dev:9092,EXTERNAL://localhost:29092 \
   -e KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT \
   -e KAFKA_INTER_BROKER_LISTENER_NAME=INTERNAL \
   -e KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER \
@@ -113,7 +153,7 @@ docker run -d \
   -e KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1 \
   -e KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS=0 \
   apache/kafka:3.7.0
-log_ok "Apache Kafka listo (interno flexicredit-kafka-dev:9092 / host localhost:29092)."
+log_ok "Apache Kafka listo (interno ${PROJECT_NAME}-kafka-dev:9092 / host localhost:29092)."
 
 # ---------------------------------------------------------------------------
 # Gitea (servidor Git local para dev)
@@ -159,30 +199,41 @@ if [[ "$GITEA_READY" -eq 0 ]]; then
 fi
 
 log "Creando usuario admin en Gitea..."
-docker exec gitea gitea admin user create \
+# IMPORTANTE: 'docker exec' entra como root y Gitea aborta con
+# "[F] Gitea is not supposed to be run as root". Hay que correr el CLI
+# como el usuario 'git' del contenedor, si no el usuario admin nunca se crea.
+docker exec -u git gitea gitea admin user create \
   --username gitea-admin \
   --password gitea-admin \
-  --email admin@flexicredit.local \
+  --email "admin@${PROJECT_NAME}.local" \
   --admin \
   --must-change-password=false 2>/dev/null \
   && log_ok "Usuario gitea-admin creado." \
-  || log "Usuario gitea-admin ya existe."
+  || log "Usuario gitea-admin ya existe (o se omitió la creación)."
 
 GITEA_API="http://localhost:3000/api/v1"
 GITEA_AUTH="gitea-admin:gitea-admin"
 
-log "Creando organización flexicredit en Gitea..."
+# Verificar que la autenticación realmente funcione antes de seguir.
+# Un fallo silencioso aquí deja a la org y a todos los repos sin crear (HTTP 401).
+if ! curl -sf -u "$GITEA_AUTH" "$GITEA_API/user" &>/dev/null; then
+  log_err "Autenticación gitea-admin falló (HTTP 401): el usuario admin no quedó creado."
+  log_err "Revisar: docker exec -u git gitea gitea admin user list"
+  exit 1
+fi
+
+log "Creando organización $PROJECT_NAME en Gitea..."
 curl -sf -u "$GITEA_AUTH" -X POST "$GITEA_API/orgs" \
   -H "Content-Type: application/json" \
-  -d '{"username":"flexicredit","visibility":"private","repo_admin_change_team_access":true}' \
+  -d "{\"username\":\"${PROJECT_NAME}\",\"visibility\":\"private\",\"repo_admin_change_team_access\":true}" \
   &>/dev/null \
-  && log_ok "Organización flexicredit creada." \
-  || log "Organización flexicredit ya existe."
+  && log_ok "Organización $PROJECT_NAME creada." \
+  || log "Organización $PROJECT_NAME ya existe."
 
 log_ok "Gitea listo."
 log "  UI:           http://localhost:3000"
 log "  Credenciales: gitea-admin / gitea-admin"
-log "  Organización: flexicredit"
+log "  Organización: $PROJECT_NAME"
 log "  Los repositorios se crean bajo esta organización a medida que se generan"
 log "  los servicios con los scripts de scaffold y jenkins-shared-library-builder.sh"
 
@@ -212,10 +263,151 @@ mkdir -p \
   "$TF_BACKEND/modules/msk" \
   "$TF_BACKEND/modules/argocd" \
   "$TF_BACKEND/environments/dev" \
+  "$TF_BACKEND/environments/dev/argocd-bootstrap" \
+  "$TF_BACKEND/environments/dev/.kube" \
   "$TF_BACKEND/environments/staging" \
   "$TF_BACKEND/environments/staging/argocd-bootstrap" \
   "$TF_BACKEND/environments/prod" \
   "$TF_BACKEND/environments/prod/argocd-bootstrap"
+
+# ---------------------------------------------------------------------------
+# Cluster Kubernetes de dev — K3d (K3s en Docker)
+# ---------------------------------------------------------------------------
+# El EKS de floci es solo emulación de metadatos (no hay API server real ni pods),
+# así que el lazo CI/CD completo (Jenkins build → push → bumpImageTag → ArgoCD sync
+# → pods) no puede cerrarse en dev. K3d levanta un Kubernetes REAL en contenedores
+# Docker sobre la misma red floci-net, con un registry propio. Sobre él se instala
+# ArgoCD (módulo terraform 'argocd' en dev) y Jenkins (contenedor en floci-net)
+# lanza agentes como pods. Reemplaza por completo a EKS en dev.
+#
+# Nombres derivados de $PROJECT_NAME (referenciados por los providers de Terraform
+# y el JCasC de Jenkins):
+#   - cluster:        <proyecto>-dev   (contexto kubeconfig: k3d-<proyecto>-dev)
+#   - API interno:    https://k3d-<proyecto>-dev-serverlb:6443  (desde floci-net)
+#   - registry:       k3d-<proyecto>-registry:5100 (floci-net) / localhost:5100 (host)
+#
+# Se generan DOS kubeconfig:
+#   - .kube/config-k3d           → server en localhost:<port>, para Terraform (host).
+#   - .kube/config-k3d-internal  → server en serverlb:6443, para Jenkins (contenedor).
+KUBE_DIR="$TF_BACKEND/environments/dev/.kube"
+
+# ---------------------------------------------------------------------------
+# SonarQube (quality gate del pipeline CI en dev).
+# Se levanta ANTES del cluster K3d para que k3d lo inyecte en CoreDNS como
+# miembro de floci-net; así los agentes (pods) resuelven http://<name>:9000
+# al correr `mvn sonar:sonar`. La URL + token se persisten en .sonar-env para
+# que setup-cicd-pipeline.sh los cargue en .env.jenkins sin intervención manual.
+# El bloque es no-fatal: si SonarQube falla, la infra sigue y Sonar queda pendiente.
+# ---------------------------------------------------------------------------
+SONAR_CONTAINER="${PROJECT_NAME}-sonarqube"
+SONAR_URL_INTERNAL="http://${SONAR_CONTAINER}:9000"   # desde floci-net (agentes K3d)
+SONAR_ADMIN_PASS="sonar-admin-dev"
+SONAR_ENV_FILE="$TF_BACKEND/environments/dev/.sonar-env"
+
+log "Verificando vm.max_map_count (requerido por Elasticsearch de SonarQube)..."
+CURRENT_MMC=$(sysctl -n vm.max_map_count 2>/dev/null || echo 0)
+if [[ "$CURRENT_MMC" -lt 262144 ]]; then
+  if sudo -n sysctl -w vm.max_map_count=262144 &>/dev/null; then
+    log_ok "vm.max_map_count elevado a 262144."
+  else
+    log "vm.max_map_count=$CURRENT_MMC (< 262144) y no se pudo elevar sin sudo."
+    log "  SonarQube arranca igual (SONAR_ES_BOOTSTRAP_CHECKS_DISABLE=true), pero si"
+    log "  crashea, ejecutá: sudo sysctl -w vm.max_map_count=262144"
+  fi
+else
+  log_ok "vm.max_map_count=$CURRENT_MMC (>= 262144)."
+fi
+
+log "Levantando contenedor SonarQube (dev)..."
+docker run -d \
+  --name "$SONAR_CONTAINER" \
+  --network floci-net \
+  -p 9000:9000 \
+  -e SONAR_ES_BOOTSTRAP_CHECKS_DISABLE=true \
+  sonarqube:lts-community >/dev/null
+
+log "Esperando que SonarQube esté listo (puede tardar 1-2 min)..."
+SONAR_READY=0
+for _ in $(seq 1 90); do
+  status=$(curl -s http://localhost:9000/api/system/status 2>/dev/null | grep -o '"status":"[A-Z]*"' | cut -d'"' -f4 || true)
+  if [[ "$status" == "UP" ]]; then
+    SONAR_READY=1
+    break
+  fi
+  sleep 3
+done
+
+if [[ "$SONAR_READY" -eq 0 ]]; then
+  log_err "SonarQube no respondió UP (~4.5 min). Revisá: docker logs $SONAR_CONTAINER"
+  log_err "  La infra continúa; SONAR_URL/SONAR_TOKEN quedarán pendientes en .env.jenkins."
+else
+  log_ok "SonarQube listo (interno $SONAR_URL_INTERNAL / host http://localhost:9000)."
+  # Cambiar password admin (admin/admin → fijo de dev). Fresh container cada run.
+  curl -s -u admin:admin -X POST \
+    "http://localhost:9000/api/users/change_password?login=admin&previousPassword=admin&password=${SONAR_ADMIN_PASS}" \
+    -o /dev/null && log_ok "Password admin de SonarQube actualizado." \
+    || log "Password admin ya estaba cambiado (o se omitió)."
+  # Generar token para Jenkins (revoca el previo del mismo nombre → idempotente).
+  curl -s -u "admin:${SONAR_ADMIN_PASS}" -X POST \
+    "http://localhost:9000/api/user_tokens/revoke?name=jenkins-ci" -o /dev/null || true
+  SONAR_TOKEN_VALUE=$(curl -s -u "admin:${SONAR_ADMIN_PASS}" -X POST \
+    "http://localhost:9000/api/user_tokens/generate?name=jenkins-ci" 2>/dev/null \
+    | grep -o '"token":"[^"]*"' | cut -d'"' -f4 || true)
+  if [[ -n "$SONAR_TOKEN_VALUE" ]]; then
+    mkdir -p "$TF_BACKEND/environments/dev"
+    cat > "$SONAR_ENV_FILE" <<EOFSONAR
+SONAR_URL=${SONAR_URL_INTERNAL}
+SONAR_TOKEN=${SONAR_TOKEN_VALUE}
+EOFSONAR
+    log_ok "Token de SonarQube generado y persistido en $SONAR_ENV_FILE."
+  else
+    log_err "No se pudo generar el token de SonarQube. Revisá: docker logs $SONAR_CONTAINER"
+  fi
+fi
+
+log "Levantando cluster K3d (${PROJECT_NAME}-dev) en floci-net..."
+k3d cluster create "${PROJECT_NAME}-dev" \
+  --network floci-net \
+  --registry-create "${PROJECT_NAME}-registry:0.0.0.0:5100" \
+  --servers 1 \
+  --agents 1 \
+  --kubeconfig-update-default=false \
+  --kubeconfig-switch-context=false \
+  --wait
+log_ok "Cluster K3d ${PROJECT_NAME}-dev creado (registry k3d-${PROJECT_NAME}-registry:5100)."
+
+log "Generando kubeconfig de K3d..."
+# Variante host (Terraform corre en el host): server en localhost:<puerto mapeado>.
+k3d kubeconfig get "${PROJECT_NAME}-dev" > "$KUBE_DIR/config-k3d"
+
+# Variante interna (Jenkins corre como contenedor en floci-net): el API server se
+# alcanza por el hostname del load balancer de k3d en floci-net. Se omite la
+# verificación TLS porque el SAN del cert no necesariamente incluye ese hostname.
+cp "$KUBE_DIR/config-k3d" "$KUBE_DIR/config-k3d-internal"
+kubectl --kubeconfig "$KUBE_DIR/config-k3d-internal" config set-cluster "k3d-${PROJECT_NAME}-dev" \
+  --server="https://k3d-${PROJECT_NAME}-dev-serverlb:6443" >/dev/null
+kubectl --kubeconfig "$KUBE_DIR/config-k3d-internal" config set-cluster "k3d-${PROJECT_NAME}-dev" \
+  --insecure-skip-tls-verify=true >/dev/null
+# insecure-skip-tls-verify y certificate-authority-data son mutuamente excluyentes.
+kubectl --kubeconfig "$KUBE_DIR/config-k3d-internal" config unset "clusters.k3d-${PROJECT_NAME}-dev.certificate-authority-data" >/dev/null
+
+log "Esperando a que el API server de K3d responda..."
+K3D_READY=0
+for i in $(seq 1 30); do
+  if kubectl --kubeconfig "$KUBE_DIR/config-k3d" get nodes &>/dev/null; then
+    K3D_READY=1
+    break
+  fi
+  sleep 2
+done
+if [[ "$K3D_READY" -eq 0 ]]; then
+  log_err "El cluster K3d no respondió en 60 s. Revisar: k3d cluster list / docker logs k3d-${PROJECT_NAME}-dev-server-0"
+  exit 1
+fi
+log_ok "K3d listo."
+log "  kubeconfig (host):     $KUBE_DIR/config-k3d   (contexto k3d-${PROJECT_NAME}-dev)"
+log "  kubeconfig (Jenkins):  $KUBE_DIR/config-k3d-internal"
+log "  Registry:              k3d-${PROJECT_NAME}-registry:5100 (floci-net) / localhost:5100 (host)"
 
 # ===========================================================================
 # FRONTEND — provider Vercel
@@ -305,10 +497,10 @@ variable "api_url" {
 }
 EOF
 
-cat > "$TF_FRONTEND/environments/dev/main.tf" << 'EOF'
+cat > "$TF_FRONTEND/environments/dev/main.tf" << EOF
 module "frontend" {
   source       = "../../modules/vercel-project"
-  project_name = "my-app-dev"
+  project_name = "${PROJECT_NAME}-dev"
   api_url      = var.api_url
 }
 EOF
@@ -356,7 +548,7 @@ EOF
 cat > "$TF_FRONTEND/environments/$env/main.tf" << EOF
 module "frontend" {
   source       = "../../modules/vercel-project"
-  project_name = "my-app-${env}"
+  project_name = "${PROJECT_NAME}-${env}"
   api_url      = var.api_url
 }
 EOF
@@ -853,14 +1045,19 @@ resource "aws_iam_policy" "ecr_pull" {
   }
 }
 
-resource "aws_iam_role_policy_attachment" "task_secrets" {
-  role       = aws_iam_role.ecs_task.name
-  policy_arn = aws_iam_policy.secrets_read.arn
-}
-
 resource "aws_iam_role_policy_attachment" "task_ecr" {
   role       = aws_iam_role.ecs_task.name
   policy_arn = aws_iam_policy.ecr_pull.arn
+}
+
+resource "aws_iam_role_policy_attachment" "task_secrets" {
+  role       = aws_iam_role.ecs_task.name
+  policy_arn = aws_iam_policy.secrets_read.arn
+
+  # Floci pierde una de dos llamadas AttachRolePolicy concurrentes sobre el mismo
+  # rol (race en su IAM): la relectura devuelve "empty result". Serializar ambas
+  # attachments evita la carrera. Inofensivo en AWS real (solo algo más lento).
+  depends_on = [aws_iam_role_policy_attachment.task_ecr]
 }
 EOF
 
@@ -2912,6 +3109,30 @@ terraform {
       source  = "hashicorp/tls"
       version = "~> 4.0"
     }
+    helm = {
+      source  = "hashicorp/helm"
+      version = "~> 2.12"
+    }
+    kubernetes = {
+      source  = "hashicorp/kubernetes"
+      version = "~> 2.30"
+    }
+  }
+}
+
+# Providers Kubernetes/Helm apuntando al cluster K3d local (lo crea floci-start con
+# `k3d cluster create flexicredit-dev`). A diferencia de staging/prod (EKS, auth por
+# `aws eks get-token`), aquí la autenticación es por certificado de cliente del
+# kubeconfig que k3d genera. El cluster debe existir antes de `terraform apply`.
+provider "kubernetes" {
+  config_path    = "${path.module}/.kube/config-k3d"
+  config_context = "k3d-flexicredit-dev"
+}
+
+provider "helm" {
+  kubernetes {
+    config_path    = "${path.module}/.kube/config-k3d"
+    config_context = "k3d-flexicredit-dev"
   }
 }
 
@@ -3093,9 +3314,9 @@ data "aws_subnets" "default" {
 }
 
 locals {
-  project_name = "my-app"
+  project_name = "__PROJECT_NAME__"
   environment  = "dev"
-  services     = ["auth-svc", "user-svc", "order-svc"]
+  services     = []
 
   vpc_id     = data.aws_vpc.default.id
   vpc_cidr   = data.aws_vpc.default.cidr_block
@@ -3105,6 +3326,11 @@ locals {
   # Interno: para microservicios como contenedores en floci-net. Externo: desde el host.
   kafka_bootstrap_brokers          = "flexicredit-kafka-dev:9092"
   kafka_bootstrap_brokers_external = "localhost:29092"
+
+  # Registry de imágenes de dev: el que crea k3d (`--registry-create`). Reemplaza al
+  # ECR emulado de floci (cuyo pull de capas es poco fiable). Jenkins/Kaniko empuja
+  # aquí y K3d hace pull desde aquí. Interno a floci-net; el host lo ve en localhost:5100.
+  dev_registry = "k3d-flexicredit-registry:5100"
 }
 
 module "iam" {
@@ -3144,43 +3370,20 @@ module "ecr" {
   services     = local.services
 }
 
-module "eks" {
-  source                  = "../../modules/eks"
-  environment             = local.environment
-  project_name            = local.project_name
-  subnet_ids              = local.subnet_ids
-  attach_managed_policies = false
-  enable_data_plane       = false
-}
-
-module "jenkins" {
-  source                = "../../modules/jenkins"
-  environment           = local.environment
-  project_name          = local.project_name
-  vpc_id                = local.vpc_id
-  vpc_cidr              = local.vpc_cidr
-  subnet_ids            = local.subnet_ids
-  public_subnet_ids     = local.subnet_ids
-  ami_id                = var.ami_id
-  aws_region            = var.aws_region
-  availability_zone     = var.availability_zone
-  alb_internal          = true
-  eks_cluster_name      = module.eks.cluster_name
-  eks_cluster_endpoint  = module.eks.cluster_endpoint
-  eks_oidc_provider_arn = module.eks.oidc_provider_arn
-  eks_oidc_issuer_host  = module.eks.oidc_issuer_host
-  attach_ssm_policy     = false
-  enable_compute        = false
-  shared_library_repo   = var.shared_library_repo
-  sonar_url             = var.sonar_url
-  sonar_token           = var.sonar_token
-  slack_team            = var.slack_team
-  slack_token           = var.slack_token
-  vercel_token          = var.vercel_token
-  vercel_org_id         = var.vercel_org_id
-  vercel_project_id     = var.vercel_project_id
-  gitops_git_username   = var.gitops_git_username
-  gitops_git_token      = var.gitops_git_token
+# En dev NO se usa EKS (módulo eks): el plano de cómputo real es el cluster K3d que
+# levanta floci-start (flexicredit-dev en floci-net). Tampoco se usa el módulo jenkins
+# (controller EC2 + agentes EKS): en dev el controller Jenkins corre como contenedor
+# en floci-net y lanza agentes como pods en K3d (lo configura setup-cicd-pipeline.sh).
+#
+# ArgoCD (CD por GitOps) se instala en el cluster K3d vía Helm. En dev el server se
+# expone como NodePort (en EKS sería LoadBalancer); se accede con kubectl port-forward.
+# Los ApplicationSet/AppProject se aplican desde environments/dev/argocd-bootstrap/.
+module "argocd" {
+  source              = "../../modules/argocd"
+  environment         = local.environment
+  project_name        = local.project_name
+  server_service_type = "NodePort"
+  argocd_domain       = "localhost"
 }
 
 # MSK desactivado en dev: floci deja el cluster en estado CREATING para siempre y el
@@ -3216,6 +3419,9 @@ module "rds" {
 }
 EOF
 
+# El heredoc de main.tf es 'EOF' (sin expansión), así que sustituimos el slug aquí.
+sed -i "s/__PROJECT_NAME__/${PROJECT_NAME}/" "$TF_BACKEND/environments/dev/main.tf"
+
 cat > "$TF_BACKEND/environments/dev/outputs.tf" << 'EOF'
 output "api_endpoint" {
   description = "URL base del API Gateway"
@@ -3242,9 +3448,11 @@ output "ecr_repository_urls" {
   value       = module.ecr.repository_urls
 }
 
+# En dev el registry es el de k3d (no ECR). setup-cicd-pipeline.sh lee este output
+# para configurar ECR_REGISTRY del JCasC de Jenkins y construir los image tags.
 output "ecr_registry" {
-  description = "URL base del registry ECR (para docker login y construcción de image tags)"
-  value       = try(split("/", values(module.ecr.repository_urls)[0])[0], null)
+  description = "Registry de imágenes de dev (k3d). En floci-net: k3d-flexicredit-registry:5100"
+  value       = local.dev_registry
 }
 
 output "secret_arns" {
@@ -3263,19 +3471,21 @@ output "task_role_arn" {
   value       = module.iam.task_role_arn
 }
 
-output "jenkins_url" {
-  description = "URL de acceso a la UI de Jenkins"
-  value       = module.jenkins.jenkins_url
+# ArgoCD corre en el cluster K3d. La UI se accede con port-forward (no hay LoadBalancer
+# en dev). El password inicial del admin se lee del secret argocd-initial-admin-secret.
+output "argocd_namespace" {
+  description = "Namespace donde quedó instalado ArgoCD en K3d"
+  value       = module.argocd.namespace
 }
 
-output "jenkins_ebs_volume_id" {
-  description = "ID del volumen EBS que persiste JENKINS_HOME"
-  value       = module.jenkins.ebs_volume_id
+output "argocd_admin_password_cmd" {
+  description = "Comando para leer la contraseña inicial del admin de ArgoCD"
+  value       = module.argocd.admin_password_cmd
 }
 
-output "jenkins_agent_role_arn" {
-  description = "ARN del IAM role del agente Jenkins (para RBAC en EKS/IRSA en dev)"
-  value       = module.jenkins.agent_role_arn
+output "argocd_port_forward_cmd" {
+  description = "Comando para exponer la UI de ArgoCD en https://localhost:8090"
+  value       = "kubectl --kubeconfig .kube/config-k3d -n ${module.argocd.namespace} port-forward svc/argocd-server 8090:443"
 }
 
 output "kafka_bootstrap_brokers" {
@@ -3307,6 +3517,142 @@ output "rds_arn" {
   description = "ARN de la instancia RDS"
   value       = module.rds.arn
 }
+EOF
+
+# --- Manifiestos bootstrap de ArgoCD para dev (K3d) --------------------------
+# Mismos objetos que staging/prod (AppProject + ApplicationSet + repo-creds), pero
+# con auto-sync y apuntando a Gitea en floci-net. Se generan aquí (no en el loop
+# staging/prod) para no pisar los archivos de entorno de dev escritos arriba.
+# Se aplican con setup-cicd-pipeline.sh (Sección 5) una vez ArgoCD está arriba.
+
+cat > "$TF_BACKEND/environments/dev/argocd-bootstrap/appproject.yaml" << 'EOF'
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: flexicredit
+  namespace: argocd
+spec:
+  description: Microservicios FlexiCredit (dev)
+  sourceRepos:
+    - '*'
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: '*'
+  clusterResourceWhitelist:
+    - group: '*'
+      kind: '*'
+  namespaceResourceWhitelist:
+    - group: '*'
+      kind: '*'
+EOF
+
+# ApplicationSet: una Application por servicio. ArgoCD lee helm/<service>/values-dev.yaml
+# del repo del servicio en Gitea. Las entradas se añaden al correr maven_hexagonal_scaffold.py.
+cat > "$TF_BACKEND/environments/dev/argocd-bootstrap/applicationset.yaml" << 'EOF'
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: flexicredit-dev
+  namespace: argocd
+spec:
+  goTemplate: true
+  generators:
+    - list:
+        elements:
+          # -- services managed by scaffold --
+          # repoURL apunta a Gitea en floci-net (http://gitea:3000); ArgoCD (pod en
+          # el cluster K3d flexicredit-dev) lo alcanza porque está en la misma red floci-net.
+  template:
+    metadata:
+      name: '{{.service}}-dev'
+    spec:
+      project: flexicredit
+      source:
+        repoURL: '{{.repoURL}}'
+        targetRevision: '{{.revision}}'
+        path: 'helm/{{.service}}'
+        helm:
+          valueFiles:
+            - 'values-dev.yaml'
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: dev
+      # dev: auto-sync con prune + selfHeal (corrige drift automáticamente).
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=true
+EOF
+
+cat > "$TF_BACKEND/environments/dev/argocd-bootstrap/repo-credentials.example.yaml" << 'EOF'
+# Credenciales de repositorio para ArgoCD. ArgoCD (pod en el cluster K3d
+# flexicredit-dev) alcanza Gitea por http://gitea:3000 porque ambos están en floci-net.
+# Aplicar con: kubectl apply -f repo-credentials.example.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: repo-creds-gitea-flexicredit
+  namespace: argocd
+  labels:
+    argocd.argoproj.io/secret-type: repo-creds
+stringData:
+  type: git
+  url: http://gitea:3000/flexicredit
+  username: gitea-admin
+  password: gitea-admin
+EOF
+
+# RBAC del agente Jenkins en K3d (sin IRSA: K3d no es AWS). El controller Jenkins
+# (contenedor en floci-net) lanza agentes como pods en el namespace 'jenkins'. Para
+# los smoke tests post-sync, el SA jenkins-agent necesita leer el deployment y crear
+# el pod de prueba en el namespace de la app (dev). Reemplaza al bootstrap con IRSA
+# de staging/prod. Lo aplica setup-cicd-pipeline.sh (Sección 2) en dev.
+cat > "$TF_BACKEND/environments/dev/argocd-bootstrap/jenkins-agent-rbac-dev.yaml" << 'EOF'
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: jenkins
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: dev
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: jenkins-agent
+  namespace: jenkins
+---
+# Smoke tests: el agente consulta el rollout y lanza un pod curl en el namespace dev.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: jenkins-agent-smoke
+  namespace: dev
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: jenkins-agent-smoke
+  namespace: dev
+subjects:
+  - kind: ServiceAccount
+    name: jenkins-agent
+    namespace: jenkins
+roleRef:
+  kind: Role
+  name: jenkins-agent-smoke
+  apiGroup: rbac.authorization.k8s.io
 EOF
 
 # ===========================================================================
@@ -3773,7 +4119,7 @@ spec:
           # -- services managed by scaffold --
           # Las entradas se añaden automáticamente al correr maven_hexagonal_scaffold.py.
           # repoURL apunta a Gitea en floci-net (http://gitea:3000); ArgoCD llega a él
-          # porque floci-eks-my-app-dev (donde corre k3s) está en la misma red floci-net.
+          # porque el cluster K3d (donde corre k3s) está en la misma red floci-net.
   template:
     metadata:
       name: '{{.service}}-$env'
@@ -3798,8 +4144,8 @@ cat > "$TF_BACKEND/environments/$env/argocd-bootstrap/repo-credentials.example.y
 # Aplicar con: kubectl apply -f repo-credentials.example.yaml
 #
 # En dev (floci): Gitea corre en floci-net como contenedor "gitea".
-# ArgoCD (pod en k3s dentro de floci-eks-my-app-dev) alcanza Gitea via http://gitea:3000
-# porque floci-eks-my-app-dev está en la misma red floci-net.
+# ArgoCD (pod en k3s dentro de el cluster K3d) alcanza Gitea via http://gitea:3000
+# porque el cluster K3d está en la misma red floci-net.
 apiVersion: v1
 kind: Secret
 metadata:
@@ -3815,5 +4161,21 @@ stringData:
 EOF
 
 done
+
+# ---------------------------------------------------------------------------
+# Genericidad: los heredocs de arriba se emiten con el slug literal "flexicredit"
+# para mantenerlos legibles; aquí se sustituye por $PROJECT_NAME en todo el árbol
+# Terraform generado (módulos, environments y argocd-bootstrap). El cuerpo del
+# script ya usa $PROJECT_NAME para el cluster K3d / registry / Kafka, así que tras
+# esta pasada los providers kubernetes/helm y los manifiestos ArgoCD quedan
+# alineados con esos nombres.
+# ---------------------------------------------------------------------------
+if [[ "$PROJECT_NAME" != "flexicredit" ]]; then
+  log "Aplicando nombre de proyecto '$PROJECT_NAME' al árbol Terraform generado..."
+  find "$TERRAFORM_ROOT" -type f \
+    \( -name '*.tf' -o -name '*.yaml' -o -name '*.yml' -o -name '*.tfvars' -o -name '*.json' \) \
+    -print0 | xargs -0 --no-run-if-empty sed -i "s/flexicredit/${PROJECT_NAME}/g"
+  log_ok "Nombre de proyecto aplicado al árbol Terraform."
+fi
 
 log_ok "Estructura Terraform creada en $TERRAFORM_ROOT."

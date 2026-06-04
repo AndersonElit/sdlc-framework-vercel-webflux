@@ -7,8 +7,10 @@
 #                checklist ✓ y terraform output rds_port disponible).
 #
 # Uso:
-#   bash init-databases.sh -p <pg-db> -m <mongo-db> -u <usuario> -w <clave>
+#   bash init-databases.sh -P <proyecto> -p <pg-db> -m <mongo-db> -u <usuario> -w <clave>
 #
+#   -P, --project  NOMBRE   Slug del proyecto (nombra el contenedor Kafka
+#                           <proyecto>-kafka-dev y el prefijo de secrets)  (obligatorio)
 #   -p, --pg-db    NOMBRE   Base de datos PostgreSQL a crear   (obligatorio)
 #   -m, --mongo-db NOMBRE   Base de datos MongoDB a crear      (obligatorio)
 #   -u, --user     NOMBRE   Usuario de aplicación a crear      (obligatorio)
@@ -20,9 +22,9 @@
 #   2. Verifica que los contenedores floci, floci-mongo y Kafka estén UP
 #   3. PostgreSQL — crea el usuario/clave indicados, crea la base (parámetro)
 #      con ese owner y habilita pgcrypto
-#   4. PostgreSQL — aplica SDD-FlexiCredit-schema.sql sobre la base creada
+#   4. PostgreSQL — aplica el schema .sql del diseño sobre la base creada
 #   5. MongoDB — crea la base (parámetro) con el usuario/clave indicados y
-#      ejecuta SDD-FlexiCredit-collections.js (colecciones + validadores)
+#      ejecuta el collections .js del diseño (colecciones + validadores)
 #   6. Verificación final: colecciones, tablas, extensión
 #   7. Checklist de criterios de aceptación
 # ===========================================================================
@@ -51,18 +53,20 @@ COLLECTIONS_JS="${COLLECTIONS_FILES[0]}"
 # ──────────────────────────────────────────────────────────────────────────────
 # 0. Parámetros (nombres de BD y credenciales de aplicación — todos obligatorios)
 # ──────────────────────────────────────────────────────────────────────────────
+PROJECT_NAME=""
 PG_DB_NAME=""
 MONGO_DB_NAME=""
 APP_USER=""
 APP_PASS=""
 
 usage() {
-  sed -n '9,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '9,18p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
   exit "${1:-0}"
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    -P|--project)  PROJECT_NAME="$2"; shift 2 ;;
     -p|--pg-db)    PG_DB_NAME="$2";   shift 2 ;;
     -m|--mongo-db) MONGO_DB_NAME="$2"; shift 2 ;;
     -u|--user)     APP_USER="$2";     shift 2 ;;
@@ -73,6 +77,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 MISSING_ARGS=()
+[[ -z "$PROJECT_NAME"  ]] && MISSING_ARGS+=("-P/--project")
 [[ -z "$PG_DB_NAME"    ]] && MISSING_ARGS+=("-p/--pg-db")
 [[ -z "$MONGO_DB_NAME" ]] && MISSING_ARGS+=("-m/--mongo-db")
 [[ -z "$APP_USER"      ]] && MISSING_ARGS+=("-u/--user")
@@ -82,6 +87,8 @@ if [[ ${#MISSING_ARGS[@]} -gt 0 ]]; then
   log_err "Faltan parámetros obligatorios: ${MISSING_ARGS[*]}"
   usage 1
 fi
+
+KAFKA_CONTAINER="${PROJECT_NAME}-kafka-dev"
 
 # URIs de MongoDB: con autenticación (usuario de app) y sin autenticación.
 MONGO_NOAUTH_URI="mongodb://localhost:27017/$MONGO_DB_NAME"
@@ -133,7 +140,7 @@ log_ok "Collections JS encontrado: $COLLECTIONS_JS"
 # ──────────────────────────────────────────────────────────────────────────────
 HEADER "2. Verificando contenedores de soporte en floci-net"
 
-CONTAINERS_REQUIRED=("floci" "floci-mongo" "flexicredit-kafka-dev")
+CONTAINERS_REQUIRED=("floci" "floci-mongo" "$KAFKA_CONTAINER")
 ALL_UP=1
 
 for c in "${CONTAINERS_REQUIRED[@]}"; do
@@ -355,7 +362,7 @@ printf "  %-35s %s\n" "Tablas creadas" "$TABLE_COUNT"
 printf "  %-35s %s\n" "Colecciones MongoDB" "${#EXPECTED_COLLECTIONS[@]} esperadas"
 echo ""
 echo "  NOTA: Los microservicios leen las credenciales de BD desde Secrets Manager"
-echo "        (floci) en la ruta /flexicredit/dev/<servicio>. Ejecute la Etapa 2:"
+echo "        (floci) en la ruta /${PROJECT_NAME}/dev/<servicio>. Ejecute la Etapa 2:"
 echo "        bash .claude/scripts/create-all-secrets-dev.sh"
 echo ""
 

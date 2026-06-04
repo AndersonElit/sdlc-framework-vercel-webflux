@@ -35,6 +35,39 @@ AWS_REGION="${AWS_REGION:-us-east-1}"
 AWS_CMD="aws --endpoint-url=$FLOCI_ENDPOINT --region $AWS_REGION"
 
 # ──────────────────────────────────────────────────────────────────────────────
+# 0. Parámetros
+# ──────────────────────────────────────────────────────────────────────────────
+PROJECT_NAME=""
+usage() {
+  cat <<USAGE
+Uso: $0 -P <proyecto>
+
+  -P, --project NOMBRE   Slug del proyecto (el mismo usado en
+                         base-infrastructure-builder.sh). Determina el nombre
+                         del cluster K3d (<proyecto>-dev), el contenedor Kafka
+                         (<proyecto>-kafka-dev) y la base PostgreSQL de dev
+                         (<proyecto>_dev). (obligatorio)
+USAGE
+  exit "${1:-0}"
+}
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -P|--project) PROJECT_NAME="${2:-}"; shift 2 ;;
+    --project=*)  PROJECT_NAME="${1#*=}"; shift ;;
+    -h|--help)    usage 0 ;;
+    *) log_err "Argumento desconocido: $1"; usage 1 ;;
+  esac
+done
+if [[ -z "$PROJECT_NAME" ]]; then
+  log_err "Falta el parámetro obligatorio -P/--project."
+  usage 1
+fi
+KAFKA_CONTAINER="${PROJECT_NAME}-kafka-dev"
+SONAR_CONTAINER="${PROJECT_NAME}-sonarqube"
+K3D_CLUSTER="${PROJECT_NAME}-dev"
+PG_DB_NAME="${PROJECT_NAME}_dev"
+
+# ──────────────────────────────────────────────────────────────────────────────
 # 1. Validación de prerequisitos
 # ──────────────────────────────────────────────────────────────────────────────
 HEADER "1. Verificando prerequisitos"
@@ -69,7 +102,7 @@ log_ok "docker encontrado ($(command -v docker))."
 # ──────────────────────────────────────────────────────────────────────────────
 HEADER "2. Verificando contenedores de soporte en floci-net"
 
-CONTAINERS_EXPECTED=("floci" "floci-mongo" "flexicredit-kafka-dev" "gitea")
+CONTAINERS_EXPECTED=("floci" "floci-mongo" "$KAFKA_CONTAINER" "gitea" "$SONAR_CONTAINER")
 ALL_UP=1
 
 for c in "${CONTAINERS_EXPECTED[@]}"; do
@@ -146,9 +179,16 @@ log_ok "terraform plan completado."
 # 7. Terraform apply
 # ──────────────────────────────────────────────────────────────────────────────
 HEADER "7. terraform apply"
-log_warn "Aplicando infraestructura dev con floci..."
-log "En la primera aplicación de un ambiente con EKS, crear primero el cluster:"
-log "  terraform apply -target=module.eks && terraform apply"
+log_warn "Aplicando infraestructura dev con floci + K3d..."
+# En dev NO se usa EKS: el cluster Kubernetes es K3d ($K3D_CLUSTER), creado por
+# base-infrastructure-builder.sh (floci-start). Los providers kubernetes/helm leen
+# .kube/config-k3d, así que el cluster debe existir antes de este apply. El módulo
+# 'argocd' instala ArgoCD en K3d vía Helm en el mismo apply (sin -target).
+if ! kubectl --kubeconfig "$TF_DEV_DIR/.kube/config-k3d" get nodes &>/dev/null; then
+  log_err "El cluster K3d $K3D_CLUSTER no responde. Ejecutá primero base-infrastructure-builder.sh."
+  exit 1
+fi
+log_ok "Cluster K3d $K3D_CLUSTER accesible."
 
 (
   cd "$TF_DEV_DIR"
@@ -188,6 +228,29 @@ else
 fi
 
 # ──────────────────────────────────────────────────────────────────────────────
+# 8b. Verificación del cluster K3d + ArgoCD
+# ──────────────────────────────────────────────────────────────────────────────
+HEADER "8b. Verificando cluster K3d + ArgoCD"
+
+if command -v kubectl &>/dev/null; then
+  KUBE="kubectl --kubeconfig $TF_DEV_DIR/.kube/config-k3d"
+  if $KUBE get nodes &>/dev/null; then
+    log_ok "K3d — nodos:"
+    $KUBE get nodes 2>/dev/null || true
+  else
+    log_warn "K3d — el cluster no respondió."
+  fi
+  if $KUBE get namespace argocd &>/dev/null; then
+    log_ok "ArgoCD — namespace presente. Pods:"
+    $KUBE -n argocd get pods 2>/dev/null || true
+  else
+    log_warn "ArgoCD — namespace 'argocd' no encontrado (¿terraform apply del módulo argocd?)."
+  fi
+else
+  log_warn "kubectl no disponible; omitiendo verificación de K3d/ArgoCD."
+fi
+
+# ──────────────────────────────────────────────────────────────────────────────
 # 9. Verificación de conectividad
 # ──────────────────────────────────────────────────────────────────────────────
 HEADER "9. Verificación de conectividad"
@@ -199,7 +262,7 @@ RDS_PORT=$(cd "$TF_DEV_DIR" && terraform output -raw rds_port 2>/dev/null || ech
 if [[ -n "$RDS_PORT" ]]; then
   log "PostgreSQL en localhost:$RDS_PORT"
   if command -v psql &>/dev/null; then
-    if PGPASSWORD=changeme123 psql "postgresql://admin:changeme123@localhost:$RDS_PORT/flexicredit_dev" -c '\conninfo' &>/dev/null; then
+    if PGPASSWORD=changeme123 psql "postgresql://admin:changeme123@localhost:$RDS_PORT/$PG_DB_NAME" -c '\conninfo' &>/dev/null; then
       log_ok "PostgreSQL — conexión exitosa en localhost:$RDS_PORT."
     else
       log_err "PostgreSQL — falló la conexión en localhost:$RDS_PORT."
@@ -227,7 +290,7 @@ fi
 
 # ── Kafka ──
 log "Kafka en localhost:29092"
-if docker exec flexicredit-kafka-dev /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list &>/dev/null; then
+if docker exec "$KAFKA_CONTAINER" /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list &>/dev/null; then
   log_ok "Kafka — respuesta del broker (lista de tópicos vacía esperada)."
 else
   log_err "Kafka — no responde."
@@ -274,9 +337,11 @@ printf "  %-30s %-40s %s\n" \
   "${RDS_PORT:-(ver output)}"
 printf "  %-30s %-40s %s\n" "MongoDB" "mongodb://localhost:27017" "27017"
 printf "  %-30s %-40s %s\n" "Kafka (host)" "localhost:29092" "29092"
-printf "  %-30s %-40s %s\n" "Kafka (floci-net)" "flexicredit-kafka-dev:9092" "9092"
+printf "  %-30s %-40s %s\n" "Kafka (floci-net)" "${KAFKA_CONTAINER}:9092" "9092"
 printf "  %-30s %-40s %s\n" "Gitea UI / API" "http://localhost:3000" "3000"
 printf "  %-30s %-40s %s\n" "Gitea SSH" "localhost:2222" "2222"
+printf "  %-30s %-40s %s\n" "SonarQube UI / API" "http://localhost:9000" "9000"
+printf "  %-30s %-40s %s\n" "SonarQube (floci-net)" "${SONAR_CONTAINER}:9000" "9000"
 echo ""
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -332,14 +397,14 @@ rm -f /tmp/floci-health-check.json
 
 # psql conecta
 if [[ -n "$RDS_PORT" ]] && command -v psql &>/dev/null; then
-  if PGPASSWORD=changeme123 psql "postgresql://admin:changeme123@localhost:$RDS_PORT/flexicredit_dev" -c '\conninfo' &>/dev/null; then
-    check_item "psql conecta a flexicredit_dev en localhost:$RDS_PORT" 0
+  if PGPASSWORD=changeme123 psql "postgresql://admin:changeme123@localhost:$RDS_PORT/$PG_DB_NAME" -c '\conninfo' &>/dev/null; then
+    check_item "psql conecta a $PG_DB_NAME en localhost:$RDS_PORT" 0
   else
-    check_item "psql conecta a flexicredit_dev en localhost:$RDS_PORT" 1
+    check_item "psql conecta a $PG_DB_NAME en localhost:$RDS_PORT" 1
     checklist_ok=1
   fi
 else
-  check_item "psql conecta a flexicredit_dev (psql no disponible o rds_port vacío)" 1
+  check_item "psql conecta a $PG_DB_NAME (psql no disponible o rds_port vacío)" 1
   checklist_ok=1
 fi
 
@@ -357,7 +422,7 @@ else
 fi
 
 # kafka responde
-if docker exec flexicredit-kafka-dev /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list &>/dev/null; then
+if docker exec "$KAFKA_CONTAINER" /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list &>/dev/null; then
   check_item "kafka-topics --list responde" 0
 else
   check_item "kafka-topics --list responde" 1

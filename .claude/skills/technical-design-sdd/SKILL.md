@@ -478,13 +478,13 @@ Esta sección debe indicar que la infraestructura base del proyecto se aprovisio
 Este script genera el árbol Terraform multi-ambiente (`dev`/`staging`/`prod`) para:
 
 - **Frontend**: proyecto y despliegues en Vercel (provider `vercel`).
-- **Backend (AWS)**: EKS, RDS (PostgreSQL), IAM, Cognito, API Gateway, Secrets Manager y ECR.
+- **Backend (AWS)**: EKS, RDS (PostgreSQL), IAM, Cognito, API Gateway, Secrets Manager y ECR. **Nota sobre dev**: en el ambiente `dev` el cluster Kubernetes NO es EKS sino **K3d** (K3s en Docker, real, sobre `floci-net`) con su propio registry de imágenes; el EKS de floci es solo emulación de metadatos y no soporta el flujo CI/CD+GitOps completo. EKS aplica a `staging`/`prod`.
 
 # REGLAS PARA LA REFERENCIA AL SCRIPT
 
 - Referenciar el script por su ruta relativa: `.claude/scripts/base-infrastructure-builder.sh`.
 - Indicar que se ejecuta tras completar la etapa de Diseño Técnico, usando las decisiones de este documento (`infrastructure.md`) como insumos.
-- Documentar en la tabla de componentes la correspondencia entre las decisiones de infraestructura del diseño y los recursos que genera el script (Vercel, EKS, RDS, Cognito, API Gateway, Secrets Manager, ECR).
+- Documentar en la tabla de componentes la correspondencia entre las decisiones de infraestructura del diseño y los recursos que genera el script (Vercel, EKS/K3d-en-dev, RDS, Cognito, API Gateway, Secrets Manager, ECR).
 - Si una decisión técnica del diseño difiere de lo que provisiona el script por defecto, indicarlo explícitamente como ajuste requerido.
 
 ---
