@@ -40,6 +40,8 @@ Los archivos de microservicio (`03-ms-`) se generan uno por cada bounded context
 
 Si el diseño técnico definió una **capa de integración dedicada** (Apache Camel) y/o **orquestación de saga**, se genera además un documento `DEV-[proyecto]-03-ms-integration-service.md` para el `integration-service` (capa de integración + orquestador de saga). Por su rol, este servicio se implementa en el orden que indique el roadmap respecto de los flujos de saga: sus sistemas externos no dependen de otros microservicios, pero la saga necesita que los participantes expongan sus compensaciones, por lo que el orquestador suele implementarse después de los participantes que coordina (o en paralelo, validando con dobles de prueba).
 
+Si el diseño técnico definió un **subsistema de reportería**, se generan además `DEV-[proyecto]-03-ms-report-extraction-service.md` (MS1, Spark) y `DEV-[proyecto]-03-ms-report-processing-service.md` (MS2, Spark), y un documento `DEV-[proyecto]-06-reporting-serverless.md` para la capa serverless de formatos (lambdas PDF/XLS/CSV + EventBridge). Estos servicios son *jobs batch* Spark (no servicios REST); ver "Reglas para los documentos de reportería" en la Etapa 3.
+
 # ESTILO DE LOS DOCUMENTOS
 
 Los documentos deben:
@@ -196,6 +198,7 @@ Secciones en orden exacto:
    - Referenciar el script `.claude/scripts/scaffold-all-services.sh` y explicar que es genérico: acepta `--backend nombre:db:messaging:puerto` (repetible), `--frontend nombre` (opcional) y `--bc-tags servicio=BC-XX` (repetible, opcional). No incluir comandos `python3` individuales.
    - Bloque de ejemplo con la invocación completa del script con todos los `--backend`, `--frontend`, los cuatro parámetros de BD (`-p <pg-db>`, `-m <mongo-db>`, `-u <usuario>`, `-w <clave>`, **idénticos** a los usados en `init-databases.sh`) y `--bc-tags` derivados del diseño técnico. Los `--bc-tags` deben incluirse para todos los servicios PostgreSQL, usando el tag `BC-XX` que corresponde a su bloque en `docs/design/database/SDD-[proyecto]-schema.sql`.
    - Si el diseño definió capa de integración u orquestación de saga, incluir además: `--integration-service "<sistema=BC-XX,...>"` (genera el `integration-service` con sus rutas Camel), `--saga-flows <flujo1,flujo2>` (un orquestador por flujo), y, por cada servicio de dominio participante, `--saga-participant <servicio>` y `--outbox <servicio>` (generan el consumidor de comandos de saga, el endpoint de compensación, el módulo outbox y la migración `V3__outbox.sql`).
+   - Si el diseño definió **subsistema de reportería**, incluir además: `--report-extraction <svc>:<source>:<topic-out>` (MS1, Spark; `source` = `mongo` read model CQRS [default] | `jdbc`), `--report-processing <svc>:<topic-in>:<topic-out>` (MS2, Spark), `--report-types <lista>` (un `ReportTransformer` por tipo, patrón Factory) y `--report-formats pdf,xls,csv` (capa serverless: lambdas + Terraform EventBridge en `reporting-lambdas/`). Estos servicios se generan con `scala_hexagonal_scaffold.py` (no Maven) y compilan/ensamblan con sbt.
    - Tabla resumen: servicio → puerto local → DB → mensajería → módulos generados.
    - Indicar si el servicio usa mensajería (kafka-producer / kafka-consumer / ambos / none).
    - Documentar los artefactos que produce el scaffold y que consume la Etapa 2b: `Jenkinsfile` (backend y frontend), `Dockerfile` multi-stage (backend) y charts Helm (`helm/<service>/`)
@@ -365,6 +368,31 @@ En el documento de cada microservicio participante, añadir:
 - En la **capa rest-api** (o consumidor Kafka): el/los **endpoint(s)/consumidor(es) de compensación** idempotentes que el orquestador invoca para revertir el paso.
 - En la **Sección 8 (TDD)**: prueba del outbox con Testcontainers (atomicidad + publicación única) y prueba de idempotencia (la reentrega no produce doble efecto); prueba de contrato del endpoint de compensación con WebTestClient.
 - En los **criterios de aceptación**: el servicio publica eventos vía outbox (no dual-write) y sus compensaciones son idempotentes.
+
+### Reglas para los documentos de reportería (solo si el diseño incluye el subsistema de Reportería)
+
+Si el diseño técnico declara reportería, generar documentos dedicados (no usan `maven_hexagonal_scaffold.py`):
+
+**`DEV-[proyecto]-03-ms-report-extraction-service.md` (MS1, Spark Scala)** — estructura de Etapa 3 con:
+- **Scaffolding:** `.claude/templates/scala_hexagonal_scaffold.py --report-role extraction --source mongo|jdbc` (documentado en `02-scaffold.md` vía `--report-extraction` de `scaffold-all-services.sh`). La **fuente por defecto es el read model CQRS** (`--source mongo`); `jdbc` solo para proyectos sin CQRS.
+- **Capas hexagonales (Spark):** dominio `ReportSchema`/`ColumnSpec`/`ReportType` + puertos `SourceDataPort`/`ParquetStorePort`/`EventBusPort`; aplicación `ValidateAndExtractUseCase`; infraestructura `SparkMongoSourceAdapter` (o JDBC), `SparkS3ParquetAdapter` (escribe `raw/`), `KafkaEventPublisher`. `DataFrame`/`SparkSession`/clientes confinados a infraestructura.
+- **TDD (Sección 8):** validación de esquema (columnas faltantes/tipos/integridad → fallo), adaptador S3-parquet round-trip (`SparkSession` local + S3 de floci), adaptador de origen con Testcontainers, publicación de evento con embedded Kafka. Umbrales: validación/use cases ≥ 85%, adaptadores ≥ 80%.
+- **Criterios de aceptación:** `sbt compile` y `sbt assembly` verdes; validación fallida ⇒ `report.extraction.failed` sin parquet.
+
+**`DEV-[proyecto]-03-ms-report-processing-service.md` (MS2, Spark Scala)** — estructura de Etapa 3 con:
+- **Scaffolding:** `scala_hexagonal_scaffold.py --report-role processing --kafka-in report.extracted --kafka-out report.processed --report-types <lista>` (vía `--report-processing` y `--report-types`).
+- **Capas hexagonales:** **patrón Factory (DR-10)** — trait `ReportTransformer`, `ReportTransformerFactory` con registro `Map[ReportType, ReportTransformer]`, `ProcessReportUseCase` que delega en la factory, y un transformer por tipo de reporte. `entry-points/kafka-consumer` dispara el job al recibir `report.extracted`.
+- **TDD:** factory (`reportType` conocido→transformer / desconocido→`UnsupportedReportTypeException`), cada transformer con fixtures parquet, orquestación con dobles.
+- **Criterios:** añadir un tipo nuevo = añadir clase + registro, sin tocar `ProcessReportUseCase` (Abierto/Cerrado).
+
+**`DEV-[proyecto]-06-reporting-serverless.md` (capa de formatos)** — lambdas + EventBridge:
+- **Scaffolding:** `.claude/templates/report_lambdas_scaffold.py --org <proyecto> --formats pdf,xls,csv` (vía `--report-formats`). Genera Lambda Kafka Consumer, lambdas PDF/XLS/CSV y el Terraform de EventBridge (bus + una rule por formato).
+- **TDD:** cada lambda de formato (parquet→archivo válido en `output/` con pytest + S3 de floci), Lambda Consumer (evento Kafka→`PutEvents` por formato con EventBridge de floci), enrutamiento (`detail.format` activa la rule correcta).
+- **Despliegue:** el mismo Terraform en dev (floci `:4566`) y staging/prod (AWS real); bandera `ENABLE_REPORTING_SERVERLESS` para omitir.
+
+**En el Documento Maestro (roadmap):** añadir al **Mapa de Microservicios** las columnas **"Tipo de reporte"** y **"Formatos"** para los servicios de reportería; MS1/MS2 son *jobs batch* (no servicios REST), con dependencia MS1→MS2 vía `report.extracted` y MS2→serverless vía `report.processed`.
+
+**En `DEV-[proyecto]-05-tests.md`:** añadir el **E2E de reportería**: (a) camino feliz parquet `raw`→`processed`→3 formatos en `output/`; (b) validación fallida (columna faltante ⇒ `report.extraction.failed`, sin parquet). Ejecutado en local con floci (S3/Lambda/EventBridge) + K3d.
 
 ---
 

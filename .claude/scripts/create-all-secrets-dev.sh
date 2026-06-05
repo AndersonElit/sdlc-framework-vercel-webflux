@@ -306,6 +306,36 @@ for svc_path in "${services[@]}"; do
   fi
 done
 
+# ── Paso 3b: Secret del subsistema de reportería (§10.3) ──────────────────────
+# Secret compartido por el ETL Spark (MS1/MS2) y la capa serverless de formatos.
+# Idempotente: se crea/actualiza siempre; los servicios de reportería lo consumen
+# solo si existen. En dev apunta a floci (:4566).
+HEADER "Paso 3b — Secret de reportería"
+
+reporting_secret="${SECRET_PREFIX}/reporting"
+reporting_json=$(jq -n \
+  --arg endpoint "http://localhost:4566" \
+  --arg bucket   "${PROJECT_NAME}-reports" \
+  --arg kafka    "localhost:29092" \
+  --arg bus      "${PROJECT_NAME}-report-bus" \
+  '{
+    AWS_ENDPOINT_URL:        $endpoint,
+    AWS_ACCESS_KEY_ID:       "test",
+    AWS_SECRET_ACCESS_KEY:   "test",
+    AWS_REGION:              "us-east-1",
+    REPORT_BUCKET:           $bucket,
+    KAFKA_BOOTSTRAP_SERVERS: $kafka,
+    EVENTBRIDGE_BUS:         $bus
+  }')
+
+if action="$(upsert_secret "$reporting_secret" "$reporting_json")"; then
+  log_ok "reporting — $action  →  $reporting_secret"
+  ok+=("reporting")
+else
+  log_err "reporting — falló el upsert del secret de reportería"
+  failed+=("reporting")
+fi
+
 # ── Resumen ───────────────────────────────────────────────────────────────────
 HEADER "Resumen"
 

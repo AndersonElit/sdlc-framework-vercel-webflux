@@ -227,6 +227,24 @@ TABLE_COUNT=$(PGPASSWORD="$APP_PASS" psql "$PGAPP/$PG_DB_NAME" -tc \
 log_ok "Tablas en base $PG_DB_NAME: $TABLE_COUNT"
 
 # ──────────────────────────────────────────────────────────────────────────────
+# 5b. PostgreSQL — catálogo de esquemas de reportería (opcional, §9.2)
+# ──────────────────────────────────────────────────────────────────────────────
+# report_schema_catalog resuelve el ReportSchema vigente que MS1 valida (DR-1).
+# Idempotente (CREATE TABLE IF NOT EXISTS); inofensivo si el proyecto no usa reportería.
+HEADER "5b. PostgreSQL — catálogo de esquemas de reportería (report_schema_catalog)"
+
+PGPASSWORD="$APP_PASS" psql "$PGAPP/$PG_DB_NAME" -v ON_ERROR_STOP=1 <<'SQL'
+CREATE TABLE IF NOT EXISTS report_schema_catalog (
+  report_type      TEXT PRIMARY KEY,
+  schema_version   TEXT        NOT NULL,
+  columns          JSONB       NOT NULL,
+  integrity_rules  JSONB       NOT NULL DEFAULT '[]'::jsonb,
+  updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+SQL
+log_ok "Tabla report_schema_catalog lista (catálogo de esquemas de reportería)."
+
+# ──────────────────────────────────────────────────────────────────────────────
 # 6. MongoDB — crear base/usuario y ejecutar script de colecciones
 # ──────────────────────────────────────────────────────────────────────────────
 HEADER "6. MongoDB — base de datos '$MONGO_DB_NAME' y colecciones"

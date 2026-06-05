@@ -37,6 +37,8 @@ TEMPLATES_DIR="$REPO_ROOT/.claude/templates"
 MAVEN_TEMPLATE="$TEMPLATES_DIR/maven_hexagonal_scaffold.py"
 NEXTJS_TEMPLATE="$TEMPLATES_DIR/nextjs_feature_scaffold.py"
 INTEGRATION_TEMPLATE="$TEMPLATES_DIR/integration_service_scaffold.py"
+SCALA_TEMPLATE="$TEMPLATES_DIR/scala_hexagonal_scaffold.py"
+REPORT_LAMBDAS_TEMPLATE="$TEMPLATES_DIR/report_lambdas_scaffold.py"
 
 BACKEND_DIR="$REPO_ROOT/backend"
 FRONTEND_DIR="$REPO_ROOT/frontend"
@@ -80,6 +82,11 @@ INTEGRATION_PORT="8090"
 SAGA_FLOWS=""               # valor de --saga-flows: "originacion,desembolso"
 declare -A OUTBOX_SERVICES        # --outbox <servicio>
 declare -A SAGA_PARTICIPANTS      # --saga-participant <servicio>
+# Reportería (ETL Spark + lambdas de formato)
+REPORT_EXTRACTION=()              # --report-extraction <svc>:<source>:<topic-out>
+REPORT_PROCESSING=()              # --report-processing <svc>:<topic-in>:<topic-out>
+REPORT_TYPES=""                   # --report-types ventas-mensual,saldos
+REPORT_FORMATS=""                 # --report-formats pdf,xls,csv
 PROJECT_NAME=""
 PG_DB_NAME=""
 MONGO_DB_NAME=""
@@ -121,6 +128,16 @@ Uso: $0 -P <proyecto> --backend nombre:db:messaging:puerto [--backend ...] \
   --bc-tags   Par servicio=BC-XX (opcional, repetible).
               Mapea un servicio PostgreSQL a su tag en el schema.sql para
               generar V1__initial_schema.sql por Flyway.
+
+  --report-extraction <svc>:<source>:<topic-out>   (opcional, repetible)
+              Genera el report-extraction-service (MS1, Spark) con scala_hexagonal_scaffold.py
+              --report-role extraction. source = mongo (read model CQRS, default) | jdbc.
+  --report-processing <svc>:<topic-in>:<topic-out> (opcional, repetible)
+              Genera el report-processing-service (MS2, Spark) --report-role processing.
+  --report-types lista,csv                         (opcional)
+              Tipos de reporte de MS2: un ReportTransformer + registro por tipo (Factory, DR-10).
+  --report-formats pdf,xls,csv                     (opcional)
+              Genera la capa serverless (lambdas PDF/XLS/CSV + Kafka consumer + Terraform EventBridge).
 
 Ejemplo:
   bash $0 \\
@@ -311,6 +328,38 @@ while [[ $# -gt 0 ]]; do
       OUTBOX_SERVICES["$SVC"]=1
       shift
       ;;
+    --report-extraction)
+      REPORT_EXTRACTION+=("${2:?--report-extraction requiere <svc>:<source>:<topic-out>}")
+      shift 2
+      ;;
+    --report-extraction=*)
+      REPORT_EXTRACTION+=("${1#*=}")
+      shift
+      ;;
+    --report-processing)
+      REPORT_PROCESSING+=("${2:?--report-processing requiere <svc>:<topic-in>:<topic-out>}")
+      shift 2
+      ;;
+    --report-processing=*)
+      REPORT_PROCESSING+=("${1#*=}")
+      shift
+      ;;
+    --report-types)
+      REPORT_TYPES="${2:?--report-types requiere una lista CSV}"
+      shift 2
+      ;;
+    --report-types=*)
+      REPORT_TYPES="${1#*=}"
+      shift
+      ;;
+    --report-formats)
+      REPORT_FORMATS="${2:?--report-formats requiere una lista CSV (pdf,xls,csv)}"
+      shift 2
+      ;;
+    --report-formats=*)
+      REPORT_FORMATS="${1#*=}"
+      shift
+      ;;
     -h|--help)
       usage
       ;;
@@ -445,6 +494,95 @@ if [[ "$HAS_INTEGRATION" -eq 1 ]]; then
       BACKEND_FAILED+=("$INTEGRATION_NAME")
     fi
   fi
+fi
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 3c. Reportería — ETL Spark (MS1/MS2) + capa serverless de formatos
+# ──────────────────────────────────────────────────────────────────────────────
+HAS_REPORTING=0
+[[ ${#REPORT_EXTRACTION[@]} -gt 0 || ${#REPORT_PROCESSING[@]} -gt 0 || -n "$REPORT_FORMATS" ]] && HAS_REPORTING=1
+
+if [[ "$HAS_REPORTING" -eq 1 ]]; then
+  HEADER "3c. Reportería (Spark ETL + lambdas de formato)"
+
+  # MS1 — report-extraction-service(s): <svc>:<source>:<topic-out>
+  for spec in "${REPORT_EXTRACTION[@]}"; do
+    IFS=':' read -r rname rsource rtopic_out <<< "$spec"
+    rsource="${rsource:-mongo}"
+    rtopic_out="${rtopic_out:-report.extracted}"
+    if [[ -z "$rname" ]]; then
+      log_err "Formato inválido en --report-extraction: '$spec' (esperado <svc>:<source>:<topic-out>)."
+      BACKEND_FAILED+=("report-extraction")
+      continue
+    fi
+    if [[ -d "$BACKEND_DIR/$rname" ]]; then
+      log_warn "$rname — directorio ya existe; omitiendo."
+    elif [[ ! -f "$SCALA_TEMPLATE" ]]; then
+      log_err "Template no encontrado: $SCALA_TEMPLATE"
+      BACKEND_FAILED+=("$rname")
+    else
+      log "Generando $rname (extraction, source=$rsource, out=$rtopic_out)..."
+      if (cd "$BACKEND_DIR" && python3 "$SCALA_TEMPLATE" \
+            --service-name "$rname" --report-role extraction \
+            --source "$rsource" --kafka-out "$rtopic_out"); then
+        log_ok "$rname generado."
+      else
+        log_err "$rname — falló la generación."
+        BACKEND_FAILED+=("$rname")
+      fi
+    fi
+  done
+
+  # MS2 — report-processing-service(s): <svc>:<topic-in>:<topic-out>
+  for spec in "${REPORT_PROCESSING[@]}"; do
+    IFS=':' read -r rname rtopic_in rtopic_out <<< "$spec"
+    rtopic_in="${rtopic_in:-report.extracted}"
+    rtopic_out="${rtopic_out:-report.processed}"
+    if [[ -z "$rname" ]]; then
+      log_err "Formato inválido en --report-processing: '$spec' (esperado <svc>:<topic-in>:<topic-out>)."
+      BACKEND_FAILED+=("report-processing")
+      continue
+    fi
+    if [[ -d "$BACKEND_DIR/$rname" ]]; then
+      log_warn "$rname — directorio ya existe; omitiendo."
+    elif [[ ! -f "$SCALA_TEMPLATE" ]]; then
+      log_err "Template no encontrado: $SCALA_TEMPLATE"
+      BACKEND_FAILED+=("$rname")
+    else
+      log "Generando $rname (processing, in=$rtopic_in, out=$rtopic_out, types='$REPORT_TYPES')..."
+      if (cd "$BACKEND_DIR" && python3 "$SCALA_TEMPLATE" \
+            --service-name "$rname" --report-role processing \
+            --kafka-in "$rtopic_in" --kafka-out "$rtopic_out" \
+            --report-types "$REPORT_TYPES"); then
+        log_ok "$rname generado."
+      else
+        log_err "$rname — falló la generación."
+        BACKEND_FAILED+=("$rname")
+      fi
+    fi
+  done
+
+  # Capa serverless de formatos (lambdas + Terraform EventBridge)
+  if [[ -n "$REPORT_FORMATS" ]]; then
+    if [[ ! -f "$REPORT_LAMBDAS_TEMPLATE" ]]; then
+      log_err "Template no encontrado: $REPORT_LAMBDAS_TEMPLATE"
+      BACKEND_FAILED+=("reporting-lambdas")
+    elif [[ -d "$REPO_ROOT/reporting-lambdas" ]]; then
+      log_warn "reporting-lambdas/ ya existe; omitiendo capa serverless."
+    else
+      log "Generando capa serverless de formatos ($REPORT_FORMATS)..."
+      if (cd "$REPO_ROOT" && python3 "$REPORT_LAMBDAS_TEMPLATE" \
+            --org "$PROJECT_NAME" --formats "$REPORT_FORMATS" \
+            --kafka-topic report.processed); then
+        log_ok "reporting-lambdas/ generado."
+      else
+        log_err "reporting-lambdas — falló la generación."
+        BACKEND_FAILED+=("reporting-lambdas")
+      fi
+    fi
+  fi
+else
+  log "Reportería: omitida (sin --report-extraction/--report-processing/--report-formats)."
 fi
 
 # ──────────────────────────────────────────────────────────────────────────────

@@ -41,7 +41,7 @@ Cada etapa consume la salida de la etapa anterior, de modo que el conocimiento d
 │   │   └── input-adc-template.md # Entrada (ADC) para /strategic-design-sdd
 │   ├── skills/                   # Las 5 skills del pipeline
 │   ├── scripts/                  # Scripts de implementación (infra, scaffold, CI/CD…)
-│   └── templates/                # Scaffolders (Maven hexagonal, Next.js)
+│   └── templates/                # Scaffolders (Maven hexagonal, Next.js, Scala/Spark reportería, lambdas de formato)
 ├── requerimiento/                # Aquí guardas el formato de entrada diligenciado
 └── docs/                         # Salida generada por las skills
     ├── planning/                 # PID + ADC
@@ -202,6 +202,32 @@ Se propaga por todo el pipeline: el ADC captura sistemas externos y estrategia t
 | CI/CD | Stage `Contract Tests` (WireMock) en el Jenkinsfile, activo solo para el `integration-service` |
 
 > Detalle completo y decisiones arquitectónicas: [PLAN-integracion-camel-saga.md](PLAN-integracion-camel-saga.md).
+
+---
+
+## Reportería (ETL Apache Spark + Generación de Formatos Serverless)
+
+El framework soporta, de forma **opt-in y trazable end-to-end**, un subsistema de reportería para producir reportes (PDF/XLS/CSV) a partir de datos operacionales:
+
+- **ETL por lotes con Apache Spark** en dos microservicios Scala (arquitectura hexagonal, generados con `scala_hexagonal_scaffold.py`): **`report-extraction-service` (MS1)** extrae del **read model CQRS** (MongoDB; o JDBC en proyectos sin CQRS), **valida contra un esquema declarado** y materializa parquet crudo en S3, publicando `report.extracted`; **`report-processing-service` (MS2)** transforma por **tipo de reporte** (patrón Factory, abierto/cerrado) y produce parquet listo, publicando `report.processed`.
+- **Capa de formatos serverless** (AWS Lambda + EventBridge): un *Lambda Kafka Consumer* enruta por EventBridge (una rule por formato) a las lambdas **PDF/XLS/CSV**, que renderizan a `output/`. En dev corre sobre **floci** (S3/Lambda/EventBridge en `:4566`), con el **mismo Terraform** que en AWS real.
+
+Se propaga por todo el pipeline: el ADC (sección 13) declara tipos de reporte/fuentes/formatos → el Strategic Design añade el bounded context de Reportería y `DS-xxx` → el Diseño Técnico genera los contenedores MS1/MS2 y la malla serverless en el C4, los esquemas parquet y `report_schema_catalog` en el modelo de datos, y los `ADR-xxx` → el Plan de Desarrollo emite los documentos `03-ms-report-extraction-service.md`, `03-ms-report-processing-service.md` y `06-reporting-serverless.md`, todo bajo **TDD**.
+
+**Generación de código (etapa de implementación):**
+
+| Componente | Cómo se genera |
+|------------|----------------|
+| `report-extraction-service` (MS1, Spark) | `scala_hexagonal_scaffold.py --report-role extraction --source mongo\|jdbc` |
+| `report-processing-service` (MS2, Spark) | `scala_hexagonal_scaffold.py --report-role processing --report-types <lista>` (Factory de transformers) |
+| Capa serverless de formatos | `report_lambdas_scaffold.py --org <proyecto> --formats pdf,xls,csv` (lambdas + Terraform EventBridge) |
+| Orquestación | `scaffold-all-services.sh` con `--report-extraction`, `--report-processing`, `--report-types`, `--report-formats` |
+| Infraestructura local | `base-infrastructure-builder.sh` crea el bucket S3, los topics `report.*` y el bus EventBridge en floci (omitir con `ENABLE_REPORTING=0`; solo serverless con `ENABLE_REPORTING_SERVERLESS=0`) |
+| Catálogo de esquemas | `init-databases.sh` crea la tabla opcional `report_schema_catalog` |
+| Secretos | `create-all-secrets-dev.sh` crea el secret `<proyecto>/dev/reporting` (S3/floci, Kafka, EventBridge) |
+| CI/CD | Steps `assembleSparkService` (fat JAR Spark) y `deployReportingLambdas` (Terraform) en la shared library |
+
+> Detalle completo y decisiones arquitectónicas: [PLAN-reporteria-spark-etl.md](PLAN-reporteria-spark-etl.md).
 
 ---
 

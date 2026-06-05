@@ -652,6 +652,21 @@ Con base en el contenido del SRS y del ADC (si fue leído), genera el documento 
 - Usa las integraciones y sistemas legados del ADC para enriquecer el **Context Map** con sistemas externos reales.
 - Usa el modelo de despliegue y los entornos del ADC para contextualizar los **Bounded Contexts** cuando sea relevante.
 
+### Reportería (condicional — solo si el ADC sección 13 declara que el sistema requiere reportes)
+
+Si el ADC declara reportería, incorpora el **subsistema de reportería** al diseño estratégico:
+
+**En SDD-domain.md:**
+- Añade un **Bounded Context de Reportería** al Context Map, consumidor del read model (relación *Customer/Supplier* o *Conformist* respecto a los contextos de dominio).
+- Amplía el **Ubiquitous Language** con: `ReportSchema`, `ReportType`, `ColumnSpec`, transformación por tipo de reporte.
+- Añade los **Eventos de Dominio** `ReportExtracted` (MS1→MS2) y `ReportProcessed` (MS2→capa de formatos), más los de fallo `ReportExtractionFailed`/`ReportProcessingFailed` (DE-xxx).
+- Si el ADC declara CQRS, documenta los eventos de proyección (`<agregado>.changed`) y el read model como **vista del bounded context**.
+
+**En SDD-architecture.md (Decisiones Estratégicas DS-xxx):**
+- `DS-xxx` — **ETL Spark de dos etapas**: `report-extraction-service` (MS1, extracción + validación de esquema declarado) y `report-processing-service` (MS2, transformación por tipo de reporte con patrón Factory). Parquet como contrato entre etapas.
+- `DS-xxx` — **Capa serverless de formatos**: Lambda Kafka Consumer → EventBridge (una rule por formato) → lambdas PDF/XLS/CSV. Desacople por EventBridge.
+- Si el ADC declara CQRS: `DS-CQRS-1..3` — segregación write (PostgreSQL)/read (MongoDB), sincronización por Outbox+Kafka, y **la reportería como consumidor del read model** (prohibido apuntar a la BD operacional).
+
 ### Regla de precedencia
 
 Cuando exista conflicto entre lo inferido del SRS y lo definido explícitamente en el ADC, el ADC tiene precedencia. Las decisiones del ADC son restricciones del proyecto, no sugerencias.

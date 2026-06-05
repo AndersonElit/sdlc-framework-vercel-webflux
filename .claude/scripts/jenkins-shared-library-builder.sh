@@ -94,6 +94,35 @@ def call(Map args = [:]) {
 }
 EOF
 
+# assembleSparkService — build + tests + fat JAR de un servicio de reportería (Spark, sbt)
+cat > "$OUT_DIR/vars/assembleSparkService.groovy" <<'EOF'
+// Compila, prueba y ensambla el fat JAR de un servicio Spark de reportería
+// (report-extraction-service / report-processing-service) generado por
+// scala_hexagonal_scaffold.py --report-role. Spark va '% provided'; el JAR
+// incluye Kafka/Mongo y se ejecuta en cluster (o local[*] en dev).
+def call(Map args = [:]) {
+    sh 'sbt -batch clean test'
+    sh 'sbt -batch "entryPoints/assembly"'
+    junit testResults: '**/target/test-reports/*.xml', allowEmptyResults: true
+    archiveArtifacts artifacts: '**/target/scala-*/*-assembly-*.jar', allowEmptyArchive: true
+}
+EOF
+
+# deployReportingLambdas — empaqueta y despliega la capa serverless de formatos
+cat > "$OUT_DIR/vars/deployReportingLambdas.groovy" <<'EOF'
+// Empaqueta las lambdas (kafka-consumer + PDF/XLS/CSV) y aplica el Terraform de
+// EventBridge/rules de reporting-lambdas/. Mismo Terraform en dev (floci :4566)
+// y staging/prod (AWS real); solo cambian endpoint/credenciales por var-file.
+def call(Map args = [:]) {
+    def dir     = args.dir     ?: 'reporting-lambdas/infra'
+    def varFile = args.varFile ?: 'dev.tfvars'
+    dir(dir) {
+        sh 'terraform init -input=false'
+        sh "terraform apply -input=false -auto-approve -var-file=${varFile}"
+    }
+}
+EOF
+
 # runIntegrationTests — Testcontainers
 cat > "$OUT_DIR/vars/runIntegrationTests.groovy" <<'EOF'
 // Tests de integración (R2DBC/Mongo/Kafka) con Testcontainers.

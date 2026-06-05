@@ -196,6 +196,65 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Subsistema de reportería (ETL Spark + capa serverless de formatos)
+#   - S3 (floci): bucket <proyecto>-reports con prefijos raw/ processed/ output/.
+#   - Kafka:      topics report.extracted (MS1→MS2) y report.processed (MS2→serverless).
+#   - EventBridge (floci): bus <proyecto>-report-bus (capa serverless, DR-8).
+# Idempotente. Para omitir todo: ENABLE_REPORTING=0. Para omitir solo el bus
+# serverless (mantener S3+topics): ENABLE_REPORTING_SERVERLESS=0 (DR-8).
+# ---------------------------------------------------------------------------
+ENABLE_REPORTING="${ENABLE_REPORTING:-1}"
+ENABLE_REPORTING_SERVERLESS="${ENABLE_REPORTING_SERVERLESS:-1}"
+if [[ "$ENABLE_REPORTING" == "1" ]]; then
+  FLOCI_ENDPOINT="${FLOCI_ENDPOINT:-http://localhost:4566}"
+  REPORT_BUCKET="${PROJECT_NAME}-reports"
+  KAFKA_CONTAINER="${PROJECT_NAME}-kafka-dev"
+  REPORT_BUS="${PROJECT_NAME}-report-bus"
+
+  # S3 bucket de reportería en floci (idempotente).
+  log "Creando bucket S3 de reportería (s3://${REPORT_BUCKET}) en floci..."
+  if aws --endpoint-url="$FLOCI_ENDPOINT" --region us-east-1 \
+       s3api head-bucket --bucket "$REPORT_BUCKET" &>/dev/null; then
+    log "Bucket ${REPORT_BUCKET} ya existe."
+  else
+    aws --endpoint-url="$FLOCI_ENDPOINT" --region us-east-1 \
+      s3 mb "s3://${REPORT_BUCKET}" >/dev/null \
+      && log_ok "Bucket ${REPORT_BUCKET} creado." \
+      || log_warn "No se pudo crear el bucket ${REPORT_BUCKET} (¿floci arriba?)."
+  fi
+
+  # Topics Kafka de reportería (idempotente vía --if-not-exists).
+  for topic in report.extracted report.processed; do
+    log "Creando topic Kafka '$topic' (idempotente)..."
+    docker exec "$KAFKA_CONTAINER" /opt/kafka/bin/kafka-topics.sh \
+      --bootstrap-server localhost:9092 \
+      --create --if-not-exists --topic "$topic" \
+      --partitions 3 --replication-factor 1 >/dev/null 2>&1 \
+      && log_ok "Topic '$topic' listo." \
+      || log_warn "No se pudo crear el topic '$topic' (¿contenedor $KAFKA_CONTAINER arriba?)."
+  done
+
+  # Bus EventBridge de la capa serverless (idempotente). Las rules/lambdas las
+  # crea el Terraform de reporting-lambdas/infra (report_lambdas_scaffold.py).
+  if [[ "$ENABLE_REPORTING_SERVERLESS" == "1" ]]; then
+    log "Creando bus EventBridge de reportería (${REPORT_BUS}) en floci..."
+    if aws --endpoint-url="$FLOCI_ENDPOINT" --region us-east-1 \
+         events describe-event-bus --name "$REPORT_BUS" &>/dev/null; then
+      log "Bus ${REPORT_BUS} ya existe."
+    else
+      aws --endpoint-url="$FLOCI_ENDPOINT" --region us-east-1 \
+        events create-event-bus --name "$REPORT_BUS" >/dev/null \
+        && log_ok "Bus ${REPORT_BUS} creado." \
+        || log_warn "No se pudo crear el bus ${REPORT_BUS} (¿floci arriba?)."
+    fi
+  else
+    log "ENABLE_REPORTING_SERVERLESS=0 — se omite el bus EventBridge (S3+topics conservados)."
+  fi
+else
+  log "ENABLE_REPORTING=0 — se omite la provisión del subsistema de reportería."
+fi
+
+# ---------------------------------------------------------------------------
 # Gitea (servidor Git local para dev)
 # Reemplaza GitHub/GitLab para los repos internos del proyecto: microservicios
 # y jenkins-shared-library. El SDLC principal permanece en GitHub.

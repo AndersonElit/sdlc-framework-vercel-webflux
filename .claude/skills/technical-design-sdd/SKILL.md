@@ -739,6 +739,25 @@ Del Strategic Design extrae:
 
 Con base en el contenido leído, genera los tres documentos SDD técnicos siguiendo toda la estructura y reglas definidas en este prompt.
 
+### Reportería (condicional — solo si el Strategic Design incluye el bounded context / DS-xxx de Reportería)
+
+Si el diseño estratégico declara reportería, materialízala técnicamente en los tres documentos:
+
+**En SDD-system.md (Arquitectura del Sistema / C4):**
+- Añade los contenedores `report-extraction-service` (MS1, Spark batch Scala), `report-processing-service` (MS2, Spark batch Scala) y la **malla serverless**: Lambda Kafka Consumer, bus EventBridge, lambdas PDF/XLS/CSV.
+- En el **Stack Tecnológico**: Apache Spark 3.5.1 / Scala 2.13 (fat JAR sbt-assembly), `mongo-spark-connector` (read model CQRS) o Spark JDBC, S3 (floci en dev), Kafka, AWS Lambda + EventBridge (Python 3.12).
+- Describe cada servicio en **Componentes del Sistema** con sus capas hexagonales (Spark/Kafka/S3 confinados a `infrastructure`).
+
+**En SDD-design.md (Diseño Técnico):**
+- **Flujo ETL** en *Flujos Técnicos Principales*: read model → MS1 (valida esquema → parquet `raw/` → `report.extracted`) → MS2 (transforma por tipo vía Factory → parquet `processed/` → `report.processed`) → Lambda Consumer → EventBridge → lambdas de formato → `output/{pdf,xls,csv}/`.
+- En **Diseño de Persistencia**: esquemas parquet (`raw`/`processed`), layout S3 (§9.1) y la tabla `report_schema_catalog` (`report_type` PK, `schema_version`, `columns` jsonb, `integrity_rules` jsonb, `updated_at`).
+- Documenta los topics/eventos `report.extracted` y `report.processed` (contratos JSON) y los de fallo en la documentación de eventos asíncronos.
+
+**En SDD-infrastructure.md (ADR):**
+- `ADR-xxx` — Spark batch en dos servicios; parquet como contrato; Factory de transformadores (Abierto/Cerrado).
+- `ADR-xxx` — Capa serverless (Lambda+EventBridge) sobre floci en dev (drop-in para Terraform/AWS) y AWS real en prod.
+- Si hay CQRS: `ADR-CQRS-x` — consistencia eventual write→read aceptada e idempotencia del proyector; la reportería refleja el read model en `validatedAt`.
+
 ### Reglas de coherencia
 
 - Las decisiones técnicas deben ser coherentes con las decisiones estratégicas (DS-xxx) del Strategic Design.

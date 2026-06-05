@@ -66,6 +66,7 @@ Tecnologías que NO deben usarse y por qué:
 - **Justificación:** 
 - **Patrón de integración entre componentes:** (REST / gRPC / mensajería asíncrona / mixto)
 - **Patrón de acceso a datos:** (repositorio / CQRS / active record / por definir)
+- **Si CQRS:** indica la **BD de escritura** (command, p.ej. PostgreSQL normalizado) y la **BD de lectura** (query/read model, p.ej. MongoDB desnormalizado), y la **sincronización** (Transactional Outbox + Kafka). La reportería (sección 14) extrae del **read model**, no de la BD operacional.
 
 ---
 
@@ -193,7 +194,28 @@ Lista decisiones arquitectónicas o tecnológicas que ya fueron resueltas antes 
 
 ---
 
-## 13. Información Adicional
+## 13. Reportería (opcional)
+
+Completar **solo si el sistema debe generar reportes** (PDF/XLS/CSV) a partir de datos operacionales.
+Si se completa, el pipeline materializa el subsistema de reportería: ETL por lotes con Apache Spark
+(dos microservicios Scala — extracción/validación y transformación por tipo) y una capa serverless
+de formatos (AWS Lambda + EventBridge). La fuente por defecto es el **read model CQRS** (sección 4).
+
+- **¿El sistema requiere generación de reportes?** (sí / no / por definir)
+- **Fuente de datos del ETL:** (read model CQRS [MongoDB, default] / BD relacional vía JDBC [proyectos sin CQRS])
+- **Disparo del ETL:** (programado/schedule [default] / on-demand por evento de comando / ambos)
+- **Persistencia del catálogo de esquemas:** (tabla `report_schema_catalog` en BD / archivo en repo)
+
+### Tipos de reporte
+
+| Tipo de reporte (`reportType`) | Fuente (colección/tabla) | Columnas/esquema esperado | Formatos de salida | Frecuencia / disparo | Volumetría estimada |
+|---|---|---|---|---|---|
+| ej. `ventas-mensual` | ej. colección `ventas` (read model) | ej. fecha, sucursal, monto, … | PDF / XLS / CSV | ej. mensual programado | ej. 1M filas/mes |
+| | | | | | |
+
+---
+
+## 14. Información Adicional
 
 Contexto relevante no cubierto en las secciones anteriores:
 
