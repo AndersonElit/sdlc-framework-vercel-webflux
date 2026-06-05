@@ -235,7 +235,7 @@ if [[ "$ENABLE_REPORTING" == "1" ]]; then
   done
 
   # Bus EventBridge de la capa serverless (idempotente). Las rules/lambdas las
-  # crea el Terraform de reporting-lambdas/infra (report_lambdas_scaffold.py).
+  # crea el Terraform de terraform/backend/modules/reporting-lambdas (report_lambdas_scaffold.py).
   if [[ "$ENABLE_REPORTING_SERVERLESS" == "1" ]]; then
     log "Creando bus EventBridge de reportería (${REPORT_BUS}) en floci..."
     if aws --endpoint-url="$FLOCI_ENDPOINT" --region us-east-1 \
@@ -361,6 +361,7 @@ mkdir -p \
   "$TF_BACKEND/modules/jenkins" \
   "$TF_BACKEND/modules/msk" \
   "$TF_BACKEND/modules/argocd" \
+  "$TF_BACKEND/modules/reporting-lambdas" \
   "$TF_BACKEND/environments/dev" \
   "$TF_BACKEND/environments/dev/argocd-bootstrap" \
   "$TF_BACKEND/environments/dev/.kube" \
@@ -3216,6 +3217,10 @@ terraform {
       source  = "hashicorp/kubernetes"
       version = "~> 2.30"
     }
+    archive = {
+      source  = "hashicorp/archive"
+      version = "~> 2.4"
+    }
   }
 }
 
@@ -3262,8 +3267,12 @@ provider "aws" {
     cloudwatchlogs       = "http://localhost:4566"
     ssm                  = "http://localhost:4566"
     autoscaling          = "http://localhost:4566"
+    lambda               = "http://localhost:4566"
+    events               = "http://localhost:4566"
   }
 }
+
+provider "archive" {}
 EOF
 
 cat > "$TF_BACKEND/environments/dev/variables.tf" << 'EOF'
@@ -3520,6 +3529,26 @@ EOF
 
 # El heredoc de main.tf es 'EOF' (sin expansión), así que sustituimos el slug aquí.
 sed -i "s/__PROJECT_NAME__/${PROJECT_NAME}/" "$TF_BACKEND/environments/dev/main.tf"
+
+# Capa serverless de reportería (EventBridge + lambdas PDF/XLS/CSV).
+# Se activa cuando ENABLE_REPORTING_SERVERLESS=1 (default). El módulo se popula con
+# report_lambdas_scaffold.py; debe ejecutarse antes del primer `terraform apply`.
+if [[ "$ENABLE_REPORTING_SERVERLESS" == "1" ]]; then
+  cat >> "$TF_BACKEND/environments/dev/main.tf" << 'EOFMOD'
+
+# Activa este módulo después de ejecutar report_lambdas_scaffold.py.
+# module "reporting_lambdas" {
+#   source                  = "../../modules/reporting-lambdas"
+#   org                     = local.project_name
+#   kafka_topic             = "report.processed"
+#   kafka_bootstrap_servers = local.kafka_bootstrap_brokers
+#   lambda_runtime          = "python3.12"
+#   report_bucket           = "${local.project_name}-reports"
+#   aws_endpoint_url        = "http://localhost:4566"
+# }
+EOFMOD
+  log_ok "Bloque module reporting_lambdas añadido a environments/dev/main.tf (comentado hasta ejecutar scaffold)."
+fi
 
 cat > "$TF_BACKEND/environments/dev/outputs.tf" << 'EOF'
 output "api_endpoint" {
@@ -3780,12 +3809,18 @@ terraform {
       source  = "hashicorp/kubernetes"
       version = "~> 2.30"
     }
+    archive = {
+      source  = "hashicorp/archive"
+      version = "~> 2.4"
+    }
   }
 }
 
 provider "aws" {
   region = var.aws_region
 }
+
+provider "archive" {}
 
 # Providers Kubernetes/Helm apuntando al cluster EKS de este ambiente (lo crea
 # module.eks). Autenticación vía exec (aws eks get-token).
@@ -4040,6 +4075,16 @@ module "argocd" {
 
   depends_on = [module.eks]
 }
+
+# Activa este módulo después de ejecutar report_lambdas_scaffold.py.
+# module "reporting_lambdas" {
+#   source           = "../../modules/reporting-lambdas"
+#   org              = var.project_name
+#   kafka_topic      = "report.processed"
+#   lambda_runtime   = "python3.12"
+#   report_bucket    = "${var.project_name}-reports"
+#   aws_endpoint_url = ""
+# }
 EOF
 
 cat > "$TF_BACKEND/environments/$env/outputs.tf" << 'EOF'

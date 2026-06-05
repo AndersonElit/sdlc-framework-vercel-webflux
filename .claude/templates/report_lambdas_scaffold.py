@@ -237,7 +237,7 @@ def format_lambda(root: Path, fmt: str, org: str) -> None:
 # Terraform
 # --------------------------------------------------------------------------- #
 def terraform(root: Path, org: str, topic: str, runtime: str, formats: list[str]) -> None:
-    base = "reporting-lambdas/infra"
+    base = "terraform/backend/modules/reporting-lambdas"
 
     write(root, f"{base}/variables.tf", _r('''variable "org" {
   type    = string
@@ -275,43 +275,6 @@ variable "kafka_topic" {
   default = "__TOPIC__"
 }
 ''', ORG=org, RUNTIME=runtime, TOPIC=topic))
-
-    write(root, f"{base}/provider.tf", '''terraform {
-  required_providers {
-    aws = {
-      source  = "hashicorp/aws"
-      version = "~> 5.0"
-    }
-    archive = {
-      source  = "hashicorp/archive"
-      version = "~> 2.4"
-    }
-  }
-}
-
-# Provider AWS. En dev apunta a floci (:4566); en staging/prod se omiten los overrides.
-provider "aws" {
-  region                      = var.aws_region
-  access_key                  = "test"
-  secret_key                  = "test"
-  s3_use_path_style           = true
-  skip_credentials_validation = true
-  skip_metadata_api_check     = true
-  skip_requesting_account_id  = true
-
-  endpoints {
-    lambda      = var.aws_endpoint_url
-    events      = var.aws_endpoint_url
-    s3          = var.aws_endpoint_url
-    iam         = var.aws_endpoint_url
-    sts         = var.aws_endpoint_url
-    cloudwatch  = var.aws_endpoint_url
-    logs        = var.aws_endpoint_url
-  }
-}
-
-provider "archive" {}
-''')
 
     write(root, f"{base}/iam.tf", '''data "aws_iam_policy_document" "lambda_assume" {
   statement {
@@ -359,7 +322,7 @@ resource "aws_iam_role_policy" "reporting_lambda" {
 # --- Lambda Kafka Consumer: report.processed -> EventBridge PutEvents (DR-5) ---
 data "archive_file" "kafka_consumer" {
   type        = "zip"
-  source_dir  = "${path.module}/../kafka-consumer"
+  source_dir  = "${path.module}/../../../../reporting-lambdas/kafka-consumer"
   output_path = "${path.module}/build/kafka-consumer.zip"
 }
 
@@ -403,7 +366,7 @@ resource "aws_lambda_event_source_mapping" "kafka_consumer" {
 # ===================== Formato __FMT_UP__ =====================
 data "archive_file" "__FMT__" {
   type        = "zip"
-  source_dir  = "${path.module}/../__FMT__"
+  source_dir  = "${path.module}/../../../../reporting-lambdas/__FMT__"
   output_path = "${path.module}/build/__FMT__.zip"
 }
 
@@ -461,13 +424,6 @@ output "kafka_consumer_function" {
 }
 ''')
 
-    # dev tfvars (floci)
-    write(root, f"{base}/dev.tfvars", _r('''org                      = "__ORG__"
-aws_endpoint_url         = "http://localhost:4566"
-report_bucket            = "__ORG__-reports"
-kafka_bootstrap_servers  = "kafka:9092"
-kafka_topic              = "__TOPIC__"
-''', ORG=org, TOPIC=topic))
 
 
 # --------------------------------------------------------------------------- #
@@ -491,28 +447,38 @@ Generado por `report_lambdas_scaffold.py` (PLAN-reporteria-spark-etl.md §7.2).
 ```
 reporting-lambdas/
 ├── kafka-consumer/   # consume __TOPIC__ -> PutEvents EventBridge (DR-5)
-__FORMAT_DIRS__├── infra/            # Terraform: bus + rules + lambdas + IAM
+__FORMAT_DIRS__
+```
+
+## Terraform
+
+El módulo Terraform vive en el árbol creado por `base-infrastructure-builder.sh`:
+
+```
+terraform/backend/modules/reporting-lambdas/   # IAM + EventBridge bus + lambdas
+terraform/backend/environments/dev/main.tf     # module "reporting_lambdas" { ... }
 ```
 
 ## Desplegar (dev, floci)
 
 ```bash
-cd infra
+cd terraform/backend/environments/dev
 terraform init
-terraform apply -var-file=dev.tfvars
+terraform apply
 ```
 
-El **mismo** Terraform aplica en staging/prod (AWS real): solo cambian
-`aws_endpoint_url` (vacío => AWS real) y las credenciales del provider (DR-8).
+El **mismo** módulo aplica en staging/prod (AWS real): solo cambian las variables
+`aws_endpoint_url` (vacío => AWS real) pasadas desde cada environment (DR-8).
 ''', TOPIC=topic,
         FORMAT_DIRS="".join(f"├── {f}/{' ' * (16 - len(f))}# parquet -> {f.upper()} -> output/{f}/\n"
                             for f in formats)))
 
     abs_root = root.resolve()
     print(f"\nDone! Reporting serverless layer scaffolded at: {abs_root}/reporting-lambdas")
+    print(f"Terraform module at:  {abs_root}/terraform/backend/modules/reporting-lambdas")
     print("\nNext:")
-    print("  cd reporting-lambdas/infra && terraform init && terraform validate")
-    print("  terraform apply -var-file=dev.tfvars   # dev sobre floci (:4566)")
+    print("  cd terraform/backend/environments/dev && terraform init && terraform validate")
+    print("  terraform apply   # dev sobre floci (:4566)")
 
 
 def main() -> None:
