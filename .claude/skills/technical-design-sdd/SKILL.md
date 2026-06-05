@@ -337,6 +337,21 @@ Definir:
 - consideraciones de consistencia,
 - estrategia de migraciones.
 
+# PATRÓN OBLIGATORIO — DATABASE-PER-SERVICE
+
+Todo diseño de microservicios **debe** declarar explícitamente el patrón **Database-per-Service**:
+
+- Cada microservicio posee y gestiona su propia base de datos; ningún otro servicio accede directamente a ella (ni para lectura ni para escritura).
+- Las bases de datos se provisionan automáticamente por `init-databases.sh` usando la convención: `<prefijo>_<servicio_slug>` (ej. `mydb_clientes_service`). El prefijo se define en `scaffold-all-services.sh` con `-p <prefijo-pg>` / `-m <prefijo-mongo>`.
+- El esquema inicial de cada servicio lo aplica Flyway en el arranque (`V1__initial_schema.sql`), **no** un script global.
+- La comunicación entre servicios que necesita datos de otra BD se resuelve mediante **eventos de dominio** (Kafka) o **llamadas REST** al servicio propietario — nunca acceso directo a la BD ajena.
+- En la tabla resumen de entidades, incluir una columna **"BD propietaria"** que indique la base de datos que le corresponde a cada servicio según la convención de nombres.
+
+| Microservicio | BD propietaria | Motor | Tablas / Colecciones |
+|---|---|---|---|
+| `clientes-service` | `<prefijo>_clientes_service` | PostgreSQL | ... |
+| `eventos-service` | `<prefijo>_eventos_service` | MongoDB | ... |
+
 # MODELO DE DATOS (ARCHIVO INDEPENDIENTE OBLIGATORIO)
 
 Además de la descripción conceptual en el cuerpo del documento, debes generar el modelo de datos como un **archivo independiente** dentro de `docs/design/database/`. El formato del artefacto depende del tipo de base de datos definido en el Strategic Design / Stack Tecnológico:
@@ -379,10 +394,12 @@ Si el diseño usa más de un motor (por ejemplo PostgreSQL para un contexto y Mo
 - Reflejar las relaciones y trust boundaries del dominio (referencias, foreign keys, embedding).
 - Elegir el formato (`.sql`, `.js` o ambos) según el tipo de base de datos decidido en el Stack Tecnológico de `system.md`.
 - Mantener nivel de diseño: esquema y estructura, sin datos de prueba ni lógica de aplicación.
+- **Separación por BD (Database-per-Service):** los comentarios `-- BC-XX:` en el `schema.sql` delimitan los bloques de tablas de cada microservicio. Cada bloque `-- BC-XX:` se extrae por `scaffold-all-services.sh` a la migración `V1__initial_schema.sql` del servicio correspondiente y se aplica sobre su BD propia (`<prefijo>_<svc_slug>`). **No existe un schema global compartido en producción**; el `schema.sql` es únicamente el artefacto de diseño de referencia.
 - **Tablas de soporte para Saga y Outbox (si aplica):** si el diseño incluye sagas, añade al `schema.sql` (bajo un comentario de bounded context propio) las tablas de soporte, agrupadas por su servicio propietario:
   - En el **servicio orquestador** (`integration-service`): `saga_instance` (`saga_id` PK, `saga_type`, `state`, `current_step`, `payload jsonb`, timestamps) y `saga_step_log` (`id`, `saga_id` FK, `step_name`, `status`, `compensation_payload jsonb`, `executed_at`).
   - En cada **servicio participante** que publica eventos: `outbox` (`id`, `aggregate_type`, `aggregate_id`, `event_type`, `payload jsonb`, `topic`, `created_at`, `published_at`, `status`; índice sobre `status, created_at`) y `processed_message` (`message_id` PK, `consumer`, `processed_at`) para idempotencia.
   - Cada tabla es propiedad de exactamente un microservicio; sepáralas con comentarios `-- BC-XX:` para que la generación de migraciones Flyway las asigne correctamente.
+  - Cada tabla vive en la BD del servicio propietario, nunca en una BD compartida.
 
 # REFERENCIA EN EL DOCUMENTO
 
@@ -580,6 +597,7 @@ Documentar decisiones técnicas importantes.
 
 # ADRs OBLIGATORIOS SEGÚN LAS DECISIONES ESTRATÉGICAS
 
+- **Siempre obligatorio:** incluye un `ADR-xxx` para **Database-per-Service**: cada microservicio posee su propia BD aislada (`<prefijo>_<servicio_slug>`), provistonada por `init-databases.sh`; el esquema lo aplica Flyway en el arranque; la comunicación entre servicios usa eventos (Kafka) o REST, nunca acceso directo a la BD ajena. Tradeoffs: autonomía e independencia de despliegue a cambio de consistencia eventual y ausencia de JOINs entre BDs.
 - Si el Strategic Design definió una capa de integración dedicada, incluye un `ADR-xxx` que profundice **Apache Camel como capa de integración en `integration-service`**: bridge reactivo Camel↔Reactor (`camel-reactive-streams`, prohibido `block()`), resiliencia con Resilience4j y ACL por sistema externo.
 - Si definió sagas, incluye un `ADR-xxx` para la **orquestación de saga** (Camel Saga EIP + coordinador **Narayana LRA**, orquestador en `integration-service`, compensaciones idempotentes) y un `ADR-xxx` para el **Transactional Outbox** en los participantes (publicación de eventos atómica con el cambio de BD; relay por polling en dev, evolucionable a CDC/Debezium).
 
@@ -744,19 +762,34 @@ Con base en el contenido leído, genera los tres documentos SDD técnicos siguie
 Si el diseño estratégico declara reportería, materialízala técnicamente en los tres documentos:
 
 **En SDD-system.md (Arquitectura del Sistema / C4):**
-- Añade los contenedores `report-extraction-service` (MS1, Spark batch Scala), `report-processing-service` (MS2, Spark batch Scala) y la **malla serverless**: Lambda Kafka Consumer, bus EventBridge, lambdas PDF/XLS/CSV.
-- En el **Stack Tecnológico**: Apache Spark 3.5.1 / Scala 2.13 (fat JAR sbt-assembly), `mongo-spark-connector` (read model CQRS) o Spark JDBC, S3 (floci en dev), Kafka, AWS Lambda + EventBridge (Python 3.12).
-- Describe cada servicio en **Componentes del Sistema** con sus capas hexagonales (Spark/Kafka/S3 confinados a `infrastructure`).
+- Añade los siguientes contenedores al C4 nivel 2:
+  - `projection-service` (Spring Boot reactivo, Kafka consumer + R2DBC PostgreSQL): consume eventos de dominio de todos los microservicios y escribe tablas desnormalizadas en `<prefix>_readmodel`. **Es el único escritor del read model.**
+  - `report-extraction-service` (MS1, Spark batch Scala — **CronJob K8s**): lee `<prefix>_readmodel` vía JDBC y escribe parquet `raw/` en S3.
+  - `report-processing-service` (MS2, Spark batch Scala — **CronJob K8s**): consume `report.extracted`, transforma por tipo y escribe parquet `processed/`.
+  - Malla serverless: Lambda Kafka Consumer, bus EventBridge, lambdas PDF/XLS/CSV.
+- En el **Stack Tecnológico**: Apache Spark 3.5.1 / Scala 2.13 (fat JAR sbt-assembly), **Spark JDBC** (lectura del read model PostgreSQL), S3 (floci en dev), Kafka, AWS Lambda + EventBridge (Python 3.12), Kubernetes CronJob (despliegue de MS1/MS2). Eliminar `mongo-spark-connector` como opción CQRS; el read model es **PostgreSQL relacional**.
+- Describe el `projection-service` en **Componentes del Sistema** con su rol: proyector de eventos CQRS, único escritor del read model; usa R2DBC reactivo para escribir tablas desnormalizadas (ej. `report_sales`, `report_customers`).
+- Describe MS1 y MS2 como **jobs batch disparados por schedule** (no servicios REST); representarlos en el C4 como contenedores batch con su expresión cron.
 
 **En SDD-design.md (Diseño Técnico):**
-- **Flujo ETL** en *Flujos Técnicos Principales*: read model → MS1 (valida esquema → parquet `raw/` → `report.extracted`) → MS2 (transforma por tipo vía Factory → parquet `processed/` → `report.processed`) → Lambda Consumer → EventBridge → lambdas de formato → `output/{pdf,xls,csv}/`.
-- En **Diseño de Persistencia**: esquemas parquet (`raw`/`processed`), layout S3 (§9.1) y la tabla `report_schema_catalog` (`report_type` PK, `schema_version`, `columns` jsonb, `integrity_rules` jsonb, `updated_at`).
-- Documenta los topics/eventos `report.extracted` y `report.processed` (contratos JSON) y los de fallo en la documentación de eventos asíncronos.
+- **Flujo ETL con CQRS** en *Flujos Técnicos Principales*:
+  1. Domain MSes publican eventos a Kafka (`CustomerCreated`, `OrderCreated`, `PaymentCompleted`, etc.)
+  2. `projection-service` consume todos los eventos y proyecta tablas desnormalizadas en `<prefix>_readmodel` (PostgreSQL).
+  3. MS1 Spark lee `<prefix>_readmodel` vía JDBC → valida esquema → parquet `raw/` → publica `report.extracted`.
+  4. MS2 Spark consume `report.extracted` → transforma por tipo (Factory) → parquet `processed/` → publica `report.processed`.
+  5. Lambda Consumer → EventBridge → lambdas de formato → `output/{pdf,xls,csv}/`.
+- En **Diseño de Persistencia**:
+  - Esquemas parquet (`raw`/`processed`) y layout S3.
+  - **`<prefijo>_readmodel`** (PostgreSQL, Database-per-Service del Projection Service): tablas desnormalizadas optimizadas para extracción; ej. `report_sales (customer_id, customer_name, order_id, order_total, payment_amount, payment_date)`. MS1 la lee con `SELECT * FROM report_sales` vía JDBC — sin JOINs entre BDs operacionales.
+  - **`<prefijo>_reporting`** (PostgreSQL): tabla `report_schema_catalog` (`report_type` PK, `schema_version`, `columns` jsonb, `integrity_rules` jsonb, `updated_at`); MS1 la consulta para validar el esquema del DataFrame extraído.
+  - Incluir en la tabla de BDs la columna "BD propietaria" indicando que `<prefix>_readmodel` es propiedad del `projection-service` y que es **read-only para el resto**.
+- Documenta los topics/eventos `report.extracted` y `report.processed` (contratos JSON) y los de fallo.
 
 **En SDD-infrastructure.md (ADR):**
+- `ADR-xxx` — **CQRS con read model PostgreSQL relacional**: el `projection-service` proyecta eventos de dominio (Kafka) sobre tablas SQL desnormalizadas en `<prefix>_readmodel`; MS1 Spark lee con JDBC (`SparkJdbcSourceAdapter`). Tradeoff: consistencia eventual + queries SQL expresivos sin JOINs entre BDs operacionales.
+- `ADR-xxx` — Spark batch en dos servicios desplegados como **Kubernetes CronJob** (no Deployment); schedule configurable por ambiente vía `--schedule "<cron>"`; ArgoCD sincroniza el CronJob; Jenkins termina en `bumpImageTag` (sin smoke tests HTTP).
 - `ADR-xxx` — Spark batch en dos servicios; parquet como contrato; Factory de transformadores (Abierto/Cerrado).
-- `ADR-xxx` — Capa serverless (Lambda+EventBridge) sobre floci en dev (drop-in para Terraform/AWS) y AWS real en prod.
-- Si hay CQRS: `ADR-CQRS-x` — consistencia eventual write→read aceptada e idempotencia del proyector; la reportería refleja el read model en `validatedAt`.
+- `ADR-xxx` — Capa serverless (Lambda+EventBridge) sobre floci en dev y AWS real en prod.
 
 ### Reglas de coherencia
 

@@ -87,6 +87,7 @@ REPORT_EXTRACTION=()              # --report-extraction <svc>:<source>:<topic-ou
 REPORT_PROCESSING=()              # --report-processing <svc>:<topic-in>:<topic-out>
 REPORT_TYPES=""                   # --report-types ventas-mensual,saldos
 REPORT_FORMATS=""                 # --report-formats pdf,xls,csv
+REPORT_SCHEDULE="0 * * * *"      # --report-schedule CRON (CronJob K8s, default: cada hora)
 PROJECT_NAME=""
 PG_DB_NAME=""
 MONGO_DB_NAME=""
@@ -138,6 +139,9 @@ Uso: $0 -P <proyecto> --backend nombre:db:messaging:puerto [--backend ...] \
               Tipos de reporte de MS2: un ReportTransformer + registro por tipo (Factory, DR-10).
   --report-formats pdf,xls,csv                     (opcional)
               Genera la capa serverless (lambdas PDF/XLS/CSV + Kafka consumer + Terraform EventBridge).
+  --report-schedule "CRON"                          (opcional)
+              Expresión cron del CronJob K8s para los batch jobs Spark.
+              Default: "0 * * * *" (cada hora). Ej: "0 2 * * *" = 2 AM diario.
 
 Ejemplo:
   bash $0 \\
@@ -360,6 +364,14 @@ while [[ $# -gt 0 ]]; do
       REPORT_FORMATS="${1#*=}"
       shift
       ;;
+    --report-schedule)
+      REPORT_SCHEDULE="${2:?--report-schedule requiere una expresión cron entre comillas}"
+      shift 2
+      ;;
+    --report-schedule=*)
+      REPORT_SCHEDULE="${1#*=}"
+      shift
+      ;;
     -h|--help)
       usage
       ;;
@@ -465,7 +477,12 @@ for svc_spec in "${BACKEND_SERVICES[@]}"; do
   [[ -n "${SAGA_PARTICIPANTS[$name]:-}" ]] && EXTRA_FLAGS+=("--saga-participant")
 
   log "Generando $name (db=$db, messaging=$messaging, port=$port${EXTRA_FLAGS:+, ${EXTRA_FLAGS[*]}})..."
-  if (cd "$BACKEND_DIR" && python3 "$MAVEN_TEMPLATE" -n "$name" -d "$db" -m "$messaging" -p "$port" --org "$PROJECT_NAME" "${EXTRA_FLAGS[@]}"); then
+  # Database-per-Service: pasar prefijos para que el script generado derive la BD
+  # correcta (<prefix>_<servicio_slug>), consistente con init-databases.sh.
+  if (cd "$BACKEND_DIR" && python3 "$MAVEN_TEMPLATE" -n "$name" -d "$db" -m "$messaging" -p "$port" \
+        --org "$PROJECT_NAME" \
+        --pg-db "$PG_DB_NAME" --mongo-db "$MONGO_DB_NAME" \
+        "${EXTRA_FLAGS[@]}"); then
     log_ok "$name generado."
   else
     log_err "$name — falló la generación."
@@ -524,7 +541,9 @@ if [[ "$HAS_REPORTING" -eq 1 ]]; then
       log "Generando $rname (extraction, source=$rsource, out=$rtopic_out)..."
       if (cd "$BACKEND_DIR" && python3 "$SCALA_TEMPLATE" \
             --service-name "$rname" --report-role extraction \
-            --source "$rsource" --kafka-out "$rtopic_out"); then
+            --source "$rsource" --kafka-out "$rtopic_out" \
+            --org "$PROJECT_NAME" --schedule "$REPORT_SCHEDULE" \
+            --pg-db "$PG_DB_NAME"); then
         log_ok "$rname generado."
       else
         log_err "$rname — falló la generación."
@@ -553,7 +572,8 @@ if [[ "$HAS_REPORTING" -eq 1 ]]; then
       if (cd "$BACKEND_DIR" && python3 "$SCALA_TEMPLATE" \
             --service-name "$rname" --report-role processing \
             --kafka-in "$rtopic_in" --kafka-out "$rtopic_out" \
-            --report-types "$REPORT_TYPES"); then
+            --report-types "$REPORT_TYPES" \
+            --org "$PROJECT_NAME" --schedule "$REPORT_SCHEDULE"); then
         log_ok "$rname generado."
       else
         log_err "$rname — falló la generación."

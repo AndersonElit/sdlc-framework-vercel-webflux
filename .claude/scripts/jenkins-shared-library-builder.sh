@@ -94,12 +94,11 @@ def call(Map args = [:]) {
 }
 EOF
 
-# assembleSparkService — build + tests + fat JAR de un servicio de reportería (Spark, sbt)
-cat > "$OUT_DIR/vars/assembleSparkService.groovy" <<'EOF'
-// Compila, prueba y ensambla el fat JAR de un servicio Spark de reportería
-// (report-extraction-service / report-processing-service) generado por
-// scala_hexagonal_scaffold.py --report-role. Spark va '% provided'; el JAR
-// incluye Kafka/Mongo y se ejecuta en cluster (o local[*] en dev).
+# buildScalaBatchJob — build + tests + fat JAR de un Spark batch job (sbt)
+cat > "$OUT_DIR/vars/buildScalaBatchJob.groovy" <<'EOF'
+// Compila, prueba y ensambla el fat JAR de un Spark batch job generado por
+// scala_hexagonal_scaffold.py. Spark va '% provided'; el JAR incluye Kafka/Mongo
+// y se ejecuta en cluster o local[*] (dev). Llamado desde el Jenkinsfile Scala.
 def call(Map args = [:]) {
     sh 'sbt -batch clean test'
     sh 'sbt -batch "entryPoints/assembly"'
@@ -145,13 +144,20 @@ def call(Map args = [:]) {
 }
 EOF
 
-# runQualityGates — SonarQube + quality gate
+# runQualityGates — SonarQube + quality gate (Maven y sbt)
 cat > "$OUT_DIR/vars/runQualityGates.groovy" <<'EOF'
 // Análisis estático + espera del quality gate. Falla si el gate = ERROR.
+// projectType: 'maven' (default) | 'sbt'  — determina el comando de análisis.
 def call(Map args = [:]) {
-    def sonarEnv = args.sonarEnv ?: 'sonarqube'
+    def sonarEnv    = args.sonarEnv    ?: 'sonarqube'
+    def projectType = args.projectType ?: 'maven'
     withSonarQubeEnv(sonarEnv) {
-        sh 'mvn -B --no-transfer-progress sonar:sonar'
+        if (projectType == 'sbt') {
+            // sbt-sonar plugin (addSbtPlugin "com.github.mwz" % "sonar-scala" % "…")
+            sh 'sbt -batch sonarScan'
+        } else {
+            sh 'mvn -B --no-transfer-progress sonar:sonar'
+        }
     }
     timeout(time: 10, unit: 'MINUTES') {
         def qg = waitForQualityGate()
@@ -162,13 +168,20 @@ def call(Map args = [:]) {
 }
 EOF
 
-# runSecurityScans — OWASP Dependency Check + escaneo de secretos
+# runSecurityScans — OWASP Dependency Check + escaneo de secretos (Maven y sbt)
 cat > "$OUT_DIR/vars/runSecurityScans.groovy" <<'EOF'
-// OWASP Dependency Check (CVEs) + escaneo de secretos. Falla ante hallazgo crítico.
+// OWASP Dependency Check (CVEs) + escaneo de secretos (gitleaks). Falla ante CVE crítico.
+// projectType: 'maven' (default) | 'sbt'  — determina el comando OWASP.
 def call(Map args = [:]) {
-    def failOnCvss = args.failOnCvss ?: '9'
-    // OWASP corre en el contenedor maven (defaultContainer del pod backend).
-    sh "mvn -B --no-transfer-progress org.owasp:dependency-check-maven:check -DfailBuildOnCVSS=${failOnCvss}"
+    def failOnCvss  = args.failOnCvss  ?: '9'
+    def projectType = args.projectType ?: 'maven'
+    if (projectType == 'sbt') {
+        // sbt-dependency-check plugin: addSbtPlugin "net.vonbuchholtz" % "sbt-dependency-check" % "…"
+        sh "sbt -batch dependencyCheckAggregate"
+    } else {
+        // OWASP corre en el contenedor maven (defaultContainer del pod backend).
+        sh "mvn -B --no-transfer-progress org.owasp:dependency-check-maven:check -DfailBuildOnCVSS=${failOnCvss}"
+    }
     // Escaneo de secretos (gitleaks) en su propio contenedor. Sustituible por trufflehog.
     container('gitleaks') {
         sh 'gitleaks detect --source . --no-banner --redact --exit-code 1'
@@ -442,7 +455,45 @@ spec:
           memory: 1Gi
 EOF
 
-log_ok "Pods de agentes (podBackend.yaml, podFrontend.yaml) generados."
+# Pod Scala batch — SBT + Kaniko + Trivy + gitleaks.
+# Sin sidecar dind ni contenedor maven: los batch jobs Spark no usan Testcontainers.
+# Usado por el Jenkinsfile generado por scala_hexagonal_scaffold.py (buildScalaBatchJob).
+cat > "$OUT_DIR/resources/org/$ORG_SLUG/podScalaBatch.yaml" <<'EOF'
+apiVersion: v1
+kind: Pod
+spec:
+  serviceAccountName: jenkins-agent
+  containers:
+    - name: sbt
+      image: sbtscala/scala-sbt:eclipse-temurin-17.0.10_7_1.9.8_2.13.14
+      command: ['sleep']
+      args: ['infinity']
+      resources:
+        requests:
+          cpu: "1"
+          memory: 3Gi
+        limits:
+          cpu: "2"
+          memory: 4Gi
+    - name: kaniko
+      image: gcr.io/kaniko-project/executor:debug
+      command: ['sleep']
+      args: ['infinity']
+    - name: trivy
+      image: aquasec/trivy:0.53.0
+      command: ['sleep']
+      args: ['infinity']
+    - name: gitleaks
+      image: zricethezav/gitleaks:latest
+      command: ['sleep']
+      args: ['infinity']
+    - name: deploy
+      image: alpine/k8s:1.29.0   # incluye kubectl, helm y aws-cli
+      command: ['sleep']
+      args: ['infinity']
+EOF
+
+log_ok "Pods de agentes (podBackend.yaml, podFrontend.yaml, podScalaBatch.yaml) generados."
 
 # ---------------------------------------------------------------------------
 # bootstrap/ — objetos Kubernetes previos (namespace + ServiceAccount IRSA).

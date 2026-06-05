@@ -192,13 +192,15 @@ Para cada contexto incluir:
 - propósito,
 - responsabilidades,
 - entidades principales,
-- límites.
+- límites,
+- **datos que posee** (patrón Database-per-Service: cada bounded context es propietario exclusivo de su base de datos; ningún otro contexto accede directamente a ella).
 
 # REGLAS
 
 - Mantener separación clara de responsabilidades.
 - Evitar contextos excesivamente grandes.
 - Priorizar cohesión del dominio.
+- Cada bounded context declara sus datos como propiedad exclusiva. La comunicación de datos entre contextos ocurre mediante **eventos de dominio** o **consultas REST** al contexto propietario — nunca acceso directo a su base de datos.
 
 ---
 
@@ -482,6 +484,7 @@ Documenta decisiones tomadas a nivel estratégico en esta etapa.
 
 # DECISIONES ESTRATÉGICAS OBLIGATORIAS SEGÚN EL ADC
 
+- **Siempre obligatorio si se elige arquitectura de microservicios:** incluye una decisión estratégica (`DS-xxx`) sobre **Database-per-Service** — cada microservicio/bounded context posee y gestiona su propia base de datos; ningún otro servicio accede directamente a ella; la comunicación entre servicios que requiere datos de otro contexto usa eventos de dominio (mensajería asíncrona) o llamadas REST al servicio propietario. Documenta el tradeoff: autonomía de datos e independencia de despliegue a cambio de consistencia eventual y ausencia de JOINs entre bases de datos.
 - Si el ADC o el Context Map identifican integración con sistemas externos, incluye una decisión estratégica (`DS-xxx`) sobre la **capa de integración**: si se centraliza en un microservicio dedicado `integration-service` con Apache Camel (ACL/mediación EAI) o se distribuye por servicio. Documenta el tradeoff (gobierno central y dominio limpio vs. hop de red y posible cuello de botella).
 - Si el ADC o el Context Map identifican transacciones que cruzan servicios, incluye una decisión estratégica (`DS-xxx`) sobre la **estrategia de saga**: estilo (orquestación / coreografía / híbrido), ubicación del orquestador (recomendado: dentro del `integration-service`) y coordinador (Narayana LRA vs. saga persistida propia). Documenta el tradeoff (visibilidad/control central vs. acoplamiento y complejidad operacional). Estas decisiones se profundizan como `ADR-xxx` en el Diseño Técnico.
 
@@ -663,9 +666,13 @@ Si el ADC declara reportería, incorpora el **subsistema de reportería** al dis
 - Si el ADC declara CQRS, documenta los eventos de proyección (`<agregado>.changed`) y el read model como **vista del bounded context**.
 
 **En SDD-architecture.md (Decisiones Estratégicas DS-xxx):**
-- `DS-xxx` — **ETL Spark de dos etapas**: `report-extraction-service` (MS1, extracción + validación de esquema declarado) y `report-processing-service` (MS2, transformación por tipo de reporte con patrón Factory). Parquet como contrato entre etapas.
+- `DS-xxx` — **ETL Spark de dos etapas**: `report-extraction-service` (MS1, extracción + validación de esquema declarado) y `report-processing-service` (MS2, transformación por tipo de reporte con patrón Factory). Parquet como contrato entre etapas. Aclarar que **MS1 y MS2 son jobs batch ejecutados por schedule** (no servicios REST persistentes); no exponen endpoints HTTP; el schedule define la frecuencia de ejecución (p. ej. diario, horario). Documenta el tradeoff: simplicidad operacional de batch vs. latencia introducida por el schedule.
 - `DS-xxx` — **Capa serverless de formatos**: Lambda Kafka Consumer → EventBridge (una rule por formato) → lambdas PDF/XLS/CSV. Desacople por EventBridge.
-- Si el ADC declara CQRS: `DS-CQRS-1..3` — segregación write (PostgreSQL)/read (MongoDB), sincronización por Outbox+Kafka, y **la reportería como consumidor del read model** (prohibido apuntar a la BD operacional).
+- `DS-xxx` — **Base de datos dedicada de reportería** (`<prefijo>_reporting`): el catálogo de esquemas de reportería (`report_schema_catalog`) y los metadatos compartidos del subsistema residen en una base de datos propia del bounded context de Reportería, separada de las BDs operacionales de cada microservicio (Database-per-Service).
+- Si el ADC declara CQRS: incluye las siguientes decisiones encadenadas:
+  - `DS-CQRS-1` — **Segregación write/read**: cada microservicio operacional escribe en su propia BD PostgreSQL (Database-per-Service, lado write); el estado que necesitan los reportes se publica como eventos de dominio en Kafka. Ningún microservicio de reportería accede a las BDs operacionales.
+  - `DS-CQRS-2` — **Projection Service** (servicio dedicado de proyección, Spring Boot reactivo): consume eventos de dominio de todos los microservicios desde Kafka y construye tablas **PostgreSQL relacionales** desnormalizadas y optimizadas para consulta (p. ej. `report_sales`, `report_customers`) en una **BD PostgreSQL dedicada de lectura** (`<prefix>_readmodel`). Es el único escritor de esta BD. Tradeoff: consistencia eventual (el read model refleja el estado con un lag proporcional al throughput de Kafka) a cambio de queries SQL simples y de alto rendimiento sin JOINs entre las BDs operacionales.
+  - `DS-CQRS-3` — **Read model relacional como fuente de extracción**: el `report-extraction-service` (MS1 Spark, `--source jdbc`) lee exclusivamente de `<prefix>_readmodel` vía `SparkJdbcSourceAdapter` — prohibido apuntar a las BDs operacionales de los servicios de dominio. Al usar SQL/JDBC, los queries de extracción son expresivos y directamente verificables sin transformaciones de esquema intermedias.
 
 ### Regla de precedencia
 

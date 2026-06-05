@@ -138,7 +138,10 @@ def build_files(root: Path, svc: str, pkg: str,
 # .env
 # --------------------------------------------------------------------------- #
 def dotenv_files(root: Path, report_role: str | None = None,
-                 source: str = "mongo") -> None:
+                 source: str = "mongo", pg_db_prefix: str = "") -> None:
+    # BD del read model CQRS (PostgreSQL): <prefix>_readmodel si hay prefijo.
+    readmodel_db = f"{pg_db_prefix}_readmodel" if pg_db_prefix else "readmodel_db"
+
     if report_role is None:
         content = (
             "R2_ACCOUNT_ID=\n"
@@ -165,8 +168,8 @@ def dotenv_files(root: Path, report_role: str | None = None,
             )
         elif report_role == "extraction" and source == "jdbc":
             content += (
-                "# --- Fuente JDBC (proyectos sin CQRS) ---\n"
-                "JDBC_URL=jdbc:postgresql://localhost:5432/app\n"
+                "# --- Read model CQRS (PostgreSQL — BD dedicada de lectura) ---\n"
+                f"JDBC_URL=jdbc:postgresql://localhost:5432/{readmodel_db}\n"
                 "JDBC_TABLE=ventas\n"
                 "JDBC_USER=app\n"
                 "JDBC_PASSWORD=app\n"
@@ -182,9 +185,14 @@ def dockerfile_files(root: Path, svc: str) -> None:
     jar = "infrastructure/entry-points/target/scala-2.13/entry-points-assembly-*.jar"
 
     write(root, "Dockerfile",
-          "# Stage 1 — build fat JAR\n"
+          "# Stage 1 — cachear dependencias SBT (capa separada → rebuilds más rápidos)\n"
           "FROM sbtscala/scala-sbt:eclipse-temurin-17.0.10_7_1.9.8_2.13.14 AS builder\n"
           "WORKDIR /app\n"
+          "COPY build.sbt .\n"
+          "COPY project/ project/\n"
+          "RUN sbt update\n"
+          "\n"
+          "# Copiar fuentes y ensamblar fat JAR\n"
           "COPY . .\n"
           'RUN sbt "entryPoints/assembly"\n'
           "\n"
@@ -220,6 +228,435 @@ def dockerfile_files(root: Path, svc: str) -> None:
           ".bsp/\n"
           ".metals/\n"
           ".idea/\n")
+
+
+# --------------------------------------------------------------------------- #
+# Jenkinsfile
+# --------------------------------------------------------------------------- #
+def get_jenkinsfile_content(svc: str, org: str = "myproject") -> str:
+    lib_org = "".join(c for c in org.lower() if c.isascii() and c.isalnum()) or "myproject"
+    template = """\
+@Library('jenkins-shared-library@main') _
+
+// ───────────────────────────────────────────────────────────────────────────
+// Jenkinsfile — Spark batch job '__SVC__'
+// Pipeline CI puro; el CD lo gestiona ArgoCD (CronJob en K8s).
+// Sin smoke tests HTTP: los batch jobs no exponen endpoints.
+// Modelo de agentes: Kubernetes plugin (pod efímero con contenedor SBT).
+// El deploy NO ocurre aquí: bumpImageTag escribe el nuevo tag en Git
+// y ArgoCD auto-sincroniza el CronJob en dev/staging (manual en prod).
+// ───────────────────────────────────────────────────────────────────────────
+
+pipeline {
+    agent {
+        kubernetes {
+            defaultContainer 'sbt'
+            yaml libraryResource('org/__LIB_ORG__/podScalaBatch.yaml')
+        }
+    }
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        timeout(time: 60, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '30'))
+    }
+
+    parameters {
+        string(
+            name: 'SERVICE_NAME',
+            defaultValue: '__SVC__',
+            description: 'Nombre del batch job (deriva el repo ECR y el CronJob K8s).'
+        )
+        choice(
+            name: 'DEPLOY_ENV',
+            choices: ['dev', 'staging', 'prod'],
+            description: 'Ambiente destino del despliegue.'
+        )
+    }
+
+    environment {
+        SERVICE_NAME  = "${params.SERVICE_NAME}"
+        DEPLOY_ENV    = "${params.DEPLOY_ENV}"
+        ECR_REPO      = "${params.SERVICE_NAME}"
+        K8S_NAMESPACE = "${params.DEPLOY_ENV}"
+    }
+
+    stages {
+        // 1 — Checkout + IMAGE_TAG inmutable (<version>-<sha>).
+        stage('Checkout') {
+            steps {
+                checkout scm
+                script {
+                    env.IMAGE_TAG = computeImageTag()
+                    echo "IMAGE_TAG=${env.IMAGE_TAG}"
+                }
+            }
+        }
+
+        // 2 — Compilar, tests unitarios y fat JAR (sbt compile test assembly).
+        stage('Build & Test') {
+            steps { buildScalaBatchJob() }
+        }
+
+        // 3 — Análisis estático + quality gate (SonarQube). Falla si gate = ERROR.
+        //     projectType: 'sbt' usa "sbt sonarScan" en lugar de mvn sonar:sonar.
+        stage('Quality Gate (SonarQube)') {
+            steps { runQualityGates(projectType: 'sbt') }
+        }
+
+        // 4 — OWASP Dependency Check (sbt-dependency-check) + gitleaks.
+        stage('Security Scans') {
+            steps { runSecurityScans(projectType: 'sbt') }
+        }
+
+        // 5 — Imagen Docker multi-stage vía Kaniko → push a Amazon ECR.
+        stage('Build & Push Image') {
+            steps {
+                buildAndPushImage(
+                    service:  env.SERVICE_NAME,
+                    ecrRepo:  env.ECR_REPO,
+                    imageTag: env.IMAGE_TAG
+                )
+            }
+        }
+
+        // 6 — Escaneo Trivy de la imagen publicada. Falla ante CVE crítico.
+        stage('Image Scan (Trivy)') {
+            steps { scanImage(ecrRepo: env.ECR_REPO, imageTag: env.IMAGE_TAG) }
+        }
+
+        // 7 — Frontera CI → CD: escribe image.repository/tag en
+        //     helm/__SVC__/values-<env>.yaml y commitea (GitOps).
+        //     ArgoCD detecta el commit y actualiza el CronJob en el cluster.
+        stage('Update GitOps (image tag)') {
+            steps {
+                bumpImageTag(
+                    service:  env.SERVICE_NAME,
+                    env:      env.DEPLOY_ENV,
+                    imageTag: env.IMAGE_TAG
+                )
+            }
+        }
+    }
+
+    post {
+        success { notify(status: 'SUCCESS', service: env.SERVICE_NAME, env: env.DEPLOY_ENV) }
+        failure { notify(status: 'FAILURE', service: env.SERVICE_NAME, env: env.DEPLOY_ENV) }
+    }
+}
+"""
+    return template.replace("__SVC__", svc).replace("__LIB_ORG__", lib_org)
+
+
+# --------------------------------------------------------------------------- #
+# Helm chart (CronJob)
+# --------------------------------------------------------------------------- #
+def get_helm_chart_files(svc: str, schedule: str = "0 * * * *") -> dict:
+    chart_yaml = f"""\
+apiVersion: v2
+name: {svc}
+description: Helm chart del Spark batch job {svc} (Kubernetes CronJob)
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+"""
+
+    values_yaml = f"""\
+# Valores base. image.repository/tag se fijan por ambiente en values-<env>.yaml (GitOps).
+
+# Expresión cron que controla cuándo Kubernetes lanza el Job.
+# Formato: "minuto hora día-mes mes día-semana"  →  "0 * * * *" = cada hora en punto.
+schedule: "{schedule}"
+
+image:
+  repository: ""   # <registry>/<service> — definido en values-<env>.yaml
+  tag: ""          # <version>-<sha> inmutable — definido en values-<env>.yaml
+  pullPolicy: IfNotPresent
+
+resources:
+  requests:
+    cpu: 500m
+    memory: 2Gi
+  limits:
+    cpu: "2"
+    memory: 4Gi
+
+# Never: el pod no se reinicia si falla (el Job reintenta según backoffLimit).
+restartPolicy: Never
+# Forbid: no lanza un nuevo Job si el anterior todavía está corriendo.
+concurrencyPolicy: Forbid
+successfulJobsHistoryLimit: 3
+failedJobsHistoryLimit: 1
+
+env: []
+"""
+
+    image_block = """\
+# image.repository / image.tag los fija el pipeline (bumpImageTag); ArgoCD los lee.
+image:
+  repository: ""
+  tag: ""
+"""
+
+    values_dev = image_block + """\
+resources:
+  requests:
+    cpu: 250m
+    memory: 1Gi
+  limits:
+    cpu: "1"
+    memory: 2Gi
+"""
+
+    values_staging = image_block + """\
+resources:
+  requests:
+    cpu: 500m
+    memory: 2Gi
+  limits:
+    cpu: "2"
+    memory: 4Gi
+"""
+
+    values_prod = image_block + """\
+resources:
+  requests:
+    cpu: "1"
+    memory: 4Gi
+  limits:
+    cpu: "4"
+    memory: 8Gi
+"""
+
+    cronjob_tpl = """\
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ .Chart.Name }}
+  labels:
+    app: {{ .Chart.Name }}
+spec:
+  schedule: {{ .Values.schedule | quote }}
+  concurrencyPolicy: {{ .Values.concurrencyPolicy }}
+  successfulJobsHistoryLimit: {{ .Values.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ .Values.failedJobsHistoryLimit }}
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            app: {{ .Chart.Name }}
+        spec:
+          restartPolicy: {{ .Values.restartPolicy }}
+          containers:
+            - name: {{ .Chart.Name }}
+              image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              resources:
+                {{- toYaml .Values.resources | nindent 16 }}
+              {{- with .Values.env }}
+              env:
+                {{- toYaml . | nindent 16 }}
+              {{- end }}
+"""
+
+    return {
+        "Chart.yaml": chart_yaml,
+        "values.yaml": values_yaml,
+        "values-dev.yaml": values_dev,
+        "values-staging.yaml": values_staging,
+        "values-prod.yaml": values_prod,
+        ".helmignore": ".git\n*.tmp\n*.bak\n",
+        "templates/cronjob.yaml": cronjob_tpl,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# scripts/create-secrets-dev.sh
+# --------------------------------------------------------------------------- #
+def get_secrets_script_content(svc: str, report_role: str | None,
+                                source: str, org: str = "myproject",
+                                pg_db_prefix: str = "") -> str:
+    import json as _json
+
+    # BD PostgreSQL del read model CQRS: <prefix>_readmodel
+    readmodel_db = f"{pg_db_prefix}_readmodel" if pg_db_prefix else "readmodel_db"
+
+    if report_role is None:
+        secret: dict = {
+            "R2_ACCOUNT_ID": "",
+            "R2_ACCESS_KEY_ID": "",
+            "R2_SECRET_ACCESS_KEY": "",
+        }
+    else:
+        secret = {
+            "AWS_ENDPOINT_URL": "http://localhost:4566",
+            "AWS_ACCESS_KEY_ID": "test",
+            "AWS_SECRET_ACCESS_KEY": "test",
+            "AWS_REGION": "us-east-1",
+            "REPORT_BUCKET": "reports",
+            "KAFKA_BOOTSTRAP_SERVERS": "localhost:9092",
+        }
+        if report_role == "extraction" and source == "mongo":
+            secret.update({
+                "MONGO_URI": "mongodb://localhost:27017",
+                "MONGO_READ_DB": "readmodel",
+                "MONGO_READ_COLLECTION": "ventas",
+            })
+        elif report_role == "extraction" and source == "jdbc":
+            secret.update({
+                "JDBC_URL": f"jdbc:postgresql://localhost:5432/{readmodel_db}",
+                "JDBC_TABLE": "ventas",
+                "JDBC_USER": "app",
+                "JDBC_PASSWORD": "app",
+            })
+
+    secret_json = _json.dumps(secret)
+    return f"""\
+#!/usr/bin/env bash
+# Crea (o actualiza) el secret de desarrollo en floci (emulador AWS).
+# Requiere que floci esté corriendo en http://localhost:4566.
+
+SECRET_NAME="{org}/dev/{svc}"
+ENDPOINT="http://localhost:4566"
+REGION="us-east-1"
+
+if aws --endpoint-url="$ENDPOINT" secretsmanager describe-secret \\
+       --secret-id "$SECRET_NAME" --region "$REGION" &>/dev/null; then
+    aws --endpoint-url="$ENDPOINT" secretsmanager put-secret-value \\
+        --secret-id "$SECRET_NAME" \\
+        --secret-string '{secret_json}' \\
+        --region "$REGION"
+    echo "Secret actualizado: $SECRET_NAME"
+else
+    aws --endpoint-url="$ENDPOINT" secretsmanager create-secret \\
+        --name "$SECRET_NAME" \\
+        --secret-string '{secret_json}' \\
+        --region "$REGION"
+    echo "Secret creado: $SECRET_NAME"
+fi
+"""
+
+
+# --------------------------------------------------------------------------- #
+# Gitea, ArgoCD, Terraform
+# --------------------------------------------------------------------------- #
+def _setup_gitea_repo(svc: str, root: Path, org: str = "myproject") -> None:
+    import base64
+    import json as _json
+    import subprocess
+    import urllib.error
+    import urllib.request
+
+    gitea_host = "http://localhost:3000"
+    credentials = base64.b64encode(b"gitea-admin:gitea-admin").decode()
+
+    try:
+        urllib.request.urlopen(f"{gitea_host}/api/healthz", timeout=3)
+    except Exception:
+        logger.warning(
+            "[Gitea] No activo en %s — crear el repo manualmente tras correr "
+            "base-infrastructure-builder.sh.", gitea_host
+        )
+        return
+
+    payload = _json.dumps({
+        "name": svc, "private": True,
+        "auto_init": False, "default_branch": "main",
+    }).encode()
+    req = urllib.request.Request(
+        f"{gitea_host}/api/v1/orgs/{org}/repos",
+        data=payload,
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Basic {credentials}"},
+        method="POST",
+    )
+    try:
+        urllib.request.urlopen(req, timeout=5)
+        logger.info("[Gitea] Repo %s/%s creado.", org, svc)
+    except urllib.error.HTTPError as e:
+        if e.code == 409:
+            logger.info("[Gitea] Repo %s/%s ya existe.", org, svc)
+        elif e.code == 401:
+            logger.warning("[Gitea] HTTP 401: correr base-infrastructure-builder.sh primero.")
+            return
+        else:
+            logger.warning("[Gitea] No se pudo crear el repo: HTTP %s", e.code)
+            return
+
+    try:
+        subprocess.run(["git", "init", "-q", "-b", "main"], cwd=root, check=True)
+        result = subprocess.run(["git", "config", "user.email"], cwd=root, capture_output=True)
+        if result.returncode != 0:
+            subprocess.run(["git", "config", "user.email", f"cicd@{org}.local"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", f"{org} CI"], cwd=root, check=True)
+        subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", f"chore: scaffold {svc}"], cwd=root, check=True)
+        remote_url = f"{gitea_host}/{org}/{svc}.git"
+        subprocess.run(["git", "remote", "add", "origin", remote_url], cwd=root, check=False)
+        logger.info("[Gitea] Remote 'origin' → %s", remote_url)
+        push_url = remote_url.replace("http://", "http://gitea-admin:gitea-admin@", 1)
+        push = subprocess.run(["git", "push", push_url, "main"], cwd=root, capture_output=True)
+        if push.returncode == 0:
+            logger.info("[Gitea] Push a %s/%s completado (rama main).", org, svc)
+        else:
+            logger.info("[Gitea] Para publicar: cd %s && git push -u origin main", root)
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        logger.warning("[Gitea] No se pudo inicializar el repo git: %s", e)
+
+
+def _update_argocd_applicationset(svc: str, org: str = "myproject") -> None:
+    repo_root = Path(__file__).parent.parent.parent
+    sentinel = "          # -- services managed by scaffold --\n"
+    entry = (
+        f"          - service: {svc}\n"
+        f"            repoURL: http://gitea:3000/{org}/{svc}.git\n"
+        f"            revision: main\n"
+    )
+    for env in ("dev", "staging", "prod"):
+        appset = (
+            repo_root / "terraform" / "backend" / "environments" / env
+            / "argocd-bootstrap" / "applicationset.yaml"
+        )
+        if not appset.exists():
+            logger.debug("[ArgoCD] %s no encontrado, omitiendo", appset)
+            continue
+        content = appset.read_text()
+        if f"service: {svc}" in content:
+            logger.debug("[ArgoCD] '%s' ya existe en applicationset.yaml (%s)", svc, env)
+            continue
+        if sentinel not in content:
+            logger.warning("[ArgoCD] Sentinel no encontrado en %s", appset)
+            continue
+        appset.write_text(content.replace(sentinel, sentinel + entry))
+        logger.info("[ArgoCD] '%s' añadido a applicationset.yaml (%s)", svc, env)
+
+
+def _update_terraform_services(svc: str) -> None:
+    repo_root = Path(__file__).parent.parent.parent
+    pattern = re.compile(r'(services\s*=\s*\[)([^\]]*?)(\])')
+    for env in ("dev", "staging", "prod"):
+        main_tf = repo_root / "terraform" / "backend" / "environments" / env / "main.tf"
+        if not main_tf.exists():
+            logger.debug("[Terraform] %s no encontrado, omitiendo", main_tf)
+            continue
+        content = main_tf.read_text()
+        match = pattern.search(content)
+        if not match:
+            logger.warning("[Terraform] No se encontró 'services' en %s", main_tf)
+            continue
+        existing = [s.strip().strip('"') for s in match.group(2).split(',') if s.strip().strip('"')]
+        if svc in existing:
+            logger.info("[Terraform] '%s' ya existe en services (%s)", svc, env)
+            continue
+        existing.append(svc)
+        new_list = ", ".join(f'"{s}"' for s in existing)
+        new_content = (content[:match.start()]
+                       + f'{match.group(1)}{new_list}{match.group(3)}'
+                       + content[match.end():])
+        main_tf.write_text(new_content)
+        logger.info("[Terraform] Agregado '%s' a services en %s", svc, env)
 
 
 # --------------------------------------------------------------------------- #
@@ -962,7 +1399,10 @@ def write(root: Path, relative: str, content: str) -> None:
 def scaffold(service_name: str, root_arg: str | None, service_name_provided: bool,
              report_role: str | None = None, source: str = "mongo",
              kafka_in: str = "report.extracted", kafka_out: str | None = None,
-             report_types: str = "") -> None:
+             report_types: str = "",
+             schedule: str = "0 * * * *",
+             org: str = "myproject",
+             pg_db_prefix: str = "") -> None:
     root = Path(root_arg) if root_arg else Path(".")
     if service_name_provided:
         root = root / service_name
@@ -979,7 +1419,7 @@ def scaffold(service_name: str, root_arg: str | None, service_name_provided: boo
     types = [t.strip() for t in report_types.split(",") if t.strip()]
 
     build_files(root, service_name, pkg, report_role, source)
-    dotenv_files(root, report_role, source)
+    dotenv_files(root, report_role, source, pg_db_prefix)
     dockerfile_files(root, service_name)
 
     if report_role is None:
@@ -993,51 +1433,105 @@ def scaffold(service_name: str, root_arg: str | None, service_name_provided: boo
         scaffold_reporting(root, service_name, pkg, report_role, source,
                            kafka_in, kafka_out, types)
 
+    # Helm chart (CronJob)
+    helm_root = root / "helm" / service_name
+    for rel_path, content in get_helm_chart_files(service_name, schedule).items():
+        target = helm_root / rel_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content)
+    logger.info("Helm chart (CronJob) creado en %s", helm_root)
+
+    # scripts/create-secrets-dev.sh
+    scripts_dir = root / "scripts"
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    secrets_script = scripts_dir / "create-secrets-dev.sh"
+    secrets_script.write_text(get_secrets_script_content(service_name, report_role, source, org,
+                                                          pg_db_prefix=pg_db_prefix))
+    secrets_script.chmod(0o755)
+    logger.info("scripts/create-secrets-dev.sh creado")
+
+    # Jenkinsfile
+    write(root, "Jenkinsfile", get_jenkinsfile_content(service_name, org))
+
+    # Registro en infraestructura (Terraform ECR, ArgoCD ApplicationSet, Gitea)
+    _update_terraform_services(service_name)
+    _update_argocd_applicationset(service_name, org)
+    _setup_gitea_repo(service_name, root, org)
+
     abs_root = root.resolve()
-    print(f"\nDone! Project scaffolded at: {abs_root}")
-    print("\n=== How to run the generated project ===")
-    print("\nPrerequisites:")
-    print("  - Java 17+")
-    print("  - sbt 1.9.8  (https://www.scala-sbt.org/download)")
-    print("  - Apache Spark 3.5.1 (bundled via entryPoints module)")
-    print("\n1. Enter the project directory:")
-    print(f"     cd {abs_root}")
+    print(f"""
+╔══════════════════════════════════════════════════════════════════════╗
+║          Proyecto listo: {service_name:<44}║
+╚══════════════════════════════════════════════════════════════════════╝
+
+ ── Ejecución local (sbt) ──────────────────────────────────────────────
+
+ 1. Entra al directorio:
+      cd {abs_root}
+
+ 2. Crea el secret en floci (emulador AWS local):
+      bash scripts/create-secrets-dev.sh""")
 
     if report_role is None:
-        print("\n2. Fill in .env with your Cloudflare R2 credentials:")
-        print("     R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY")
-        print("\n3. Run the batch job:")
-        print('     sbt "entryPoints/run"')
+        print("""
+ 3. Ejecuta el batch job:
+      sbt "entryPoints/run"
+""")
     else:
-        print("\n2. Fill in .env (S3/floci, Kafka y la fuente de datos):")
         if report_role == "extraction" and source == "mongo":
-            print("     AWS_ENDPOINT_URL, REPORT_BUCKET, KAFKA_BOOTSTRAP_SERVERS,")
-            print("     MONGO_URI, MONGO_READ_DB, MONGO_READ_COLLECTION (read model CQRS, §0)")
+            print("    (requiere floci + Kafka + MongoDB corriendo)")
         elif report_role == "extraction":
-            print("     AWS_ENDPOINT_URL, REPORT_BUCKET, KAFKA_BOOTSTRAP_SERVERS, JDBC_URL/JDBC_TABLE/...")
+            print("    (requiere floci + Kafka + PostgreSQL corriendo)")
         else:
-            print("     AWS_ENDPOINT_URL, REPORT_BUCKET, KAFKA_BOOTSTRAP_SERVERS")
-        print(f"\n3. Ejecutar el job de reportería (rol: {report_role}):")
+            print("    (requiere floci + Kafka corriendo)")
         if report_role == "extraction":
-            print('     sbt "entryPoints/run --reportType ventas-mensual"')
-            print(f"   → valida el esquema, escribe raw/ y publica '{kafka_out}'")
+            print(f'\n 3. Ejecutar extracción:\n      sbt "entryPoints/run --reportType ventas-mensual"')
+            print(f"    → valida esquema, escribe raw/ y publica '{kafka_out}'")
         else:
-            print('     sbt "entryPoints/run"')
-            print(f"   → consume '{kafka_in}', transforma por tipo y publica '{kafka_out}'")
+            print(f'\n 3. Ejecutar procesamiento:\n      sbt "entryPoints/run"')
+            print(f"    → consume '{kafka_in}', transforma y publica '{kafka_out}'")
 
-    print("\n4. Override Spark master (e.g. point to a cluster):")
-    print('     SPARK_MASTER=spark://host:7077 sbt "entryPoints/run"')
-    print("\n5. Build a fat JAR:")
-    print('     sbt "entryPoints/assembly"')
-    print("     java -jar infrastructure/entry-points/target/scala-2.13/entry-points-assembly-0.1.0-SNAPSHOT.jar")
-    print("\n6. Compile all modules without running:")
-    print("     sbt compile")
-    print("\n--- Docker ---")
-    print(f"\n7. Build the Docker image:")
-    print(f"     docker build -t {service_name}:latest .")
-    print("\n8. Run with Docker (pass env vars from .env):")
-    print(f"     docker run --env-file .env {service_name}:latest")
-    print("========================================")
+    print(f"""
+ 4. Override Spark master (cluster externo):
+      SPARK_MASTER=spark://host:7077 sbt "entryPoints/run"
+
+ 5. Fat JAR:
+      sbt "entryPoints/assembly"
+      java -jar infrastructure/entry-points/target/scala-2.13/entry-points-assembly-0.1.0-SNAPSHOT.jar
+
+ ── Docker ─────────────────────────────────────────────────────────────
+
+ 6. Build de la imagen (Stage 1 cachea deps SBT; Stage 2 solo JRE):
+      docker build -t {service_name}:latest .
+
+ 7. Ejecutar con Docker:
+      docker run --env-file .env {service_name}:latest
+
+ ── Kubernetes (CronJob) ───────────────────────────────────────────────
+
+    Schedule configurado : {schedule}
+    Helm chart generado  : helm/{service_name}/
+
+ 8. Instalar/actualizar en el cluster:
+      helm upgrade --install {service_name} helm/{service_name}/ \\
+        --namespace <namespace> \\
+        -f helm/{service_name}/values-dev.yaml
+
+ 9. Forzar ejecución inmediata (sin esperar el schedule):
+      kubectl create job --from=cronjob/{service_name} {service_name}-manual -n <namespace>
+
+10. Ver logs del último Job:
+      kubectl logs -l app={service_name} -n <namespace> --tail=100
+
+ ── CI/CD ──────────────────────────────────────────────────────────────
+
+    Jenkinsfile generado con pipeline:
+      Checkout → Build & Test → SonarQube → Security Scans
+      → Kaniko build/push ECR → Trivy scan → bumpImageTag (GitOps)
+    ArgoCD detecta el commit y actualiza el CronJob en el cluster.
+
+════════════════════════════════════════════════════════════════════════
+""")
 
 
 def main() -> None:
@@ -1057,6 +1551,17 @@ def main() -> None:
                         help="Topic Kafka a publicar (default: report.extracted en extraction / report.processed en processing).")
     parser.add_argument("--report-types", default="", metavar="CSV",
                         help="Solo processing: lista CSV de tipos de reporte (un transformer + registro por tipo).")
+    parser.add_argument("--schedule", default="0 * * * *", metavar="CRON",
+                        help="Expresión cron del CronJob K8s (default: '0 * * * *' = cada hora). "
+                             "Ej: '0 2 * * *' = 2 AM diario, '0 8 * * 1' = lunes 8 AM.")
+    parser.add_argument("--org", default="myproject", metavar="ORG",
+                        help="Slug org/proyecto: prefijo de secrets (<org>/dev/<svc>), "
+                             "organización Gitea y paquete Shared Library (org.<org>). "
+                             "(default: myproject)")
+    parser.add_argument("--pg-db", default="", metavar="PREFIX",
+                        help="Prefijo de BD PostgreSQL (Database-per-Service). "
+                             "El read model CQRS (--source jdbc) usará: <prefix>_readmodel. "
+                             "Debe coincidir con el -p/--pg-db de init-databases.sh.")
     parser.add_argument("root", nargs="?", default=None, metavar="ROOT",
                         help="Directorio raíz donde generar el proyecto (default: .)")
     parser.add_argument("-v", "--verbose", action="store_true",
@@ -1078,7 +1583,10 @@ def main() -> None:
         scaffold(args.service_name, args.root, service_name_provided,
                  report_role=args.report_role, source=args.source,
                  kafka_in=args.kafka_in, kafka_out=args.kafka_out,
-                 report_types=args.report_types)
+                 report_types=args.report_types,
+                 schedule=args.schedule,
+                 org=args.org,
+                 pg_db_prefix=args.pg_db)
     except OSError as e:
         logger.error("No se pudo crear el proyecto: %s", e)
         sys.exit(1)

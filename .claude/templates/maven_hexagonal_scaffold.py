@@ -76,13 +76,22 @@ spring:
 """
 
 
-def get_secrets_setup_content(project_name: str, database: str, messaging_system: str, port: int = 8080, org: str = "myproject") -> str:
+def get_secrets_setup_content(project_name: str, database: str, messaging_system: str,
+                              port: int = 8080, org: str = "myproject",
+                              pg_db_prefix: str = "", mongo_db_prefix: str = "") -> str:
+    # Database-per-Service: nombre de BD = <prefix>_<servicio_slug> si hay prefijo,
+    # o <servicio_slug> si no. Convención alineada con init-databases.sh y
+    # create-all-secrets-dev.sh.
+    svc_slug = project_name.replace("-", "_")
+    pg_db   = f"{pg_db_prefix}_{svc_slug}" if pg_db_prefix else svc_slug
+    mongo_db = f"{mongo_db_prefix}_{svc_slug}" if mongo_db_prefix else svc_slug
+
     secret: dict = {"SERVER_PORT": str(port)}
     if database.lower() == "mongo":
-        secret["MONGODB_URI"] = "mongodb://localhost:27017/mydb"
+        secret["MONGODB_URI"] = f"mongodb://localhost:27017/{mongo_db}"
     else:
-        secret["R2DBC_URL"] = "r2dbc:postgresql://localhost:5432/mydb"
-        secret["DB_USERNAME"] = "postgres"
+        secret["R2DBC_URL"] = f"r2dbc:postgresql://localhost:${{RDS_PORT:-5432}}/{pg_db}"
+        secret["DB_USERNAME"] = org or "appuser"
         secret["DB_PASSWORD"] = "change_me"
 
     if messaging_system.lower() in ("rabbit-producer", "rabbit-consumer"):
@@ -1341,7 +1350,8 @@ def write_outbox_migration(root: Path, outbox: bool, saga_participant: bool) -> 
 
 
 def scaffold(project_name: str, database: str, messaging_system: str, port: int = 8080,
-             org: str = "myproject", outbox: bool = False, saga_participant: bool = False) -> None:
+             org: str = "myproject", outbox: bool = False, saga_participant: bool = False,
+             pg_db_prefix: str = "", mongo_db_prefix: str = "") -> None:
     safe_name = project_name.replace("-", "")
     root = Path(project_name)
     logger.info("Creando proyecto: %s (db=%s, messaging=%s, port=%d, outbox=%s, saga_participant=%s)",
@@ -1489,7 +1499,9 @@ public class ApplicationConfig {{
     secrets_dir = root / "scripts"
     secrets_dir.mkdir(parents=True, exist_ok=True)
     secrets_script = secrets_dir / "create-secrets-dev.sh"
-    secrets_script.write_text(get_secrets_setup_content(project_name, database, messaging_system, port, org))
+    secrets_script.write_text(get_secrets_setup_content(
+        project_name, database, messaging_system, port, org,
+        pg_db_prefix=pg_db_prefix, mongo_db_prefix=mongo_db_prefix))
     secrets_script.chmod(0o755)
     logger.debug("scripts/create-secrets-dev.sh creado")
 
@@ -1758,6 +1770,13 @@ def main() -> None:
                              "secrets (<org>/dev/<servicio>), la organización Gitea y el "
                              "paquete de la Shared Library (org.<org>). Debe coincidir con "
                              "el -P/--project usado en los scripts. (default: myproject)")
+    parser.add_argument("--pg-db", default="", metavar="PREFIX",
+                        help="Prefijo del nombre de BD PostgreSQL (Database-per-Service). "
+                             "BD generada: <prefix>_<servicio_slug>. Debe coincidir con "
+                             "el -p/--pg-db de init-databases.sh y create-all-secrets-dev.sh.")
+    parser.add_argument("--mongo-db", default="", metavar="PREFIX",
+                        help="Prefijo del nombre de BD MongoDB (Database-per-Service). "
+                             "BD generada: <prefix>_<servicio_slug>.")
     parser.add_argument("--outbox", action="store_true",
                         help="Añade el módulo Transactional Outbox (publicación de eventos "
                              "atómica con el cambio de BD) y la migración V3__outbox.sql.")
@@ -1779,7 +1798,8 @@ def main() -> None:
 
     try:
         scaffold(args.service_name, args.database, args.messaging_system, args.port, args.org,
-                 outbox=args.outbox, saga_participant=args.saga_participant)
+                 outbox=args.outbox, saga_participant=args.saga_participant,
+                 pg_db_prefix=args.pg_db, mongo_db_prefix=args.mongo_db)
     except OSError as e:
         logger.error("No se pudo crear el proyecto: %s", e)
         sys.exit(1)

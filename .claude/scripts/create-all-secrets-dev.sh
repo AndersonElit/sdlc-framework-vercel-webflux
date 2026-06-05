@@ -243,12 +243,25 @@ for svc_path in "${services[@]}"; do
   db_type="$(detect_db_type "$svc_path")"
   uses_kafka="$(detect_kafka "$svc_path")"
 
-  log "→ $svc_name  (db=$db_type  kafka=$uses_kafka)"
+  # Database-per-Service: cada servicio tiene su propia BD aislada.
+  # Convención: <prefix>_<servicio_slug>  (guiones → guiones bajos)
+  # Excepción CQRS: el Projection Service escribe sobre <prefix>_readmodel
+  # (PostgreSQL relacional — read model compartido para MS1 Spark vía JDBC).
+  svc_slug="${svc_name//-/_}"
+  svc_mongo_db="${MONGO_DB_NAME}_${svc_slug}"
+
+  if [[ "$svc_name" == *"projection"* ]] && [[ "$db_type" == "postgres" ]]; then
+    svc_pg_db="${PG_DB_NAME}_readmodel"
+    log "→ $svc_name  (db=postgres/readmodel  kafka=$uses_kafka  bd_propia=$svc_pg_db)"
+  else
+    svc_pg_db="${PG_DB_NAME}_${svc_slug}"
+    log "→ $svc_name  (db=$db_type  kafka=$uses_kafka  bd_propia=${svc_pg_db:-${svc_mongo_db}})"
+  fi
 
   case "$db_type" in
     postgres)
       secret_json=$(jq -n \
-        --arg r2dbc   "r2dbc:postgresql://localhost:${RDS_PORT}/${PG_DB_NAME}" \
+        --arg r2dbc   "r2dbc:postgresql://localhost:${RDS_PORT}/${svc_pg_db}" \
         --arg user    "$DB_USER" \
         --arg pass    "$DB_PASSWORD" \
         --arg kafka   "localhost:29092" \
@@ -263,7 +276,7 @@ for svc_path in "${services[@]}"; do
       ;;
     mongo)
       secret_json=$(jq -n \
-        --arg mongo   "mongodb://localhost:27017/${MONGO_DB_NAME}" \
+        --arg mongo   "mongodb://localhost:27017/${svc_mongo_db}" \
         --arg kafka   "localhost:29092" \
         --arg cognito "$COGNITO_ISSUER_URI" \
         '{
