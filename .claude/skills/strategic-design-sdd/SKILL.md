@@ -216,6 +216,19 @@ NO generar diagramas gráficos.
 
 Usar tablas y descripciones textuales claras.
 
+# INTEGRACIÓN CON SISTEMAS EXTERNOS (ACL)
+
+Si el SRS o el ADC identifican sistemas externos / APIs de terceros (centrales de riesgo, pasarelas, proveedores de identidad, sistemas legados, etc.), modélalos en el Context Map como contextos externos con relación **upstream**, aplicando el patrón **Anti-Corruption Layer (ACL)**:
+
+- Cada sistema externo se representa como un contexto upstream del cual el sistema depende.
+- El sistema interno se protege con un ACL que traduce los modelos externos al lenguaje ubicuo propio.
+- Si el ADC indica centralizar la integración (sección "Capa de integración"), documenta que el ACL se materializa en un **contexto/servicio de integración dedicado** (`integration-service`) que media TODA la conectividad externa; los demás contextos no hablan directamente con sistemas externos.
+- Indica, por cada integración, dirección (consumo saliente / entrante / bidireccional) y criticidad.
+
+# TRANSACCIONES QUE CRUZAN CONTEXTOS (SAGA)
+
+Si existen operaciones de negocio que abarcan varios bounded contexts y requieren consistencia (ver ADC, "Estrategia de transacciones distribuidas"), identifícalas aquí como **relaciones de coordinación** entre contextos y nómbralas como flujos de saga. Para cada flujo: contextos participantes, contexto coordinador (orquestador) y los pasos que requieren compensación. El detalle técnico se define en el Diseño Técnico; aquí solo se establece el límite estratégico y la necesidad de compensación.
+
 ---
 
 ### 6. Modelos de Dominio
@@ -274,6 +287,7 @@ Consecuencias:
 - Usar IDs: DE-001, DE-002...
 - Enfocarse en eventos relevantes del dominio.
 - Los eventos expresan hechos consumados en pasado: "Pedido Confirmado", "Pago Procesado".
+- Si un evento participa en un flujo de saga (ver Context Map), identifica también su **evento de compensación** correspondiente (el hecho que revierte el efecto): por ejemplo, "Pago Procesado" → "Pago Revertido", "Crédito Desembolsado" → "Desembolso Anulado". Estos eventos de compensación son ciudadanos de primera clase del dominio y se documentan con su propio ID `DE-xxx`.
 
 ---
 
@@ -465,6 +479,11 @@ Documenta decisiones tomadas a nivel estratégico en esta etapa.
 - Solo incluir decisiones con impacto estratégico real.
 - Evitar decisiones técnicas de implementación detallada.
 - Documentar el razonamiento, no solo el resultado.
+
+# DECISIONES ESTRATÉGICAS OBLIGATORIAS SEGÚN EL ADC
+
+- Si el ADC o el Context Map identifican integración con sistemas externos, incluye una decisión estratégica (`DS-xxx`) sobre la **capa de integración**: si se centraliza en un microservicio dedicado `integration-service` con Apache Camel (ACL/mediación EAI) o se distribuye por servicio. Documenta el tradeoff (gobierno central y dominio limpio vs. hop de red y posible cuello de botella).
+- Si el ADC o el Context Map identifican transacciones que cruzan servicios, incluye una decisión estratégica (`DS-xxx`) sobre la **estrategia de saga**: estilo (orquestación / coreografía / híbrido), ubicación del orquestador (recomendado: dentro del `integration-service`) y coordinador (Narayana LRA vs. saga persistida propia). Documenta el tradeoff (visibilidad/control central vs. acoplamiento y complejidad operacional). Estas decisiones se profundizan como `ADR-xxx` en el Diseño Técnico.
 
 ---
 

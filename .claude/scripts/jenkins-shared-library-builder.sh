@@ -104,6 +104,18 @@ def call(Map args = [:]) {
 }
 EOF
 
+# runContractTests — pruebas de contrato de integraciones externas (WireMock)
+cat > "$OUT_DIR/vars/runContractTests.groovy" <<'EOF'
+// Contract tests de las rutas Camel de salida del integration-service, contra los
+// sistemas externos simulados con WireMock. Los tests se marcan con @Tag("contract")
+// (JUnit 5). Si no hay tests etiquetados, la fase pasa sin ejecutar ninguno.
+def call(Map args = [:]) {
+    def group = args.group ?: 'contract'
+    sh "mvn -B --no-transfer-progress failsafe:integration-test failsafe:verify -Dgroups=${group}"
+    junit testResults: '**/target/failsafe-reports/*.xml', allowEmptyResults: true
+}
+EOF
+
 # runQualityGates — SonarQube + quality gate
 cat > "$OUT_DIR/vars/runQualityGates.groovy" <<'EOF'
 // Análisis estático + espera del quality gate. Falla si el gate = ERROR.
@@ -301,7 +313,7 @@ def call(Map args = [:]) {
 }
 EOF
 
-log_ok "Pasos vars/ generados (10 archivos)."
+log_ok "Pasos vars/ generados (11 archivos)."
 
 # ---------------------------------------------------------------------------
 # src/ — clases auxiliares
@@ -599,6 +611,7 @@ con el nombre `jenkins-shared-library`, apuntando a este repositorio (rama `main
 | `computeImageTag()` | Checkout — tag inmutable `<version>-<sha>` |
 | `buildBackendService()` | Build & Unit Tests |
 | `runIntegrationTests(dbType: …)` | Integration Tests (Testcontainers) |
+| `runContractTests(group: …)` | Contract Tests de integraciones externas (WireMock, `@Tag("contract")`) |
 | `runQualityGates()` | Quality Gate (SonarQube) |
 | `runSecurityScans()` | Security Scans (OWASP + secretos) |
 | `buildAndPushImage(ecrRepo:, imageTag:)` | Build & Push Image (Kaniko → ECR) |

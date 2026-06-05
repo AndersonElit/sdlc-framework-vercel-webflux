@@ -125,14 +125,33 @@ Indica las regulaciones aplicables. Impacta directamente el modelo de seguridad 
 
 ### APIs y servicios de terceros ya definidos
 
-| Servicio | Proveedor | Propósito | Criticidad |
-|----------|-----------|-----------|------------|
-| | | | Alta / Media / Baja |
+| Servicio / Sistema externo | Proveedor | Propósito | Protocolo | Dirección | SLA / Latencia | Criticidad |
+|----------|-----------|-----------|-----------|-----------|----------------|------------|
+| | | | REST / SOAP / gRPC / file / ftp / jms / webhook | Saliente (consumo) / Entrante / Bidireccional | ej. p95 < 800ms / 99.5% | Alta / Media / Baja |
 
 ### Dependencias de datos
 
 - **Fuentes de datos externas:** 
 - **Sistemas que consumen datos de este sistema:** 
+
+### Capa de integración (Apache Camel)
+
+- **¿Centralizar la conectividad con sistemas externos en un microservicio dedicado `integration-service` (capa de integración / ACL con Apache Camel)?** (sí / no / por definir)
+- **Justificación:** (gobierno central de credenciales/SLAs, dominio limpio, mediación EAI vs. autonomía de cada servicio)
+- **Protocolos de entrada no-HTTP a soportar (si aplica):** (file / ftp / jms / timer / ninguno)
+
+### Estrategia de transacciones distribuidas (Saga)
+
+Completar si existen operaciones de negocio que **abarcan varios microservicios** y deben mantener consistencia (todo-o-nada con compensaciones).
+
+- **¿Hay transacciones que cruzan servicios?** (sí / no / por definir)
+- **Estilo de saga preferido:** (orquestación / coreografía / híbrido / por definir)
+- **Ubicación del orquestador (si orquestación):** (en `integration-service` / orquestador dedicado / en un servicio de dominio)
+- **Coordinador de transacciones:** (Narayana LRA / saga persistida propia / por definir)
+
+| Flujo transaccional | Servicios participantes | Paso(s) que requieren compensación | Criticidad |
+|---------------------|-------------------------|-------------------------------------|------------|
+| | | | Alta / Media / Baja |
 
 ---
 

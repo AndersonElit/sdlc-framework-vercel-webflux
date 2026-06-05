@@ -36,6 +36,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 TEMPLATES_DIR="$REPO_ROOT/.claude/templates"
 MAVEN_TEMPLATE="$TEMPLATES_DIR/maven_hexagonal_scaffold.py"
 NEXTJS_TEMPLATE="$TEMPLATES_DIR/nextjs_feature_scaffold.py"
+INTEGRATION_TEMPLATE="$TEMPLATES_DIR/integration_service_scaffold.py"
 
 BACKEND_DIR="$REPO_ROOT/backend"
 FRONTEND_DIR="$REPO_ROOT/frontend"
@@ -71,6 +72,14 @@ BACKEND_SERVICES=()
 FRONTEND_NAME=""
 HAS_FRONTEND=0
 declare -A BC_TAGS
+# Camel / Saga
+INTEGRATION_SYSTEMS=""      # valor de --integration-service: "buro=BC-01,pasarela=BC-02"
+HAS_INTEGRATION=0
+INTEGRATION_NAME="integration-service"
+INTEGRATION_PORT="8090"
+SAGA_FLOWS=""               # valor de --saga-flows: "originacion,desembolso"
+declare -A OUTBOX_SERVICES        # --outbox <servicio>
+declare -A SAGA_PARTICIPANTS      # --saga-participant <servicio>
 PROJECT_NAME=""
 PG_DB_NAME=""
 MONGO_DB_NAME=""
@@ -99,6 +108,15 @@ Uso: $0 -P <proyecto> --backend nombre:db:messaging:puerto [--backend ...] \
 
   --frontend  Nombre del proyecto frontend Next.js (opcional).
               Si se omite, no se genera frontend.
+
+  --integration-service "sis=BC-XX,..."  (opcional)
+              Genera el integration-service (Apache Camel + orquestador de saga LRA),
+              con una ruta Camel por sistema externo. El valor mapea sistema=bounded-context.
+  --saga-flows flujo1,flujo2             (opcional) Un orquestador de saga por flujo.
+  --integration-port PUERTO              (opcional) Puerto del integration-service (default: 8090).
+  --outbox SERVICIO                      (opcional, repetible) Añade Transactional Outbox al servicio.
+  --saga-participant SERVICIO            (opcional, repetible) Marca el servicio como participante
+              de saga (endpoint de compensación + processed_message); implica --outbox.
 
   --bc-tags   Par servicio=BC-XX (opcional, repetible).
               Mapea un servicio PostgreSQL a su tag en el schema.sql para
@@ -243,6 +261,56 @@ while [[ $# -gt 0 ]]; do
       DB_PASSWORD="${1#*=}"
       shift
       ;;
+    --integration-service)
+      if [[ -z "${2:-}" ]]; then
+        log_err "--integration-service requiere un valor (\"sistema=BC-XX,...\")."
+        exit 1
+      fi
+      INTEGRATION_SYSTEMS="$2"
+      HAS_INTEGRATION=1
+      shift 2
+      ;;
+    --integration-service=*)
+      INTEGRATION_SYSTEMS="${1#*=}"
+      HAS_INTEGRATION=1
+      shift
+      ;;
+    --integration-port)
+      INTEGRATION_PORT="${2:?--integration-port requiere un valor}"
+      shift 2
+      ;;
+    --integration-port=*)
+      INTEGRATION_PORT="${1#*=}"
+      shift
+      ;;
+    --saga-flows)
+      SAGA_FLOWS="${2:?--saga-flows requiere un valor (flujo1,flujo2)}"
+      shift 2
+      ;;
+    --saga-flows=*)
+      SAGA_FLOWS="${1#*=}"
+      shift
+      ;;
+    --outbox)
+      OUTBOX_SERVICES["${2:?--outbox requiere el nombre del servicio}"]=1
+      shift 2
+      ;;
+    --outbox=*)
+      OUTBOX_SERVICES["${1#*=}"]=1
+      shift
+      ;;
+    --saga-participant)
+      SVC="${2:?--saga-participant requiere el nombre del servicio}"
+      SAGA_PARTICIPANTS["$SVC"]=1
+      OUTBOX_SERVICES["$SVC"]=1   # un participante de saga publica eventos vía outbox
+      shift 2
+      ;;
+    --saga-participant=*)
+      SVC="${1#*=}"
+      SAGA_PARTICIPANTS["$SVC"]=1
+      OUTBOX_SERVICES["$SVC"]=1
+      shift
+      ;;
     -h|--help)
       usage
       ;;
@@ -343,14 +411,41 @@ for svc_spec in "${BACKEND_SERVICES[@]}"; do
     continue
   fi
 
-  log "Generando $name (db=$db, messaging=$messaging, port=$port)..."
-  if (cd "$BACKEND_DIR" && python3 "$MAVEN_TEMPLATE" -n "$name" -d "$db" -m "$messaging" -p "$port" --org "$PROJECT_NAME"); then
+  EXTRA_FLAGS=()
+  [[ -n "${OUTBOX_SERVICES[$name]:-}" ]] && EXTRA_FLAGS+=("--outbox")
+  [[ -n "${SAGA_PARTICIPANTS[$name]:-}" ]] && EXTRA_FLAGS+=("--saga-participant")
+
+  log "Generando $name (db=$db, messaging=$messaging, port=$port${EXTRA_FLAGS:+, ${EXTRA_FLAGS[*]}})..."
+  if (cd "$BACKEND_DIR" && python3 "$MAVEN_TEMPLATE" -n "$name" -d "$db" -m "$messaging" -p "$port" --org "$PROJECT_NAME" "${EXTRA_FLAGS[@]}"); then
     log_ok "$name generado."
   else
     log_err "$name — falló la generación."
     BACKEND_FAILED+=("$name")
   fi
 done
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 3b. Generar el integration-service (capa de integración Camel + orquestador de saga)
+# ──────────────────────────────────────────────────────────────────────────────
+if [[ "$HAS_INTEGRATION" -eq 1 ]]; then
+  HEADER "3b. Generando integration-service (Apache Camel + Saga EIP/LRA)"
+  if [[ ! -f "$INTEGRATION_TEMPLATE" ]]; then
+    log_err "Template no encontrado: $INTEGRATION_TEMPLATE"
+    BACKEND_FAILED+=("$INTEGRATION_NAME")
+  elif [[ -d "$BACKEND_DIR/$INTEGRATION_NAME" ]]; then
+    log_warn "$INTEGRATION_NAME — directorio ya existe; omitiendo."
+  else
+    log "Generando $INTEGRATION_NAME (externos='$INTEGRATION_SYSTEMS', sagas='$SAGA_FLOWS', port=$INTEGRATION_PORT)..."
+    if (cd "$BACKEND_DIR" && python3 "$INTEGRATION_TEMPLATE" \
+          -n "$INTEGRATION_NAME" --org "$PROJECT_NAME" -p "$INTEGRATION_PORT" \
+          --external-systems "$INTEGRATION_SYSTEMS" --saga-flows "$SAGA_FLOWS"); then
+      log_ok "$INTEGRATION_NAME generado."
+    else
+      log_err "$INTEGRATION_NAME — falló la generación."
+      BACKEND_FAILED+=("$INTEGRATION_NAME")
+    fi
+  fi
+fi
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 4. Generar scaffolding frontend

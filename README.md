@@ -181,6 +181,30 @@ Los planes generados en el paso 7 referencian scripts ejecutables en `.claude/sc
 
 ---
 
+## Integración con Sistemas Externos (Apache Camel) y Transacciones Distribuidas (Saga)
+
+El framework soporta, de forma **opt-in y trazable end-to-end**, dos capacidades para arquitecturas de microservicios:
+
+- **Capa de integración con Apache Camel** concentrada en un microservicio dedicado **`integration-service`** (ACL / mediación EAI): consumo de APIs y sistemas externos, traducción de protocolos, reintentos y circuit breaker (Resilience4j). Los servicios de dominio no hablan con el exterior: consumen `integration-service`.
+- **Patrón Saga (orquestación)** alojado en el mismo `integration-service` (Camel Saga EIP + coordinador **Narayana LRA**). Los servicios de dominio actúan como **participantes**: publican eventos vía **Transactional Outbox** (atómico con el cambio de BD) y exponen **compensaciones idempotentes**.
+
+Se propaga por todo el pipeline: el ADC captura sistemas externos y estrategia transaccional → el Strategic Design los modela (context map/ACL, `DS-xxx`) → el Diseño Técnico genera el contenedor `integration-service` en el C4, los flujos de saga con compensaciones, los endpoints de compensación en OpenAPI y las tablas `outbox`/`saga_instance` en el `schema.sql` → el Plan de Desarrollo emite el documento del `integration-service` y las secciones de participante, todo bajo **TDD** (rutas Camel con WireMock, saga compensada, outbox con Testcontainers).
+
+**Generación de código (etapa de implementación):**
+
+| Componente | Cómo se genera |
+|------------|----------------|
+| `integration-service` (Camel + saga orquestador) | Scaffolder dedicado `.claude/templates/integration_service_scaffold.py` |
+| Outbox + compensaciones en participantes | Banderas `--outbox` / `--saga-participant` de `maven_hexagonal_scaffold.py` (módulos inline + migración `V3__outbox.sql`) |
+| Orquestación | `scaffold-all-services.sh` con `--integration-service "sis=BC-XX,..."`, `--saga-flows f1,f2`, `--outbox <svc>`, `--saga-participant <svc>` |
+| Infraestructura local | `base-infrastructure-builder.sh` levanta el coordinador Narayana LRA y WireMock en `floci-net` (omitir con `ENABLE_SAGA=0`) |
+| Secretos | `create-all-secrets-dev.sh` detecta el `integration-service` y añade `LRA_COORDINATOR_URL` y `EXT_*_BASE_URL` |
+| CI/CD | Stage `Contract Tests` (WireMock) en el Jenkinsfile, activo solo para el `integration-service` |
+
+> Detalle completo y decisiones arquitectónicas: [PLAN-integracion-camel-saga.md](PLAN-integracion-camel-saga.md).
+
+---
+
 ## Principios del Framework
 
 - **Trazabilidad end-to-end:** cada documento se deriva del anterior; el ADC y las decisiones estratégicas (DS-xxx) actúan como restricciones que se propagan al diseño técnico y a la implementación.

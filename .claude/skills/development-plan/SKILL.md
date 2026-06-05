@@ -38,6 +38,8 @@ docs/development/
 
 Los archivos de microservicio (`03-ms-`) se generan uno por cada bounded context identificado en el diseño. Los archivos de feature frontend (`04-fe-`) se generan según la segmentación de features derivada del diseño. El orden numérico define la secuencia de ejecución.
 
+Si el diseño técnico definió una **capa de integración dedicada** (Apache Camel) y/o **orquestación de saga**, se genera además un documento `DEV-[proyecto]-03-ms-integration-service.md` para el `integration-service` (capa de integración + orquestador de saga). Por su rol, este servicio se implementa en el orden que indique el roadmap respecto de los flujos de saga: sus sistemas externos no dependen de otros microservicios, pero la saga necesita que los participantes expongan sus compensaciones, por lo que el orquestador suele implementarse después de los participantes que coordina (o en paralelo, validando con dobles de prueba).
+
 # ESTILO DE LOS DOCUMENTOS
 
 Los documentos deben:
@@ -119,7 +121,7 @@ Secciones en orden exacto:
 1. **Introducción** — objetivo de la etapa de desarrollo, ambiente objetivo (local: floci + K3d), tecnologías involucradas.
 2. **Prerrequisitos Globales** — herramientas a instalar antes de comenzar (Docker, Terraform, **k3d**, **kubectl**, Java 21, Node.js, Python 3, floci CLI).
 3. **Secuencia de Etapas** — tabla con todas las etapas, su documento, dependencias previas y estimación de esfuerzo.
-4. **Mapa de Microservicios** — tabla con: nombre del servicio, bounded context, base de datos, mensajería, dependencias REST entre servicios.
+4. **Mapa de Microservicios** — tabla con: nombre del servicio, bounded context, base de datos, mensajería, dependencias REST entre servicios, **sistemas externos consumidos** y **rol en saga** (orquestador / participante / ninguno). Si el diseño técnico definió una capa de integración dedicada, incluir el `integration-service` como una fila más (su bounded context es la integración/orquestación; consume los sistemas externos; rol en saga = orquestador).
 5. **Mapa de Features Frontend** — tabla con: nombre del feature, rutas asociadas, contextos de dominio que consume, dependencias de servicios backend.
 6. **Ambiente Local (floci + K3d)** — descripción de la configuración local: puertos de PostgreSQL, MongoDB, Kafka y Cognito expuestos por floci; el contenedor **SonarQube** (`[proyecto]-sonarqube`, quality gate del CI) en `floci-net`, expuesto en `localhost:9000` e interno como `[proyecto]-sonarqube:9000` (con `SONAR_URL`/`SONAR_TOKEN` persistidos en `terraform/backend/environments/dev/.sonar-env`); el cluster Kubernetes de dev **K3d** (`[proyecto]-dev`) en `floci-net` con su registry (`k3d-[proyecto]-registry:5100`) y los kubeconfig en `terraform/backend/environments/dev/.kube/`; sobre K3d corre ArgoCD; variables de entorno base.
 7. **Criterios de Done (Definition of Done)** — criterios que debe cumplir cada componente para considerarse completo en esta etapa. Debe incluir explícitamente los criterios de TDD: toda funcionalidad fue precedida por una prueba que falló y luego pasó (Red-Green-Refactor); la suite de pruebas está en verde; se cumplen los umbrales de cobertura mínima por capa; no existe lógica de negocio ni rama de error sin prueba asociada.
@@ -193,6 +195,7 @@ Secciones en orden exacto:
 2. **Scaffolding de Microservicios y Frontend**
    - Referenciar el script `.claude/scripts/scaffold-all-services.sh` y explicar que es genérico: acepta `--backend nombre:db:messaging:puerto` (repetible), `--frontend nombre` (opcional) y `--bc-tags servicio=BC-XX` (repetible, opcional). No incluir comandos `python3` individuales.
    - Bloque de ejemplo con la invocación completa del script con todos los `--backend`, `--frontend`, los cuatro parámetros de BD (`-p <pg-db>`, `-m <mongo-db>`, `-u <usuario>`, `-w <clave>`, **idénticos** a los usados en `init-databases.sh`) y `--bc-tags` derivados del diseño técnico. Los `--bc-tags` deben incluirse para todos los servicios PostgreSQL, usando el tag `BC-XX` que corresponde a su bloque en `docs/design/database/SDD-[proyecto]-schema.sql`.
+   - Si el diseño definió capa de integración u orquestación de saga, incluir además: `--integration-service "<sistema=BC-XX,...>"` (genera el `integration-service` con sus rutas Camel), `--saga-flows <flujo1,flujo2>` (un orquestador por flujo), y, por cada servicio de dominio participante, `--saga-participant <servicio>` y `--outbox <servicio>` (generan el consumidor de comandos de saga, el endpoint de compensación, el módulo outbox y la migración `V3__outbox.sql`).
    - Tabla resumen: servicio → puerto local → DB → mensajería → módulos generados.
    - Indicar si el servicio usa mensajería (kafka-producer / kafka-consumer / ambos / none).
    - Documentar los artefactos que produce el scaffold y que consume la Etapa 2b: `Jenkinsfile` (backend y frontend), `Dockerfile` multi-stage (backend) y charts Helm (`helm/<service>/`)
@@ -343,6 +346,26 @@ Secciones en orden exacto:
 - El orden de implementación dentro del documento es **test-first por capa** (TDD Red-Green-Refactor): dominio → aplicación → infraestructura → rest-api, y dentro de cada capa la prueba se escribe y se ve fallar antes del código de producción. No se documenta una fase de "pruebas al final": las pruebas conducen la implementación de cada capa.
 - Indicar explícitamente el orden de microservicios a implementar en el roadmap según dependencias (los servicios sin dependencias externas primero).
 
+### Reglas para el documento del `integration-service` (capa de integración + orquestador de saga)
+
+Generar `DEV-[proyecto]-03-ms-integration-service.md` solo si el diseño definió capa de integración dedicada u orquestación de saga. Mantiene la estructura de Etapa 3 con estas particularidades:
+
+- **Scaffolding:** referenciar el scaffolder dedicado `.claude/templates/integration_service_scaffold.py` (no `maven_hexagonal_scaffold.py`); el comando se documenta en la Etapa 2 (`02-scaffold.md`) vía la bandera `--integration-service` de `scaffold-all-services.sh`.
+- **Capa de dominio:** puertos `<Sistema>Gateway` (uno por sistema externo) y `SagaCoordinatorPort`, todos reactivos (`Mono`/`Flux`), sin tipos de Camel ni LRA.
+- **Capa de aplicación:** un `SagaOrchestratorUseCase` por flujo de saga; define la secuencia de pasos y sus compensaciones invocando puertos mockeables.
+- **Capa de infraestructura:** adaptadores Camel (`camel-rest-consumer`) que implementan los `*Gateway` con rutas Camel (ACL, reintentos, circuit breaker Resilience4j); adaptador `saga-camel` que implementa `SagaCoordinatorPort` con Camel Saga EIP + cliente Narayana LRA; persistencia R2DBC del estado de saga (`saga_instance`, `saga_step_log`); productor Kafka de comandos y consumidor de respuestas de participantes.
+- **TDD (Sección 8):** el adaptador Camel se prueba con **WireMock** + `camel-test-spring-junit5` + StepVerifier (incluyendo escenarios de timeout/error para validar la resiliencia); la saga se prueba con happy path y con fallo que dispara compensaciones en orden inverso. Tipos reactivos siempre con StepVerifier.
+- **Prerrequisitos:** coordinador Narayana LRA corriendo (Etapa 0) y los participantes con sus endpoints/consumidores de compensación disponibles (o dobles de prueba).
+
+### Reglas para servicios de dominio que **participan** en una saga
+
+En el documento de cada microservicio participante, añadir:
+
+- En la **capa de infraestructura**: módulo `outbox` (escritura del evento atómica con el cambio de BD en la misma transacción R2DBC + relay que publica a Kafka) y tabla `processed_message` para idempotencia. Las tablas `outbox` y `processed_message` se generan vía la migración `V3__outbox.sql` (producida por el scaffold con `--outbox`).
+- En la **capa rest-api** (o consumidor Kafka): el/los **endpoint(s)/consumidor(es) de compensación** idempotentes que el orquestador invoca para revertir el paso.
+- En la **Sección 8 (TDD)**: prueba del outbox con Testcontainers (atomicidad + publicación única) y prueba de idempotencia (la reentrega no produce doble efecto); prueba de contrato del endpoint de compensación con WebTestClient.
+- En los **criterios de aceptación**: el servicio publica eventos vía outbox (no dual-write) y sus compensaciones son idempotentes.
+
 ---
 
 ## Etapa 4 — DEV-[proyecto]-04-fe-[feature].md (uno por feature frontend)
@@ -420,6 +443,8 @@ Secciones en orden exacto:
    - Tabla de escenarios de integración: servicio productor → servicio consumidor → flujo a verificar
    - Herramienta: Testcontainers + JUnit 5 (backend), ambiente local completo
    - Flujos críticos de integración: autenticación → originación → ciclo de vida, eventos Kafka entre servicios
+   - **Contract tests de sistemas externos (si hay `integration-service`):** validar las rutas Camel de `integration-service` contra los sistemas externos simulados con **WireMock** (respuestas válidas, errores y timeouts para ejercitar el circuit breaker Resilience4j). Tabla: sistema externo → ruta Camel → escenario (éxito/error/timeout) → resultado esperado.
+   - **Saga (si hay orquestación):** verificar la saga completa (happy path) coordinada por `integration-service` y la **saga compensada** provocando el fallo de un participante, comprobando que se ejecutan las compensaciones de los pasos previos en orden inverso y que las compensaciones son idempotentes (reentrega no duplica efecto). Verificar también la publicación de eventos vía outbox (no dual-write).
 4. **Pruebas E2E**
    - Herramienta: Playwright (frontend) + Supertest/REST Assured (backend directo)
    - Tabla de flujos E2E: nombre, descripción, actores, precondiciones, pasos, resultado esperado
@@ -539,6 +564,7 @@ Antes de escribir los archivos, verifica que el directorio `docs/development/` e
   | `init-databases.sh` | `-P <nombre-proyecto>` | — | Sí |
   | `create-all-secrets-dev.sh` | `-P <nombre-proyecto>` | — | Sí |
   | `maven_hexagonal_scaffold.py` | `--org <nombre-proyecto>` | `-n <nombre-servicio>` | Ambos sí |
+  | `integration_service_scaffold.py` | `--org <nombre-proyecto>` | `-n integration-service` | Ambos sí |
   | `nextjs_feature_scaffold.py` | `--org <nombre-proyecto>` | `-n <nombre-proyecto-fe>` | `-n` sí |
 
 - **TDD es obligatorio y transversal** (ver sección "ESTRATEGIA DE PRUEBAS — TDD"). Todo documento de microservicio (Etapa 3) y de feature frontend (Etapa 4) debe presentar la implementación como **test-first** (Red-Green-Refactor): la prueba precede al código de producción en cada capa/artefacto. No describir una "fase de pruebas al final"; las pruebas conducen cada capa. Los criterios de aceptación de esos documentos deben incluir la verificación de que cada elemento tuvo su prueba escrita primero, que la suite está en verde y que se cumplen los umbrales de cobertura. Backend: JUnit 5 + Mockito + StepVerifier + Testcontainers + WebTestClient; los tipos reactivos se verifican con StepVerifier, nunca con `block()`. Frontend: Vitest + React Testing Library + MSW (unitario) y Playwright bajo ATDD (E2E).

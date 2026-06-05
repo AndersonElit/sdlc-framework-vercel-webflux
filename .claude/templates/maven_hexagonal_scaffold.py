@@ -124,7 +124,7 @@ fi
 """
 
 
-def get_dockerfile_content(database: str, messaging_system: str, port: int = 8080) -> str:
+def get_dockerfile_content(database: str, messaging_system: str, port: int = 8080, outbox: bool = False) -> str:
     db_module = "mongo" if database.lower() == "mongo" else "postgres"
 
     copy_poms = [
@@ -134,6 +134,10 @@ def get_dockerfile_content(database: str, messaging_system: str, port: int = 808
         "COPY infrastructure/entry-points/rest-api/pom.xml infrastructure/entry-points/rest-api/",
         "COPY infrastructure/entry-points/app/pom.xml infrastructure/entry-points/app/",
     ]
+    if outbox:
+        copy_poms.append(
+            "COPY infrastructure/driven-adapters/outbox/pom.xml infrastructure/driven-adapters/outbox/"
+        )
     if messaging_system.lower() == "rabbit-producer":
         copy_poms.append(
             "COPY infrastructure/driven-adapters/rabbit-producer/pom.xml infrastructure/driven-adapters/rabbit-producer/"
@@ -265,6 +269,13 @@ pipeline {
         //     Usa el sidecar dind del pod (DOCKER_HOST) para levantar contenedores.
         stage('Integration Tests') {
             steps { runIntegrationTests(dbType: env.DB_TYPE) }
+        }
+
+        // 3b — Contract tests de integraciones externas (WireMock). Solo aplica al
+        //      integration-service (capa Camel); se detecta por el módulo camel-rest-consumer.
+        stage('Contract Tests') {
+            when { expression { fileExists('infrastructure/driven-adapters/camel-rest-consumer') } }
+            steps { runContractTests() }
         }
 
         // 4 — Análisis estático + quality gate (SonarQube). Falla si gate = ERROR.
@@ -504,7 +515,7 @@ spec:
     }
 
 
-def get_root_pom(project_name: str, database: str, messaging_system: str) -> str:
+def get_root_pom(project_name: str, database: str, messaging_system: str, outbox: bool = False) -> str:
     safe_name = project_name.replace("-", "")
     db_module = "mongo" if database.lower() == "mongo" else "postgres"
 
@@ -523,6 +534,9 @@ def get_root_pom(project_name: str, database: str, messaging_system: str) -> str
         modules.append("infrastructure/driven-adapters/kafka-producer")
     elif messaging_system.lower() == "kafka-consumer":
         modules.append("infrastructure/entry-points/kafka-consumer")
+
+    if outbox:
+        modules.append("infrastructure/driven-adapters/outbox")
 
     modules_xml = "\n".join(f"                <module>{m}</module>" for m in modules)
 
@@ -592,7 +606,8 @@ def get_root_pom(project_name: str, database: str, messaging_system: str) -> str
 """
 
 
-def get_module_pom(parent_artifact_id: str, safe_project_name: str, module_path: str) -> str:
+def get_module_pom(parent_artifact_id: str, safe_project_name: str, module_path: str,
+                   include_outbox_dep: bool = False) -> str:
     module_artifact_id = module_path.replace("/", "-")
     module_package_name = module_path.split("/")[-1].replace("-", "")
     is_db_adapter = module_path.startswith("infrastructure/driven-adapters/")
@@ -646,6 +661,31 @@ def get_module_pom(parent_artifact_id: str, safe_project_name: str, module_path:
     <artifactId>spring-boot-starter-webflux</artifactId>
 </dependency>
 """
+        elif module_path.endswith("/outbox"):
+            deps = f"""\
+<dependency>
+    <groupId>com.{safe_project_name}.model</groupId>
+    <artifactId>domain-model</artifactId>
+    <version>${{project.version}}</version>
+</dependency>
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-data-r2dbc</artifactId>
+</dependency>
+<dependency>
+    <groupId>org.postgresql</groupId>
+    <artifactId>r2dbc-postgresql</artifactId>
+    <scope>runtime</scope>
+</dependency>
+<dependency>
+    <groupId>org.springframework.kafka</groupId>
+    <artifactId>spring-kafka</artifactId>
+</dependency>
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-webflux</artifactId>
+</dependency>
+"""
         else:
             deps = """\
 <dependency>
@@ -670,6 +710,14 @@ def get_module_pom(parent_artifact_id: str, safe_project_name: str, module_path:
 <dependency>
     <groupId>com.{safe_project_name}.restapi</groupId>
     <artifactId>infrastructure-entry-points-rest-api</artifactId>
+    <version>${{project.version}}</version>
+</dependency>
+"""
+        if include_outbox_dep:
+            deps += f"""\
+<dependency>
+    <groupId>com.{safe_project_name}.outbox</groupId>
+    <artifactId>infrastructure-driven-adapters-outbox</artifactId>
     <version>${{project.version}}</version>
 </dependency>
 """
@@ -1031,10 +1079,273 @@ public class MessageConsumer {{
     logger.info("Módulo kafka-consumer generado")
 
 
-def scaffold(project_name: str, database: str, messaging_system: str, port: int = 8080, org: str = "myproject") -> None:
+def create_outbox_files(root: Path, safe_project_name: str) -> None:
+    """Módulo Transactional Outbox: publicación de eventos atómica con el cambio de BD."""
+    module_path = "infrastructure/driven-adapters/outbox"
+    base_package = f"com.{safe_project_name}.outbox"
+    pkg_dir = root / (module_path + "/src/main/java/" + base_package.replace(".", "/"))
+    pkg_dir.mkdir(parents=True, exist_ok=True)
+    model_pkg = f"com.{safe_project_name}.model"
+
+    # Puerto en el dominio (el adaptador lo implementa)
+    model_dir = root / ("domain/model/src/main/java/" + model_pkg.replace(".", "/"))
+    model_dir.mkdir(parents=True, exist_ok=True)
+    (model_dir / "OutboxPort.java").write_text(f"""\
+package {model_pkg};
+
+import reactor.core.publisher.Mono;
+
+/** Puerto secundario de publicación confiable de eventos (Transactional Outbox). */
+public interface OutboxPort {{
+    Mono<Void> append(String aggregateType, String aggregateId, String eventType, String topic, String payload);
+}}
+""")
+
+    (pkg_dir / "OutboxMessage.java").write_text(f"""\
+package {base_package};
+
+import org.springframework.data.annotation.Id;
+import org.springframework.data.relational.core.mapping.Column;
+import org.springframework.data.relational.core.mapping.Table;
+
+import java.time.Instant;
+
+@Table("outbox")
+public class OutboxMessage {{
+    @Id
+    private Long id;
+    @Column("aggregate_type") private String aggregateType;
+    @Column("aggregate_id") private String aggregateId;
+    @Column("event_type") private String eventType;
+    private String topic;
+    private String payload;
+    private String status;
+    @Column("created_at") private Instant createdAt;
+    @Column("published_at") private Instant publishedAt;
+
+    public Long getId() {{ return id; }}
+    public void setId(Long id) {{ this.id = id; }}
+    public String getAggregateType() {{ return aggregateType; }}
+    public void setAggregateType(String v) {{ this.aggregateType = v; }}
+    public String getAggregateId() {{ return aggregateId; }}
+    public void setAggregateId(String v) {{ this.aggregateId = v; }}
+    public String getEventType() {{ return eventType; }}
+    public void setEventType(String v) {{ this.eventType = v; }}
+    public String getTopic() {{ return topic; }}
+    public void setTopic(String v) {{ this.topic = v; }}
+    public String getPayload() {{ return payload; }}
+    public void setPayload(String v) {{ this.payload = v; }}
+    public String getStatus() {{ return status; }}
+    public void setStatus(String v) {{ this.status = v; }}
+    public Instant getCreatedAt() {{ return createdAt; }}
+    public void setCreatedAt(Instant v) {{ this.createdAt = v; }}
+    public Instant getPublishedAt() {{ return publishedAt; }}
+    public void setPublishedAt(Instant v) {{ this.publishedAt = v; }}
+}}
+""")
+
+    (pkg_dir / "OutboxRepository.java").write_text(f"""\
+package {base_package};
+
+import org.springframework.data.repository.reactive.ReactiveCrudRepository;
+import reactor.core.publisher.Flux;
+
+public interface OutboxRepository extends ReactiveCrudRepository<OutboxMessage, Long> {{
+    Flux<OutboxMessage> findTop100ByStatusOrderByCreatedAtAsc(String status);
+}}
+""")
+
+    (pkg_dir / "OutboxAdapter.java").write_text(f"""\
+package {base_package};
+
+import {model_pkg}.OutboxPort;
+import org.springframework.stereotype.Component;
+import reactor.core.publisher.Mono;
+
+import java.time.Instant;
+
+/** Implementa OutboxPort: escribe el evento en la tabla outbox (misma transacción que el cambio de BD). */
+@Component
+public class OutboxAdapter implements OutboxPort {{
+
+    private final OutboxRepository repository;
+
+    public OutboxAdapter(OutboxRepository repository) {{
+        this.repository = repository;
+    }}
+
+    @Override
+    public Mono<Void> append(String aggregateType, String aggregateId, String eventType, String topic, String payload) {{
+        OutboxMessage message = new OutboxMessage();
+        message.setAggregateType(aggregateType);
+        message.setAggregateId(aggregateId);
+        message.setEventType(eventType);
+        message.setTopic(topic);
+        message.setPayload(payload);
+        message.setStatus("PENDING");
+        message.setCreatedAt(Instant.now());
+        return repository.save(message).then();
+    }}
+}}
+""")
+
+    (pkg_dir / "OutboxKafkaConfig.java").write_text(f"""\
+package {base_package};
+
+import org.apache.kafka.clients.producer.ProducerConfig;
+import org.apache.kafka.common.serialization.StringSerializer;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.kafka.core.DefaultKafkaProducerFactory;
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.kafka.core.ProducerFactory;
+import org.springframework.scheduling.annotation.EnableScheduling;
+
+import java.util.HashMap;
+import java.util.Map;
+
+@Configuration
+@EnableScheduling
+public class OutboxKafkaConfig {{
+
+    @Value("${{spring.kafka.bootstrap-servers:localhost:9092}}")
+    private String bootstrapServers;
+
+    @Bean
+    public ProducerFactory<String, String> outboxProducerFactory() {{
+        Map<String, Object> props = new HashMap<>();
+        props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
+        props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
+        props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
+        return new DefaultKafkaProducerFactory<>(props);
+    }}
+
+    @Bean
+    public KafkaTemplate<String, String> outboxKafkaTemplate() {{
+        return new KafkaTemplate<>(outboxProducerFactory());
+    }}
+}}
+""")
+
+    (pkg_dir / "OutboxRelay.java").write_text(f"""\
+package {base_package};
+
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Component;
+import reactor.core.publisher.Mono;
+
+import java.time.Instant;
+
+/** Relay del outbox: publica periódicamente los eventos PENDING a Kafka y los marca PUBLISHED. */
+@Component
+public class OutboxRelay {{
+
+    private final OutboxRepository repository;
+    private final KafkaTemplate<String, String> outboxKafkaTemplate;
+
+    public OutboxRelay(OutboxRepository repository, KafkaTemplate<String, String> outboxKafkaTemplate) {{
+        this.repository = repository;
+        this.outboxKafkaTemplate = outboxKafkaTemplate;
+    }}
+
+    @Scheduled(fixedDelayString = "${{outbox.relay.fixed-delay:5000}}")
+    public void publishPending() {{
+        repository.findTop100ByStatusOrderByCreatedAtAsc("PENDING")
+                .flatMap(message -> Mono.fromFuture(
+                                outboxKafkaTemplate.send(message.getTopic(), message.getAggregateId(), message.getPayload())
+                                        .toCompletableFuture())
+                        .flatMap(result -> {{
+                            message.setStatus("PUBLISHED");
+                            message.setPublishedAt(Instant.now());
+                            return repository.save(message);
+                        }}))
+                .subscribe();
+    }}
+}}
+""")
+    logger.info("Módulo outbox generado")
+
+
+def create_compensation_controller(root: Path, safe_project_name: str) -> None:
+    """Endpoint de compensación idempotente para servicios participantes de una saga."""
+    base_package = f"com.{safe_project_name}.restapi"
+    pkg_dir = root / ("infrastructure/entry-points/rest-api/src/main/java/" + base_package.replace(".", "/"))
+    pkg_dir.mkdir(parents=True, exist_ok=True)
+    (pkg_dir / "CompensationController.java").write_text(f"""\
+package {base_package};
+
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+import reactor.core.publisher.Mono;
+
+/**
+ * Endpoint de compensación idempotente que el orquestador de saga (integration-service) invoca
+ * para revertir un paso. La lógica se implementa bajo TDD; la idempotencia se respalda en la
+ * tabla processed_message.
+ */
+@RestController
+@RequestMapping("/saga")
+public class CompensationController {{
+
+    @PostMapping("/compensar/{{sagaId}}")
+    public Mono<ResponseEntity<Void>> compensar(@PathVariable String sagaId) {{
+        // TODO (TDD): invocar el caso de uso de compensación; idempotente vía processed_message.
+        return Mono.just(ResponseEntity.accepted().build());
+    }}
+}}
+""")
+    logger.info("CompensationController generado (servicio participante de saga)")
+
+
+def write_outbox_migration(root: Path, outbox: bool, saga_participant: bool) -> None:
+    """Genera V3__outbox.sql en el módulo rest-api (outbox y/o processed_message)."""
+    migration_dir = root / "infrastructure/entry-points/rest-api/src/main/resources/db/migration"
+    migration_dir.mkdir(parents=True, exist_ok=True)
+    parts = ["-- V3__outbox.sql",
+             "-- Generado por: maven_hexagonal_scaffold.py (--outbox / --saga-participant)",
+             ""]
+    if outbox:
+        parts += [
+            "-- Transactional Outbox: publicación de eventos atómica con el cambio de BD.",
+            "CREATE TABLE IF NOT EXISTS outbox (",
+            "    id             BIGSERIAL    PRIMARY KEY,",
+            "    aggregate_type VARCHAR(120) NOT NULL,",
+            "    aggregate_id   VARCHAR(120) NOT NULL,",
+            "    event_type     VARCHAR(120) NOT NULL,",
+            "    topic          VARCHAR(200) NOT NULL,",
+            "    payload        TEXT         NOT NULL,",
+            "    status         VARCHAR(20)  NOT NULL DEFAULT 'PENDING',",
+            "    created_at     TIMESTAMPTZ  NOT NULL DEFAULT now(),",
+            "    published_at   TIMESTAMPTZ",
+            ");",
+            "CREATE INDEX IF NOT EXISTS idx_outbox_status_created ON outbox (status, created_at);",
+            "",
+        ]
+    if outbox or saga_participant:
+        parts += [
+            "-- Idempotencia de consumidores y compensaciones de saga.",
+            "CREATE TABLE IF NOT EXISTS processed_message (",
+            "    message_id   VARCHAR(120) PRIMARY KEY,",
+            "    consumer     VARCHAR(120) NOT NULL,",
+            "    processed_at TIMESTAMPTZ  NOT NULL DEFAULT now()",
+            ");",
+            "",
+        ]
+    (migration_dir / "V3__outbox.sql").write_text("\n".join(parts) + "\n")
+    logger.info("Migración V3__outbox.sql generada")
+
+
+def scaffold(project_name: str, database: str, messaging_system: str, port: int = 8080,
+             org: str = "myproject", outbox: bool = False, saga_participant: bool = False) -> None:
     safe_name = project_name.replace("-", "")
     root = Path(project_name)
-    logger.info("Creando proyecto: %s (db=%s, messaging=%s, port=%d)", project_name, database, messaging_system, port)
+    logger.info("Creando proyecto: %s (db=%s, messaging=%s, port=%d, outbox=%s, saga_participant=%s)",
+                project_name, database, messaging_system, port, outbox, saga_participant)
 
     db_adapter_module = (
         "infrastructure/driven-adapters/mongo"
@@ -1063,6 +1374,10 @@ def scaffold(project_name: str, database: str, messaging_system: str, port: int 
         modules.append("infrastructure/entry-points/kafka-consumer")
         logger.debug("Mensajería habilitada: kafka-consumer")
 
+    if outbox:
+        modules.append("infrastructure/driven-adapters/outbox")
+        logger.debug("Transactional Outbox habilitado")
+
     logger.info("Módulos a generar: %d", len(modules))
 
     for module in modules:
@@ -1075,7 +1390,7 @@ def scaffold(project_name: str, database: str, messaging_system: str, port: int 
         pkg_dir.mkdir(parents=True, exist_ok=True)
 
         pom_path = root / module / "pom.xml"
-        pom_path.write_text(get_module_pom(project_name, safe_name, module))
+        pom_path.write_text(get_module_pom(project_name, safe_name, module, include_outbox_dep=outbox))
         logger.debug("pom.xml creado: %s", pom_path)
 
         if module == "infrastructure/entry-points/rest-api":
@@ -1164,6 +1479,13 @@ public class ApplicationConfig {{
     elif messaging_system.lower() == "kafka-consumer":
         create_kafka_consumer_files(root, safe_name)
 
+    if outbox:
+        create_outbox_files(root, safe_name)
+    if saga_participant:
+        create_compensation_controller(root, safe_name)
+    if outbox or saga_participant:
+        write_outbox_migration(root, outbox, saga_participant)
+
     secrets_dir = root / "scripts"
     secrets_dir.mkdir(parents=True, exist_ok=True)
     secrets_script = secrets_dir / "create-secrets-dev.sh"
@@ -1195,10 +1517,10 @@ bin/
 """
     (root / ".gitignore").write_text(gitignore)
     logger.debug(".gitignore creado")
-    (root / "pom.xml").write_text(get_root_pom(project_name, database, messaging_system))
+    (root / "pom.xml").write_text(get_root_pom(project_name, database, messaging_system, outbox=outbox))
     logger.debug("pom.xml raíz creado")
 
-    (root / "Dockerfile").write_text(get_dockerfile_content(database, messaging_system, port))
+    (root / "Dockerfile").write_text(get_dockerfile_content(database, messaging_system, port, outbox=outbox))
     logger.debug("Dockerfile creado")
     (root / ".dockerignore").write_text(get_dockerignore_content())
     logger.debug(".dockerignore creado")
@@ -1436,6 +1758,12 @@ def main() -> None:
                              "secrets (<org>/dev/<servicio>), la organización Gitea y el "
                              "paquete de la Shared Library (org.<org>). Debe coincidir con "
                              "el -P/--project usado en los scripts. (default: myproject)")
+    parser.add_argument("--outbox", action="store_true",
+                        help="Añade el módulo Transactional Outbox (publicación de eventos "
+                             "atómica con el cambio de BD) y la migración V3__outbox.sql.")
+    parser.add_argument("--saga-participant", action="store_true",
+                        help="Marca el servicio como participante de una saga: genera el "
+                             "endpoint de compensación idempotente y la tabla processed_message.")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Mostrar logs detallados (DEBUG)")
 
@@ -1450,7 +1778,8 @@ def main() -> None:
     )
 
     try:
-        scaffold(args.service_name, args.database, args.messaging_system, args.port, args.org)
+        scaffold(args.service_name, args.database, args.messaging_system, args.port, args.org,
+                 outbox=args.outbox, saga_participant=args.saga_participant)
     except OSError as e:
         logger.error("No se pudo crear el proyecto: %s", e)
         sys.exit(1)

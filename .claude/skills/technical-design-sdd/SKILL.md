@@ -201,6 +201,7 @@ En esta sección debes generar dos diagramas C4 en formato **Mermaid**, cada uno
 - Usar sintaxis Mermaid válida para C4 (`C4Context` y `C4Container`).
 - El contenido de cada `.mmd` es ÚNICAMENTE el diagrama Mermaid (sin texto adicional ni markdown alrededor).
 - Derivar actores, sistemas externos y contenedores de los bounded contexts, trust boundaries y decisiones del Strategic Design.
+- Si una decisión estratégica (`DS-xxx`) define una **capa de integración dedicada**, el diagrama de contenedores debe incluir el contenedor `integration-service` (Apache Camel) ubicado **entre** los microservicios de dominio y los sistemas externos: los servicios de dominio se comunican con `integration-service` (REST/Kafka) y solo `integration-service` se comunica con los sistemas externos. Si la decisión estratégica define orquestación de saga con coordinador LRA, incluye también el contenedor del **coordinador LRA (Narayana)** y su relación con `integration-service`.
 - Mantener los diagramas consistentes con el stack y los componentes descritos en este documento.
 - En el cuerpo del documento `system.md`, referenciar ambos diagramas mediante enlaces relativos (por ejemplo: `Ver diagrama de contexto: [SDD-[proyecto]-c4-context.mmd](diagrams/SDD-[proyecto]-c4-context.mmd)`) y describir brevemente en prosa qué muestra cada uno.
 - NO incrustar el contenido completo del diagrama dentro del `.md`; solo referenciarlo y resumirlo.
@@ -305,6 +306,7 @@ Genera la especificación completa en formato **OpenAPI 3.0 (YAML)**:
 - Agrupar endpoints por bounded context o módulo usando `tags`.
 - Alinear los `securitySchemes` con el modelo de autenticación/autorización del Strategic Design.
 - Mantener nivel de diseño (contratos), no incluir implementación.
+- Si hay sagas, incluye en cada **servicio participante** los endpoints de **compensación** (idempotentes) que el orquestador invoca para revertir un paso (por ejemplo `POST /{recurso}/{id}/compensar`), agrupados bajo un `tag` propio. Incluye también, en el `integration-service`, los endpoints de su **API interna** de saga (ejecutar/consultar el estado de una saga).
 
 # REFERENCIA EN EL DOCUMENTO
 
@@ -377,6 +379,10 @@ Si el diseño usa más de un motor (por ejemplo PostgreSQL para un contexto y Mo
 - Reflejar las relaciones y trust boundaries del dominio (referencias, foreign keys, embedding).
 - Elegir el formato (`.sql`, `.js` o ambos) según el tipo de base de datos decidido en el Stack Tecnológico de `system.md`.
 - Mantener nivel de diseño: esquema y estructura, sin datos de prueba ni lógica de aplicación.
+- **Tablas de soporte para Saga y Outbox (si aplica):** si el diseño incluye sagas, añade al `schema.sql` (bajo un comentario de bounded context propio) las tablas de soporte, agrupadas por su servicio propietario:
+  - En el **servicio orquestador** (`integration-service`): `saga_instance` (`saga_id` PK, `saga_type`, `state`, `current_step`, `payload jsonb`, timestamps) y `saga_step_log` (`id`, `saga_id` FK, `step_name`, `status`, `compensation_payload jsonb`, `executed_at`).
+  - En cada **servicio participante** que publica eventos: `outbox` (`id`, `aggregate_type`, `aggregate_id`, `event_type`, `payload jsonb`, `topic`, `created_at`, `published_at`, `status`; índice sobre `status, created_at`) y `processed_message` (`message_id` PK, `consumer`, `processed_at`) para idempotencia.
+  - Cada tabla es propiedad de exactamente un microservicio; sepáralas con comentarios `-- BC-XX:` para que la generación de migraciones Flyway las asigne correctamente.
 
 # REFERENCIA EN EL DOCUMENTO
 
@@ -423,6 +429,26 @@ Describir flujos importantes del sistema con perspectiva técnica.
 - Mantener claridad técnica.
 - Indicar el componente responsable de cada paso.
 - Evitar exceso de detalle.
+
+# FLUJOS DE SAGA (TRANSACCIONES DISTRIBUIDAS)
+
+Si el Strategic Design definió flujos de saga, documenta cada uno con este formato adicional, dejando explícitas las compensaciones:
+
+## Saga: [Nombre del Flujo]
+
+**Estilo:** orquestación (orquestador en `integration-service`, Camel Saga EIP + coordinador LRA) / coreografía / híbrido.
+
+| # | Paso (acción) | Servicio participante | Evento/comando | Compensación | Idempotencia |
+|---|---|---|---|---|---|
+| 1 | [acción] | [servicio] | [evento/comando] | [acción compensatoria] | [clave de idempotencia] |
+
+- Describir qué ocurre ante el fallo del paso N: el orquestador dispara las compensaciones de los pasos N-1…1 en orden inverso.
+- Indicar el uso de **Transactional Outbox** en cada participante para publicar eventos de forma atómica con su cambio de base de datos.
+- Indicar que las compensaciones y los consumidores son **idempotentes** (tabla `processed_message`).
+
+# CONSUMO DE APIS / SISTEMAS EXTERNOS (CAMEL)
+
+Si hay integración con sistemas externos centralizada en `integration-service`, documenta un flujo técnico por integración relevante: el servicio de dominio invoca a `integration-service` (REST/Kafka) → `integration-service` ejecuta la ruta Camel (con ACL, reintentos y circuit breaker Resilience4j) hacia el sistema externo → traduce la respuesta al modelo del dominio → responde. Indicar el sistema externo, el protocolo y el contrato esperado.
 
 ---
 
@@ -486,6 +512,7 @@ Este script genera el árbol Terraform multi-ambiente (`dev`/`staging`/`prod`) p
 - Indicar que se ejecuta tras completar la etapa de Diseño Técnico, usando las decisiones de este documento (`infrastructure.md`) como insumos.
 - Documentar en la tabla de componentes la correspondencia entre las decisiones de infraestructura del diseño y los recursos que genera el script (Vercel, EKS/K3d-en-dev, RDS, Cognito, API Gateway, Secrets Manager, ECR).
 - Si una decisión técnica del diseño difiere de lo que provisiona el script por defecto, indicarlo explícitamente como ajuste requerido.
+- Si el diseño incluye orquestación de saga con coordinador LRA, la tabla de componentes debe incluir el **coordinador Narayana LRA** (contenedor en `floci-net` para dev) y, para las pruebas de integración de las rutas Camel, **WireMock** como simulador de los sistemas externos. Ambos los provisiona `base-infrastructure-builder.sh`.
 
 ---
 
@@ -550,6 +577,11 @@ Documentar decisiones técnicas importantes.
 - Explicar tradeoffs con honestidad.
 - Mantener claridad técnica.
 - Incluir al menos las decisiones más impactantes del diseño.
+
+# ADRs OBLIGATORIOS SEGÚN LAS DECISIONES ESTRATÉGICAS
+
+- Si el Strategic Design definió una capa de integración dedicada, incluye un `ADR-xxx` que profundice **Apache Camel como capa de integración en `integration-service`**: bridge reactivo Camel↔Reactor (`camel-reactive-streams`, prohibido `block()`), resiliencia con Resilience4j y ACL por sistema externo.
+- Si definió sagas, incluye un `ADR-xxx` para la **orquestación de saga** (Camel Saga EIP + coordinador **Narayana LRA**, orquestador en `integration-service`, compensaciones idempotentes) y un `ADR-xxx` para el **Transactional Outbox** en los participantes (publicación de eventos atómica con el cambio de BD; relay por polling en dev, evolucionable a CDC/Debezium).
 
 ---
 

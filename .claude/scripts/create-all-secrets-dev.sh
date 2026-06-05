@@ -169,20 +169,43 @@ detect_db_type() {
   fi
 }
 
-# Detecta si el servicio tiene un driven-adapter productor de Kafka
-# o un entry-point consumidor de Kafka.
+# Detecta si el servicio tiene un driven-adapter productor de Kafka,
+# un entry-point consumidor de Kafka, o el módulo Transactional Outbox
+# (su relay también publica a Kafka).
 detect_kafka() {
   local svc_path="$1"
-  local has_producer has_consumer
+  local has_producer has_consumer has_outbox
   has_producer=$(find "$svc_path/infrastructure/driven-adapters" -maxdepth 1 -type d \
                    -name "kafka-producer" 2>/dev/null | wc -l)
   has_consumer=$(find "$svc_path/infrastructure/entry-points" -maxdepth 1 -type d \
                    -name "kafka-consumer" 2>/dev/null | wc -l)
-  if [[ "$has_producer" -gt 0 || "$has_consumer" -gt 0 ]]; then
+  has_outbox=$(find "$svc_path/infrastructure/driven-adapters" -maxdepth 1 -type d \
+                 -name "outbox" 2>/dev/null | wc -l)
+  if [[ "$has_producer" -gt 0 || "$has_consumer" -gt 0 || "$has_outbox" -gt 0 ]]; then
     echo "true"
   else
     echo "false"
   fi
+}
+
+# Detecta si el servicio es el integration-service (capa Camel + orquestador de saga):
+# presencia de los driven-adapters camel-rest-consumer o saga-camel.
+detect_integration() {
+  local svc_path="$1"
+  if find "$svc_path/infrastructure/driven-adapters" -maxdepth 1 -type d \
+       \( -name "camel-rest-consumer" -o -name "saga-camel" \) 2>/dev/null | grep -q .; then
+    echo "true"
+  else
+    echo "false"
+  fi
+}
+
+# Lista los nombres de sistemas externos a partir de las rutas Camel (external.<name>.base-url).
+detect_external_systems() {
+  local svc_path="$1"
+  grep -rho 'external\.[a-z0-9-]*\.base-url' \
+    "$svc_path/infrastructure/driven-adapters/camel-rest-consumer" 2>/dev/null \
+    | sed -E 's/external\.([a-z0-9-]*)\.base-url/\1/' | sort -u
 }
 
 # Upsert idempotente: actualiza el secret si ya existe, lo crea si no.
@@ -259,6 +282,19 @@ for svc_path in "${services[@]}"; do
   # Si el servicio no usa Kafka, eliminar la clave del JSON.
   if [[ "$uses_kafka" == "false" ]]; then
     secret_json=$(echo "$secret_json" | jq 'del(.KAFKA_BOOTSTRAP_SERVERS)')
+  fi
+
+  # integration-service: añadir coordinador LRA y URLs de sistemas externos (WireMock en dev).
+  if [[ "$(detect_integration "$svc_path")" == "true" ]]; then
+    lra_url="http://${PROJECT_NAME}-lra-coordinator:8080/lra-coordinator"
+    secret_json=$(echo "$secret_json" | jq --arg lra "$lra_url" '. + {LRA_COORDINATOR_URL: $lra}')
+    while IFS= read -r ext; do
+      [[ -z "$ext" ]] && continue
+      ext_key="EXT_$(echo "$ext" | tr '[:lower:]-' '[:upper:]_')_BASE_URL"
+      ext_val="http://${PROJECT_NAME}-wiremock:8080/${ext}"
+      secret_json=$(echo "$secret_json" | jq --arg k "$ext_key" --arg v "$ext_val" '. + {($k): $v}')
+      log "    + $ext_key → $ext_val"
+    done < <(detect_external_systems "$svc_path")
   fi
 
   if action="$(upsert_secret "$secret_name" "$secret_json")"; then

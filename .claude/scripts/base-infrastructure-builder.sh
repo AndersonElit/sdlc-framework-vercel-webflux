@@ -156,6 +156,46 @@ docker run -d \
 log_ok "Apache Kafka listo (interno ${PROJECT_NAME}-kafka-dev:9092 / host localhost:29092)."
 
 # ---------------------------------------------------------------------------
+# Soporte de Saga (orquestación) e integración (Camel):
+#   - Coordinador Narayana LRA  → respalda el Saga EIP de Camel del integration-service.
+#   - WireMock                  → simula los sistemas externos en las pruebas de integración
+#                                 (contract tests de las rutas Camel de salida).
+# Se levantan por defecto; para omitirlos en proyectos sin saga: ENABLE_SAGA=0.
+# ---------------------------------------------------------------------------
+ENABLE_SAGA="${ENABLE_SAGA:-1}"
+if [[ "$ENABLE_SAGA" == "1" ]]; then
+  LRA_CONTAINER="${PROJECT_NAME}-lra-coordinator"
+  log "Levantando coordinador Narayana LRA (saga)..."
+  if docker inspect "$LRA_CONTAINER" &>/dev/null; then
+    log "Coordinador LRA ya existe ($LRA_CONTAINER)."
+  else
+    docker run -d \
+      --name "$LRA_CONTAINER" \
+      --network floci-net \
+      --restart unless-stopped \
+      -p 50000:8080 \
+      quay.io/jbosstm/lra-coordinator:latest >/dev/null
+    log_ok "Coordinador LRA listo (interno ${LRA_CONTAINER}:8080/lra-coordinator / host localhost:50000)."
+  fi
+
+  WIREMOCK_CONTAINER="${PROJECT_NAME}-wiremock"
+  log "Levantando WireMock (simulador de sistemas externos)..."
+  if docker inspect "$WIREMOCK_CONTAINER" &>/dev/null; then
+    log "WireMock ya existe ($WIREMOCK_CONTAINER)."
+  else
+    docker run -d \
+      --name "$WIREMOCK_CONTAINER" \
+      --network floci-net \
+      --restart unless-stopped \
+      -p 9999:8080 \
+      wiremock/wiremock:3.9.1 >/dev/null
+    log_ok "WireMock listo (interno ${WIREMOCK_CONTAINER}:8080 / host localhost:9999)."
+  fi
+else
+  log "ENABLE_SAGA=0 — se omiten el coordinador LRA y WireMock."
+fi
+
+# ---------------------------------------------------------------------------
 # Gitea (servidor Git local para dev)
 # Reemplaza GitHub/GitLab para los repos internos del proyecto: microservicios
 # y jenkins-shared-library. El SDLC principal permanece en GitHub.
