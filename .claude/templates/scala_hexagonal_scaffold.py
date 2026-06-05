@@ -176,6 +176,53 @@ def dotenv_files(root: Path, report_role: str | None = None,
 
 
 # --------------------------------------------------------------------------- #
+# Dockerfile
+# --------------------------------------------------------------------------- #
+def dockerfile_files(root: Path, svc: str) -> None:
+    jar = "infrastructure/entry-points/target/scala-2.13/entry-points-assembly-*.jar"
+
+    write(root, "Dockerfile",
+          "# Stage 1 — build fat JAR\n"
+          "FROM sbtscala/scala-sbt:eclipse-temurin-17.0.10_7_1.9.8_2.13.14 AS builder\n"
+          "WORKDIR /app\n"
+          "COPY . .\n"
+          'RUN sbt "entryPoints/assembly"\n'
+          "\n"
+          "# Stage 2 — runtime (JRE only; Spark runs embedded in local[*] mode)\n"
+          "FROM eclipse-temurin:17-jre-jammy\n"
+          "WORKDIR /app\n"
+          f"COPY --from=builder /app/{jar} app.jar\n"
+          "\n"
+          'ENV SPARK_MASTER="local[*]"\n'
+          "\n"
+          'ENTRYPOINT ["java",\\\n'
+          '  "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED",\\\n'
+          '  "--add-opens=java.base/java.nio=ALL-UNNAMED",\\\n'
+          '  "--add-opens=java.base/java.lang=ALL-UNNAMED",\\\n'
+          '  "--add-opens=java.base/java.lang.invoke=ALL-UNNAMED",\\\n'
+          '  "--add-opens=java.base/java.lang.reflect=ALL-UNNAMED",\\\n'
+          '  "--add-opens=java.base/java.io=ALL-UNNAMED",\\\n'
+          '  "--add-opens=java.base/java.net=ALL-UNNAMED",\\\n'
+          '  "--add-opens=java.base/java.util=ALL-UNNAMED",\\\n'
+          '  "--add-opens=java.base/java.util.concurrent=ALL-UNNAMED",\\\n'
+          '  "--add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED",\\\n'
+          '  "--add-opens=java.base/sun.nio.cs=ALL-UNNAMED",\\\n'
+          '  "--add-opens=java.base/sun.security.action=ALL-UNNAMED",\\\n'
+          '  "--add-opens=java.base/sun.util.calendar=ALL-UNNAMED",\\\n'
+          '  "--add-opens=java.security.jgss/sun.security.krb5=ALL-UNNAMED",\\\n'
+          '  "-jar","app.jar"]\n')
+
+    write(root, ".dockerignore",
+          "target/\n"
+          ".git/\n"
+          ".env\n"
+          "*.class\n"
+          ".bsp/\n"
+          ".metals/\n"
+          ".idea/\n")
+
+
+# --------------------------------------------------------------------------- #
 # Generadores genéricos (modo sin --report-role) — comportamiento original
 # --------------------------------------------------------------------------- #
 def domain_model(root: Path, pkg: str) -> None:
@@ -933,6 +980,7 @@ def scaffold(service_name: str, root_arg: str | None, service_name_provided: boo
 
     build_files(root, service_name, pkg, report_role, source)
     dotenv_files(root, report_role, source)
+    dockerfile_files(root, service_name)
 
     if report_role is None:
         # Comportamiento original (retrocompatible): placeholders + BatchMain vacío.
@@ -984,6 +1032,11 @@ def scaffold(service_name: str, root_arg: str | None, service_name_provided: boo
     print("     java -jar infrastructure/entry-points/target/scala-2.13/entry-points-assembly-0.1.0-SNAPSHOT.jar")
     print("\n6. Compile all modules without running:")
     print("     sbt compile")
+    print("\n--- Docker ---")
+    print(f"\n7. Build the Docker image:")
+    print(f"     docker build -t {service_name}:latest .")
+    print("\n8. Run with Docker (pass env vars from .env):")
+    print(f"     docker run --env-file .env {service_name}:latest")
     print("========================================")
 
 
