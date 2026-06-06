@@ -5,8 +5,9 @@
 #
 # Implementa el patrón Database-per-Service: cada microservicio detectado en
 # backend/ recibe su propia base de datos aislada. Ningún servicio comparte
-# base de datos con otro; la inicialización del esquema la hace Flyway al
-# arrancar cada servicio (V1__initial_schema.sql generado por el scaffold).
+# base de datos con otro. El esquema lo aplica Liquibase standalone
+# (run-liquibase-migrations.sh) como paso previo al despliegue; no depende
+# del arranque del servicio (Flyway requiere JDBC — incompatible con R2DBC).
 #
 # Prerrequisito: Etapa 0 completada (init-dev-environment.sh finalizó con
 #                checklist ✓ y terraform output rds_port disponible).
@@ -437,9 +438,13 @@ for db in "${MONGO_DBS_CREATED[@]}"; do
 done
 echo ""
 echo "  Patrón: Database-per-Service — cada servicio tiene su propia BD."
-echo "  El esquema lo aplica Flyway al arrancar cada servicio (V1__initial_schema.sql)."
+echo "  El esquema lo aplica Liquibase standalone previo al despliegue (no al arrancar el servicio)."
 echo ""
-echo "  Siguiente paso (Etapa 2):"
+echo "  Siguiente paso (Etapa 1b) — aplicar changelogs Liquibase:"
+echo "    bash .claude/scripts/run-liquibase-migrations.sh \\"
+echo "      -P $PROJECT_NAME -p $PG_DB_NAME -u $APP_USER -w <clave>"
+echo ""
+echo "  Siguiente paso (Etapa 2) — secrets:"
 echo "    bash .claude/scripts/create-all-secrets-dev.sh \\"
 echo "      -P $PROJECT_NAME -p $PG_DB_NAME -m $MONGO_DB_NAME -u $APP_USER -w <clave>"
 echo ""

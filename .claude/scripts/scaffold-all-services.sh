@@ -14,9 +14,9 @@
 #   2. Crea el directorio backend/ y frontend/
 #   3. Backend — genera microservicios Spring Boot hexagonal
 #   4. Frontend — genera proyecto Next.js feature-based
-#   5. PostgreSQL — genera V1__initial_schema.sql por microservicio (Flyway)
-#   6. seguridad-service — genera V2__seed_roles_permisos.sql
-#   7. Checklist de verificación de directorios y migraciones generadas
+#   5. PostgreSQL — genera changelogs Liquibase iniciales en db/<svc>/changelog/
+#   6. seguridad-service — genera 00002_seed_roles.yaml en db/seguridad-service/changelog/
+#   7. Checklist de verificación de directorios y changelogs generados
 # ===========================================================================
 
 set -euo pipefail
@@ -47,7 +47,6 @@ SCHEMA_FILES=("$REPO_ROOT/docs/design/database"/*.sql)
 SCHEMA_SQL="${SCHEMA_FILES[0]}"
 SCHEMA_BASENAME="$(basename "$SCHEMA_SQL" 2>/dev/null || echo "schema.sql")"
 REST_MODULE="rest-api"
-MIGRATION_SUBPATH="src/main/resources/db/migration"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Argumentos de línea de comandos
@@ -66,7 +65,7 @@ MIGRATION_SUBPATH="src/main/resources/db/migration"
 #
 # --bc-tags servicio=TAG                  (repetible, opcional)
 #   Mapea un microservicio PostgreSQL a su tag en el schema.sql para generar
-#   las migraciones Flyway V1. Si se omite, no se generan migraciones.
+#   los changelogs Liquibase iniciales. Si se omite, no se generan changelogs.
 #   Ejemplo:
 #     --bc-tags clientes-service=BC-01
 # ──────────────────────────────────────────────────────────────────────────────
@@ -128,7 +127,7 @@ Uso: $0 -P <proyecto> --backend nombre:db:messaging:puerto [--backend ...] \
 
   --bc-tags   Par servicio=BC-XX (opcional, repetible).
               Mapea un servicio PostgreSQL a su tag en el schema.sql para
-              generar V1__initial_schema.sql por Flyway.
+              generar el changelog Liquibase inicial (00001_initial_schema.yaml).
 
   --report-extraction <svc>:<source>:<topic-out>   (opcional, repetible)
               Genera el report-extraction-service (MS1, Spark) con scala_hexagonal_scaffold.py
@@ -403,9 +402,9 @@ else
   log "Frontend: omitido (no se especificó --frontend)."
 fi
 if [[ "${#BC_TAGS[@]}" -gt 0 ]]; then
-  log "BC_TAGS: ${#BC_TAGS[@]} servicios para migraciones Flyway."
+  log "BC_TAGS: ${#BC_TAGS[@]} servicios para changelogs Liquibase."
 else
-  log "BC_TAGS: omitidos (no se generarán migraciones Flyway V1)."
+  log "BC_TAGS: omitidos (no se generarán changelogs Liquibase iniciales)."
 fi
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -631,18 +630,21 @@ else
 fi
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 5. PostgreSQL — generar migraciones Flyway V1 por microservicio
+# 5. PostgreSQL — generar changelogs Liquibase iniciales por microservicio
 # ──────────────────────────────────────────────────────────────────────────────
-HEADER "5. PostgreSQL — generando migraciones Flyway V1 por microservicio"
+# Flyway requiere JDBC bloqueante — incompatible con servicios R2DBC. Liquibase
+# corre como proceso independiente (run-liquibase-migrations.sh) antes del
+# despliegue; los changelogs viven en db/<servicio>/changelog/, fuera del JAR.
+HEADER "5. PostgreSQL — generando changelogs Liquibase iniciales por microservicio"
 
 if [[ "${#BC_TAGS[@]}" -gt 0 ]]; then
   if [[ ! -f "$SCHEMA_SQL" ]]; then
-    log_warn "Schema SQL no encontrado: $SCHEMA_SQL — omitiendo generación Flyway V1."
+    log_warn "Schema SQL no encontrado: $SCHEMA_SQL — omitiendo generación de changelogs Liquibase."
   else
     for SERVICE in "${!BC_TAGS[@]}"; do
       TAG="${BC_TAGS[$SERVICE]}"
-      MIGRATION_DIR="$BACKEND_DIR/$SERVICE/$REST_MODULE/$MIGRATION_SUBPATH"
-      V1_FILE="$MIGRATION_DIR/V1__initial_schema.sql"
+      CHANGELOG_DIR="$REPO_ROOT/db/$SERVICE/changelog"
+      CHANGELOG_FILE="$CHANGELOG_DIR/00001_initial_schema.yaml"
 
       BLOCK=$(awk -v tag="-- $TAG:" '
         $0 ~ tag        { found=1; next }
@@ -651,175 +653,131 @@ if [[ "${#BC_TAGS[@]}" -gt 0 ]]; then
       ' "$SCHEMA_SQL" 2>/dev/null | sed '/^[[:space:]]*$/N;/^\n$/d' || true)
 
       if [[ -z "$BLOCK" ]]; then
-        log_warn "$SERVICE ($TAG) — bloque no encontrado en schema.sql; se generará un archivo vacío con cabecera."
-        BLOCK="-- Extraer manualmente desde $SCHEMA_SQL las tablas de $TAG"
+        log_warn "$SERVICE ($TAG) — bloque no encontrado en schema.sql; se generará un placeholder."
+        BLOCK="-- TODO: extraer manualmente desde $SCHEMA_SQL las tablas de $TAG"
       fi
 
-      if [[ -f "$V1_FILE" ]]; then
-        log_warn "$SERVICE — $V1_FILE ya existe; omitiendo (no se sobreescribe)."
+      if [[ -f "$CHANGELOG_FILE" ]]; then
+        log_warn "$SERVICE — $CHANGELOG_FILE ya existe; omitiendo (no se sobreescribe)."
         continue
       fi
 
-      if [[ ! -d "$MIGRATION_DIR" ]]; then
-        mkdir -p "$MIGRATION_DIR"
-        log "  Creado directorio: $MIGRATION_DIR"
-      fi
+      mkdir -p "$CHANGELOG_DIR"
 
-      cat > "$V1_FILE" <<EOF
--- V1__initial_schema.sql
--- Microservicio: $SERVICE
--- Bounded Context: $TAG
--- Generado por: scaffold-all-services.sh
--- Fuente: docs/design/database/$SCHEMA_BASENAME
---
--- NOTA: Las tablas usan CREATE TABLE IF NOT EXISTS para ser idempotentes
--- en caso de que la base dev compartida ya las tenga del schema.sql global.
+      INDENTED_BLOCK=$(echo "$BLOCK" | sed 's/^/              /')
 
-$BLOCK
+      cat > "$CHANGELOG_FILE" <<EOF
+databaseChangeLog:
+  - changeSet:
+      id: 00001-initial-schema
+      author: scaffold
+      comment: "Schema inicial — Microservicio: $SERVICE, Bounded Context: $TAG — Fuente: docs/design/database/$SCHEMA_BASENAME"
+      changes:
+        - sql:
+            sql: |
+$INDENTED_BLOCK
+            stripComments: true
 EOF
 
-      log_ok "$SERVICE — $V1_FILE generado."
+      log_ok "$SERVICE — $CHANGELOG_FILE generado."
     done
   fi
 else
-  log "Sin --bc-tags definidos; omitiendo generación de migraciones Flyway V1."
+  log "Sin --bc-tags definidos; omitiendo generación de changelogs Liquibase."
 fi
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 6. seguridad-service — generar V2__seed_roles_permisos.sql
+# 6. seguridad-service — generar 00002_seed_roles.yaml (Liquibase)
 # ──────────────────────────────────────────────────────────────────────────────
-HEADER "6. seguridad-service — generando V2__seed_roles_permisos.sql"
+HEADER "6. seguridad-service — generando 00002_seed_roles.yaml"
 
-SEGURIDAD_MIGRATION_DIR="$BACKEND_DIR/seguridad-service/$REST_MODULE/$MIGRATION_SUBPATH"
-V2_FILE="$SEGURIDAD_MIGRATION_DIR/V2__seed_roles_permisos.sql"
+SEGURIDAD_CHANGELOG_DIR="$REPO_ROOT/db/seguridad-service/changelog"
+V2_FILE="$SEGURIDAD_CHANGELOG_DIR/00002_seed_roles.yaml"
 
 if [[ -d "$BACKEND_DIR/seguridad-service" ]]; then
   if [[ -f "$V2_FILE" ]]; then
     log_warn "seguridad-service — $V2_FILE ya existe; omitiendo."
   else
-    if [[ ! -d "$SEGURIDAD_MIGRATION_DIR" ]]; then
-      mkdir -p "$SEGURIDAD_MIGRATION_DIR"
+    mkdir -p "$SEGURIDAD_CHANGELOG_DIR"
+
+    SEGURIDAD_ROOT_YAML="$SEGURIDAD_CHANGELOG_DIR/root.yaml"
+    if [[ -f "$SEGURIDAD_ROOT_YAML" ]] && ! grep -q "00002_seed_roles.yaml" "$SEGURIDAD_ROOT_YAML"; then
+      echo "  - include:" >> "$SEGURIDAD_ROOT_YAML"
+      echo "      file: changelog/00002_seed_roles.yaml" >> "$SEGURIDAD_ROOT_YAML"
+      echo "      relativeToChangelogFile: true" >> "$SEGURIDAD_ROOT_YAML"
+      log "  Incluido 00002_seed_roles.yaml en root.yaml de seguridad-service."
     fi
 
-    cat > "$V2_FILE" <<'EOF'
--- V2__seed_roles_permisos.sql
--- Microservicio: seguridad-service
--- Semilla: 7 roles del sistema, permisos por bounded context y mapeo roles_permisos
--- Generado por: scaffold-all-services.sh
-
--- Roles del sistema (7 roles definidos en el CHECK de la tabla roles)
-INSERT INTO roles (id, nombre, descripcion, activo, created_at, updated_at)
-VALUES
-  (gen_random_uuid(), 'ADMIN',              'Administrador del sistema con acceso total',         true, NOW(), NOW()),
-  (gen_random_uuid(), 'OFICIAL_CREDITO',    'Oficial de crédito — origina y evalúa solicitudes',  true, NOW(), NOW()),
-  (gen_random_uuid(), 'ANALISTA_RIESGO',    'Analista de riesgo — revisiones manuales',           true, NOW(), NOW()),
-  (gen_random_uuid(), 'CAJERO',             'Cajero — registro de pagos y desembolsos',           true, NOW(), NOW()),
-  (gen_random_uuid(), 'AUDITOR',            'Auditor — acceso de solo lectura a auditoría',       true, NOW(), NOW()),
-  (gen_random_uuid(), 'REPORTES',           'Usuario de reportes — acceso a vistas de cartera',   true, NOW(), NOW()),
-  (gen_random_uuid(), 'SOPORTE',            'Soporte técnico — consultas operativas',              true, NOW(), NOW())
-ON CONFLICT (nombre) DO NOTHING;
-
--- Permisos por bounded context y operación
-INSERT INTO permisos (id, nombre, descripcion, recurso, accion, created_at, updated_at)
-VALUES
-  -- Gestión de Clientes
-  (gen_random_uuid(), 'clientes:read',      'Leer clientes',          'clientes',      'READ',   NOW(), NOW()),
-  (gen_random_uuid(), 'clientes:write',     'Crear/editar clientes',  'clientes',      'WRITE',  NOW(), NOW()),
-  (gen_random_uuid(), 'clientes:delete',    'Eliminar clientes',      'clientes',      'DELETE', NOW(), NOW()),
-  -- Configuración
-  (gen_random_uuid(), 'configuracion:read', 'Leer configuración',     'configuracion', 'READ',   NOW(), NOW()),
-  (gen_random_uuid(), 'configuracion:write','Editar configuración',   'configuracion', 'WRITE',  NOW(), NOW()),
-  -- Originación
-  (gen_random_uuid(), 'originacion:read',   'Leer solicitudes',       'originacion',   'READ',   NOW(), NOW()),
-  (gen_random_uuid(), 'originacion:write',  'Crear solicitudes',      'originacion',   'WRITE',  NOW(), NOW()),
-  (gen_random_uuid(), 'originacion:approve','Aprobar solicitudes',    'originacion',   'APPROVE',NOW(), NOW()),
-  -- Tasas y Simulación
-  (gen_random_uuid(), 'tasas:read',         'Consultar tasas',        'tasas',         'READ',   NOW(), NOW()),
-  (gen_random_uuid(), 'tasas:write',        'Configurar tasas',       'tasas',         'WRITE',  NOW(), NOW()),
-  -- Ciclo de Vida
-  (gen_random_uuid(), 'ciclovida:read',     'Leer obligaciones',      'ciclovida',     'READ',   NOW(), NOW()),
-  (gen_random_uuid(), 'ciclovida:write',    'Registrar pagos/abonos', 'ciclovida',     'WRITE',  NOW(), NOW()),
-  -- Auditoría
-  (gen_random_uuid(), 'auditoria:read',     'Leer eventos de auditoría','auditoria',   'READ',   NOW(), NOW()),
-  -- Reportes
-  (gen_random_uuid(), 'reportes:read',      'Consultar reportes',     'reportes',      'READ',   NOW(), NOW())
-ON CONFLICT (nombre) DO NOTHING;
-
--- Mapeo roles_permisos: ADMIN obtiene todos los permisos
-INSERT INTO roles_permisos (rol_id, permiso_id, created_at)
-SELECT r.id, p.id, NOW()
-FROM roles r, permisos p
-WHERE r.nombre = 'ADMIN'
-ON CONFLICT DO NOTHING;
-
--- OFICIAL_CREDITO
-INSERT INTO roles_permisos (rol_id, permiso_id, created_at)
-SELECT r.id, p.id, NOW()
-FROM roles r
-JOIN permisos p ON p.nombre IN (
-  'clientes:read','clientes:write',
-  'originacion:read','originacion:write',
-  'tasas:read','configuracion:read'
-)
-WHERE r.nombre = 'OFICIAL_CREDITO'
-ON CONFLICT DO NOTHING;
-
--- ANALISTA_RIESGO
-INSERT INTO roles_permisos (rol_id, permiso_id, created_at)
-SELECT r.id, p.id, NOW()
-FROM roles r
-JOIN permisos p ON p.nombre IN (
-  'clientes:read',
-  'originacion:read','originacion:approve',
-  'tasas:read','configuracion:read'
-)
-WHERE r.nombre = 'ANALISTA_RIESGO'
-ON CONFLICT DO NOTHING;
-
--- CAJERO
-INSERT INTO roles_permisos (rol_id, permiso_id, created_at)
-SELECT r.id, p.id, NOW()
-FROM roles r
-JOIN permisos p ON p.nombre IN (
-  'clientes:read',
-  'ciclovida:read','ciclovida:write'
-)
-WHERE r.nombre = 'CAJERO'
-ON CONFLICT DO NOTHING;
-
--- AUDITOR
-INSERT INTO roles_permisos (rol_id, permiso_id, created_at)
-SELECT r.id, p.id, NOW()
-FROM roles r
-JOIN permisos p ON p.nombre IN ('auditoria:read')
-WHERE r.nombre = 'AUDITOR'
-ON CONFLICT DO NOTHING;
-
--- REPORTES
-INSERT INTO roles_permisos (rol_id, permiso_id, created_at)
-SELECT r.id, p.id, NOW()
-FROM roles r
-JOIN permisos p ON p.nombre IN ('reportes:read','ciclovida:read')
-WHERE r.nombre = 'REPORTES'
-ON CONFLICT DO NOTHING;
-
--- SOPORTE
-INSERT INTO roles_permisos (rol_id, permiso_id, created_at)
-SELECT r.id, p.id, NOW()
-FROM roles r
-JOIN permisos p ON p.nombre IN (
-  'clientes:read','originacion:read',
-  'ciclovida:read','tasas:read',
-  'configuracion:read'
-)
-WHERE r.nombre = 'SOPORTE'
-ON CONFLICT DO NOTHING;
-EOF
+    cat > "$V2_FILE" <<'YAML_EOF'
+databaseChangeLog:
+  - changeSet:
+      id: 00002-seed-roles-permisos
+      author: scaffold
+      comment: "Semilla: 7 roles del sistema, permisos por bounded context y mapeo roles_permisos"
+      changes:
+        - sql:
+            sql: |
+              INSERT INTO roles (id, nombre, descripcion, activo, created_at, updated_at)
+              VALUES
+                (gen_random_uuid(), 'ADMIN',              'Administrador del sistema con acceso total',         true, NOW(), NOW()),
+                (gen_random_uuid(), 'OFICIAL_CREDITO',    'Oficial de crédito — origina y evalúa solicitudes',  true, NOW(), NOW()),
+                (gen_random_uuid(), 'ANALISTA_RIESGO',    'Analista de riesgo — revisiones manuales',           true, NOW(), NOW()),
+                (gen_random_uuid(), 'CAJERO',             'Cajero — registro de pagos y desembolsos',           true, NOW(), NOW()),
+                (gen_random_uuid(), 'AUDITOR',            'Auditor — acceso de solo lectura a auditoría',       true, NOW(), NOW()),
+                (gen_random_uuid(), 'REPORTES',           'Usuario de reportes — acceso a vistas de cartera',   true, NOW(), NOW()),
+                (gen_random_uuid(), 'SOPORTE',            'Soporte técnico — consultas operativas',              true, NOW(), NOW())
+              ON CONFLICT (nombre) DO NOTHING;
+              INSERT INTO permisos (id, nombre, descripcion, recurso, accion, created_at, updated_at)
+              VALUES
+                (gen_random_uuid(), 'clientes:read',      'Leer clientes',            'clientes',      'READ',    NOW(), NOW()),
+                (gen_random_uuid(), 'clientes:write',     'Crear/editar clientes',    'clientes',      'WRITE',   NOW(), NOW()),
+                (gen_random_uuid(), 'clientes:delete',    'Eliminar clientes',        'clientes',      'DELETE',  NOW(), NOW()),
+                (gen_random_uuid(), 'configuracion:read', 'Leer configuración',       'configuracion', 'READ',    NOW(), NOW()),
+                (gen_random_uuid(), 'configuracion:write','Editar configuración',     'configuracion', 'WRITE',   NOW(), NOW()),
+                (gen_random_uuid(), 'originacion:read',   'Leer solicitudes',         'originacion',   'READ',    NOW(), NOW()),
+                (gen_random_uuid(), 'originacion:write',  'Crear solicitudes',        'originacion',   'WRITE',   NOW(), NOW()),
+                (gen_random_uuid(), 'originacion:approve','Aprobar solicitudes',      'originacion',   'APPROVE', NOW(), NOW()),
+                (gen_random_uuid(), 'tasas:read',         'Consultar tasas',          'tasas',         'READ',    NOW(), NOW()),
+                (gen_random_uuid(), 'tasas:write',        'Configurar tasas',         'tasas',         'WRITE',   NOW(), NOW()),
+                (gen_random_uuid(), 'ciclovida:read',     'Leer obligaciones',        'ciclovida',     'READ',    NOW(), NOW()),
+                (gen_random_uuid(), 'ciclovida:write',    'Registrar pagos/abonos',   'ciclovida',     'WRITE',   NOW(), NOW()),
+                (gen_random_uuid(), 'auditoria:read',     'Leer eventos de auditoría','auditoria',     'READ',    NOW(), NOW()),
+                (gen_random_uuid(), 'reportes:read',      'Consultar reportes',       'reportes',      'READ',    NOW(), NOW())
+              ON CONFLICT (nombre) DO NOTHING;
+              INSERT INTO roles_permisos (rol_id, permiso_id, created_at)
+              SELECT r.id, p.id, NOW() FROM roles r, permisos p WHERE r.nombre = 'ADMIN'
+              ON CONFLICT DO NOTHING;
+              INSERT INTO roles_permisos (rol_id, permiso_id, created_at)
+              SELECT r.id, p.id, NOW() FROM roles r
+              JOIN permisos p ON p.nombre IN ('clientes:read','clientes:write','originacion:read','originacion:write','tasas:read','configuracion:read')
+              WHERE r.nombre = 'OFICIAL_CREDITO' ON CONFLICT DO NOTHING;
+              INSERT INTO roles_permisos (rol_id, permiso_id, created_at)
+              SELECT r.id, p.id, NOW() FROM roles r
+              JOIN permisos p ON p.nombre IN ('clientes:read','originacion:read','originacion:approve','tasas:read','configuracion:read')
+              WHERE r.nombre = 'ANALISTA_RIESGO' ON CONFLICT DO NOTHING;
+              INSERT INTO roles_permisos (rol_id, permiso_id, created_at)
+              SELECT r.id, p.id, NOW() FROM roles r
+              JOIN permisos p ON p.nombre IN ('clientes:read','ciclovida:read','ciclovida:write')
+              WHERE r.nombre = 'CAJERO' ON CONFLICT DO NOTHING;
+              INSERT INTO roles_permisos (rol_id, permiso_id, created_at)
+              SELECT r.id, p.id, NOW() FROM roles r
+              JOIN permisos p ON p.nombre IN ('auditoria:read')
+              WHERE r.nombre = 'AUDITOR' ON CONFLICT DO NOTHING;
+              INSERT INTO roles_permisos (rol_id, permiso_id, created_at)
+              SELECT r.id, p.id, NOW() FROM roles r
+              JOIN permisos p ON p.nombre IN ('reportes:read','ciclovida:read')
+              WHERE r.nombre = 'REPORTES' ON CONFLICT DO NOTHING;
+              INSERT INTO roles_permisos (rol_id, permiso_id, created_at)
+              SELECT r.id, p.id, NOW() FROM roles r
+              JOIN permisos p ON p.nombre IN ('clientes:read','originacion:read','ciclovida:read','tasas:read','configuracion:read')
+              WHERE r.nombre = 'SOPORTE' ON CONFLICT DO NOTHING;
+            stripComments: true
+YAML_EOF
 
     log_ok "seguridad-service — $V2_FILE generado."
   fi
 else
-  log "seguridad-service no encontrado en backend/; omitiendo V2 seed."
+  log "seguridad-service no encontrado en backend/; omitiendo 00002_seed_roles.yaml."
 fi
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -856,20 +814,23 @@ if [[ "$HAS_FRONTEND" -eq 1 ]]; then
                               || check_item "$FRONTEND_NAME — package.json existe" 1
 fi
 
-# Verificar migraciones Flyway V1
+# Verificar changelogs Liquibase iniciales
 if [[ "${#BC_TAGS[@]}" -gt 0 ]]; then
   for SERVICE in "${!BC_TAGS[@]}"; do
-    V1="$BACKEND_DIR/$SERVICE/$REST_MODULE/$MIGRATION_SUBPATH/V1__initial_schema.sql"
-    [[ -f "$V1" ]] && check_item "$SERVICE — V1__initial_schema.sql existe" 0 \
-                    || check_item "$SERVICE — V1__initial_schema.sql existe" 1
+    CL="$REPO_ROOT/db/$SERVICE/changelog/00001_initial_schema.yaml"
+    PROPS="$REPO_ROOT/db/$SERVICE/liquibase.properties"
+    [[ -f "$CL" ]]    && check_item "$SERVICE — db/$SERVICE/changelog/00001_initial_schema.yaml existe" 0 \
+                       || check_item "$SERVICE — db/$SERVICE/changelog/00001_initial_schema.yaml existe" 1
+    [[ -f "$PROPS" ]] && check_item "$SERVICE — db/$SERVICE/liquibase.properties existe" 0 \
+                       || check_item "$SERVICE — db/$SERVICE/liquibase.properties existe" 1
   done
 fi
 
-# Verificar V2 seed de seguridad-service
+# Verificar 00002_seed_roles.yaml de seguridad-service
 if [[ -d "$BACKEND_DIR/seguridad-service" ]]; then
-  V2="$BACKEND_DIR/seguridad-service/$REST_MODULE/$MIGRATION_SUBPATH/V2__seed_roles_permisos.sql"
-  [[ -f "$V2" ]] && check_item "seguridad-service — V2__seed_roles_permisos.sql existe" 0 \
-                  || check_item "seguridad-service — V2__seed_roles_permisos.sql existe" 1
+  V2="$REPO_ROOT/db/seguridad-service/changelog/00002_seed_roles.yaml"
+  [[ -f "$V2" ]] && check_item "seguridad-service — db/seguridad-service/changelog/00002_seed_roles.yaml existe" 0 \
+                  || check_item "seguridad-service — db/seguridad-service/changelog/00002_seed_roles.yaml existe" 1
 fi
 
 echo ""
@@ -888,10 +849,11 @@ else
   printf "  %-35s %s\n" "Frontend" "omitido"
 fi
 if [[ "${#BC_TAGS[@]}" -gt 0 ]]; then
-  printf "  %-35s %s\n" "Migraciones Flyway V1" "${#BC_TAGS[@]} servicios"
+  printf "  %-35s %s\n" "Changelogs Liquibase (00001)" "${#BC_TAGS[@]} servicios en db/"
 else
-  printf "  %-35s %s\n" "Migraciones Flyway V1" "omitidas (sin --bc-tags)"
+  printf "  %-35s %s\n" "Changelogs Liquibase (00001)" "omitidos (sin --bc-tags)"
 fi
+echo "  El esquema lo aplica Liquibase standalone (run-liquibase-migrations.sh) previo al despliegue."
 echo ""
 
 if [[ $checklist_ok -ne 0 ]] || [[ $FRONTEND_FAILED -ne 0 ]] || [[ ${#BACKEND_FAILED[@]} -gt 0 ]]; then

@@ -343,7 +343,7 @@ Todo diseño de microservicios **debe** declarar explícitamente el patrón **Da
 
 - Cada microservicio posee y gestiona su propia base de datos; ningún otro servicio accede directamente a ella (ni para lectura ni para escritura).
 - Las bases de datos se provisionan automáticamente por `init-databases.sh` usando la convención: `<prefijo>_<servicio_slug>` (ej. `mydb_clientes_service`). El prefijo se define en `scaffold-all-services.sh` con `-p <prefijo-pg>` / `-m <prefijo-mongo>`.
-- El esquema inicial de cada servicio lo aplica Flyway en el arranque (`V1__initial_schema.sql`), **no** un script global.
+- El esquema inicial de cada servicio lo aplica **Liquibase standalone** (`run-liquibase-migrations.sh`) como paso previo al despliegue (`db/<servicio>/changelog/00001_initial_schema.yaml`), **no** un script global ni Flyway (Flyway requiere JDBC bloqueante — incompatible con los servicios R2DBC del framework).
 - La comunicación entre servicios que necesita datos de otra BD se resuelve mediante **eventos de dominio** (Kafka) o **llamadas REST** al servicio propietario — nunca acceso directo a la BD ajena.
 - En la tabla resumen de entidades, incluir una columna **"BD propietaria"** que indique la base de datos que le corresponde a cada servicio según la convención de nombres.
 
@@ -394,11 +394,11 @@ Si el diseño usa más de un motor (por ejemplo PostgreSQL para un contexto y Mo
 - Reflejar las relaciones y trust boundaries del dominio (referencias, foreign keys, embedding).
 - Elegir el formato (`.sql`, `.js` o ambos) según el tipo de base de datos decidido en el Stack Tecnológico de `system.md`.
 - Mantener nivel de diseño: esquema y estructura, sin datos de prueba ni lógica de aplicación.
-- **Separación por BD (Database-per-Service):** los comentarios `-- BC-XX:` en el `schema.sql` delimitan los bloques de tablas de cada microservicio. Cada bloque `-- BC-XX:` se extrae por `scaffold-all-services.sh` a la migración `V1__initial_schema.sql` del servicio correspondiente y se aplica sobre su BD propia (`<prefijo>_<svc_slug>`). **No existe un schema global compartido en producción**; el `schema.sql` es únicamente el artefacto de diseño de referencia.
+- **Separación por BD (Database-per-Service):** los comentarios `-- BC-XX:` en el `schema.sql` delimitan los bloques de tablas de cada microservicio. Cada bloque `-- BC-XX:` se extrae por `scaffold-all-services.sh` al changelog Liquibase `db/<servicio>/changelog/00001_initial_schema.yaml` del servicio correspondiente y se aplica sobre su BD propia (`<prefijo>_<svc_slug>`) mediante `run-liquibase-migrations.sh`. **No existe un schema global compartido en producción**; el `schema.sql` es únicamente el artefacto de diseño de referencia.
 - **Tablas de soporte para Saga y Outbox (si aplica):** si el diseño incluye sagas, añade al `schema.sql` (bajo un comentario de bounded context propio) las tablas de soporte, agrupadas por su servicio propietario:
   - En el **servicio orquestador** (`integration-service`): `saga_instance` (`saga_id` PK, `saga_type`, `state`, `current_step`, `payload jsonb`, timestamps) y `saga_step_log` (`id`, `saga_id` FK, `step_name`, `status`, `compensation_payload jsonb`, `executed_at`).
   - En cada **servicio participante** que publica eventos: `outbox` (`id`, `aggregate_type`, `aggregate_id`, `event_type`, `payload jsonb`, `topic`, `created_at`, `published_at`, `status`; índice sobre `status, created_at`) y `processed_message` (`message_id` PK, `consumer`, `processed_at`) para idempotencia.
-  - Cada tabla es propiedad de exactamente un microservicio; sepáralas con comentarios `-- BC-XX:` para que la generación de migraciones Flyway las asigne correctamente.
+  - Cada tabla es propiedad de exactamente un microservicio; sepáralas con comentarios `-- BC-XX:` para que `scaffold-all-services.sh` las asigne al changelog Liquibase correcto (`db/<servicio>/changelog/00001_initial_schema.yaml`).
   - Cada tabla vive en la BD del servicio propietario, nunca en una BD compartida.
 
 # REFERENCIA EN EL DOCUMENTO
@@ -597,7 +597,7 @@ Documentar decisiones técnicas importantes.
 
 # ADRs OBLIGATORIOS SEGÚN LAS DECISIONES ESTRATÉGICAS
 
-- **Siempre obligatorio:** incluye un `ADR-xxx` para **Database-per-Service**: cada microservicio posee su propia BD aislada (`<prefijo>_<servicio_slug>`), provistonada por `init-databases.sh`; el esquema lo aplica Flyway en el arranque; la comunicación entre servicios usa eventos (Kafka) o REST, nunca acceso directo a la BD ajena. Tradeoffs: autonomía e independencia de despliegue a cambio de consistencia eventual y ausencia de JOINs entre BDs.
+- **Siempre obligatorio:** incluye un `ADR-xxx` para **Database-per-Service**: cada microservicio posee su propia BD aislada (`<prefijo>_<servicio_slug>`), provisionada por `init-databases.sh`; el esquema lo aplica **Liquibase standalone** (`run-liquibase-migrations.sh`) como paso previo al despliegue — no Flyway (incompatible con R2DBC); la comunicación entre servicios usa eventos (Kafka) o REST, nunca acceso directo a la BD ajena. Tradeoffs: autonomía e independencia de despliegue a cambio de consistencia eventual y ausencia de JOINs entre BDs.
 - Si el Strategic Design definió una capa de integración dedicada, incluye un `ADR-xxx` que profundice **Apache Camel como capa de integración en `integration-service`**: bridge reactivo Camel↔Reactor (`camel-reactive-streams`, prohibido `block()`), resiliencia con Resilience4j y ACL por sistema externo.
 - Si definió sagas, incluye un `ADR-xxx` para la **orquestación de saga** (Camel Saga EIP + coordinador **Narayana LRA**, orquestador en `integration-service`, compensaciones idempotentes) y un `ADR-xxx` para el **Transactional Outbox** en los participantes (publicación de eventos atómica con el cambio de BD; relay por polling en dev, evolucionable a CDC/Debezium).
 

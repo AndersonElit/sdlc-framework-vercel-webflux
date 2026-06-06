@@ -1311,42 +1311,100 @@ public class CompensationController {{
     logger.info("CompensationController generado (servicio participante de saga)")
 
 
-def write_outbox_migration(root: Path, outbox: bool, saga_participant: bool) -> None:
-    """Genera V3__outbox.sql en el módulo rest-api (outbox y/o processed_message)."""
-    migration_dir = root / "infrastructure/entry-points/rest-api/src/main/resources/db/migration"
-    migration_dir.mkdir(parents=True, exist_ok=True)
-    parts = ["-- V3__outbox.sql",
-             "-- Generado por: maven_hexagonal_scaffold.py (--outbox / --saga-participant)",
-             ""]
-    if outbox:
-        parts += [
-            "-- Transactional Outbox: publicación de eventos atómica con el cambio de BD.",
-            "CREATE TABLE IF NOT EXISTS outbox (",
-            "    id             BIGSERIAL    PRIMARY KEY,",
-            "    aggregate_type VARCHAR(120) NOT NULL,",
-            "    aggregate_id   VARCHAR(120) NOT NULL,",
-            "    event_type     VARCHAR(120) NOT NULL,",
-            "    topic          VARCHAR(200) NOT NULL,",
-            "    payload        TEXT         NOT NULL,",
-            "    status         VARCHAR(20)  NOT NULL DEFAULT 'PENDING',",
-            "    created_at     TIMESTAMPTZ  NOT NULL DEFAULT now(),",
-            "    published_at   TIMESTAMPTZ",
-            ");",
-            "CREATE INDEX IF NOT EXISTS idx_outbox_status_created ON outbox (status, created_at);",
-            "",
-        ]
+def write_liquibase_structure(root: Path, project_name: str, pg_db_prefix: str,
+                               outbox: bool, saga_participant: bool) -> None:
+    """Genera db/<project_name>/changelog/ en la raíz del repo (Liquibase standalone).
+
+    Flyway requiere JDBC bloqueante — incompatible con servicios R2DBC. Liquibase corre
+    como proceso independiente (Docker) antes del despliegue; no va en el classpath del JAR.
+    root = Path(project_name), cwd = backend/ → db/ vive en ../../db/ = REPO_ROOT/db/.
+    """
+    db_svc_dir = root.parent.parent / "db" / project_name
+    changelog_dir = db_svc_dir / "changelog"
+    changelog_dir.mkdir(parents=True, exist_ok=True)
+
+    svc_slug = project_name.replace("-", "_")
+    db_name = f"{pg_db_prefix}_{svc_slug}" if pg_db_prefix else svc_slug
+
+    (db_svc_dir / "liquibase.properties").write_text(
+        f"url=jdbc:postgresql://localhost:${{RDS_PORT}}/{db_name}\n"
+        f"username=${{DB_USERNAME}}\n"
+        f"password=${{DB_PASSWORD}}\n"
+        "changeLogFile=changelog/root.yaml\n"
+        "liquibaseSchemaName=public\n"
+    )
+
+    includes = (
+        "  - include:\n"
+        "      file: changelog/00001_initial_schema.yaml\n"
+        "      relativeToChangelogFile: true\n"
+    )
     if outbox or saga_participant:
-        parts += [
-            "-- Idempotencia de consumidores y compensaciones de saga.",
-            "CREATE TABLE IF NOT EXISTS processed_message (",
-            "    message_id   VARCHAR(120) PRIMARY KEY,",
-            "    consumer     VARCHAR(120) NOT NULL,",
-            "    processed_at TIMESTAMPTZ  NOT NULL DEFAULT now()",
-            ");",
-            "",
-        ]
-    (migration_dir / "V3__outbox.sql").write_text("\n".join(parts) + "\n")
-    logger.info("Migración V3__outbox.sql generada")
+        includes += (
+            "  - include:\n"
+            "      file: changelog/00003_outbox.yaml\n"
+            "      relativeToChangelogFile: true\n"
+        )
+    (changelog_dir / "root.yaml").write_text("databaseChangeLog:\n" + includes)
+
+    (changelog_dir / "00001_initial_schema.yaml").write_text(
+        "databaseChangeLog:\n"
+        "  - changeSet:\n"
+        "      id: 00001-initial-schema\n"
+        "      author: scaffold\n"
+        f"      comment: \"Schema inicial de {project_name} — generado por scaffold-all-services.sh\"\n"
+        "      changes:\n"
+        "        - sql:\n"
+        "            sql: |\n"
+        "              -- TODO: contenido poblado por scaffold-all-services.sh --bc-tags\n"
+        "            stripComments: true\n"
+    )
+
+    if outbox or saga_participant:
+        parts = ["databaseChangeLog:"]
+        if outbox:
+            parts += [
+                "  - changeSet:",
+                "      id: 00003-outbox",
+                "      author: scaffold",
+                "      comment: \"Transactional Outbox — publicación atómica con cambio de BD\"",
+                "      changes:",
+                "        - sql:",
+                "            sql: |",
+                "              CREATE TABLE IF NOT EXISTS outbox (",
+                "                  id             BIGSERIAL    PRIMARY KEY,",
+                "                  aggregate_type VARCHAR(120) NOT NULL,",
+                "                  aggregate_id   VARCHAR(120) NOT NULL,",
+                "                  event_type     VARCHAR(120) NOT NULL,",
+                "                  topic          VARCHAR(200) NOT NULL,",
+                "                  payload        TEXT         NOT NULL,",
+                "                  status         VARCHAR(20)  NOT NULL DEFAULT 'PENDING',",
+                "                  created_at     TIMESTAMPTZ  NOT NULL DEFAULT now(),",
+                "                  published_at   TIMESTAMPTZ",
+                "              );",
+                "              CREATE INDEX IF NOT EXISTS idx_outbox_status_created ON outbox (status, created_at);",
+                "            stripComments: true",
+            ]
+        if outbox or saga_participant:
+            parts += [
+                "  - changeSet:",
+                "      id: 00003-processed-message",
+                "      author: scaffold",
+                "      comment: \"Idempotencia de consumidores y compensaciones de saga\"",
+                "      changes:",
+                "        - sql:",
+                "            sql: |",
+                "              CREATE TABLE IF NOT EXISTS processed_message (",
+                "                  message_id   VARCHAR(120) PRIMARY KEY,",
+                "                  consumer     VARCHAR(120) NOT NULL,",
+                "                  processed_at TIMESTAMPTZ  NOT NULL DEFAULT now()",
+                "              );",
+                "            stripComments: true",
+            ]
+        (changelog_dir / "00003_outbox.yaml").write_text("\n".join(parts) + "\n")
+        logger.info("Liquibase 00003_outbox.yaml generado en: %s", changelog_dir)
+
+    logger.info("Liquibase structure generada en: %s", db_svc_dir)
 
 
 def scaffold(project_name: str, database: str, messaging_system: str, port: int = 8080,
@@ -1493,8 +1551,8 @@ public class ApplicationConfig {{
         create_outbox_files(root, safe_name)
     if saga_participant:
         create_compensation_controller(root, safe_name)
-    if outbox or saga_participant:
-        write_outbox_migration(root, outbox, saga_participant)
+    if database.lower() != "mongo":
+        write_liquibase_structure(root, project_name, pg_db_prefix, outbox, saga_participant)
 
     secrets_dir = root / "scripts"
     secrets_dir.mkdir(parents=True, exist_ok=True)
@@ -1779,7 +1837,7 @@ def main() -> None:
                              "BD generada: <prefix>_<servicio_slug>.")
     parser.add_argument("--outbox", action="store_true",
                         help="Añade el módulo Transactional Outbox (publicación de eventos "
-                             "atómica con el cambio de BD) y la migración V3__outbox.sql.")
+                             "atómica con el cambio de BD) y el changelog Liquibase 00003_outbox.yaml.")
     parser.add_argument("--saga-participant", action="store_true",
                         help="Marca el servicio como participante de una saga: genera el "
                              "endpoint de compensación idempotente y la tabla processed_message.")
