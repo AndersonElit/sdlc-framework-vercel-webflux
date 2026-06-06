@@ -43,7 +43,7 @@ def _r(content: str, **kw: str) -> str:
 # Kafka consumer lambda
 # --------------------------------------------------------------------------- #
 def kafka_consumer_handler(root: Path, org: str, topic: str, formats: list[str]) -> None:
-    base = "reporting-lambdas/kafka-consumer"
+    base = "terraform/backend/modules/reporting-lambdas/kafka-consumer"
     write(root, f"{base}/handler.py", _r('''"""Lambda Kafka Consumer (DR-5).
 
 Consume `__TOPIC__` (trigger Kafka/MSK o poller) y traduce cada evento a EventBridge
@@ -224,7 +224,7 @@ def handler(event, _context=None):
 
 
 def format_lambda(root: Path, fmt: str, org: str) -> None:
-    base = f"reporting-lambdas/{fmt}"
+    base = f"terraform/backend/modules/reporting-lambdas/{fmt}"
     write(root, f"{base}/handler.py", _format_handler_body(fmt, org))
     reqs = "boto3\npyarrow\n"
     lib = RENDER_LIBS[fmt]
@@ -322,7 +322,7 @@ resource "aws_iam_role_policy" "reporting_lambda" {
 # --- Lambda Kafka Consumer: report.processed -> EventBridge PutEvents (DR-5) ---
 data "archive_file" "kafka_consumer" {
   type        = "zip"
-  source_dir  = "${path.module}/../../../../reporting-lambdas/kafka-consumer"
+  source_dir  = "${path.module}/kafka-consumer"
   output_path = "${path.module}/build/kafka-consumer.zip"
 }
 
@@ -366,7 +366,7 @@ resource "aws_lambda_event_source_mapping" "kafka_consumer" {
 # ===================== Formato __FMT_UP__ =====================
 data "archive_file" "__FMT__" {
   type        = "zip"
-  source_dir  = "${path.module}/../../../../reporting-lambdas/__FMT__"
+  source_dir  = "${path.module}/__FMT__"
   output_path = "${path.module}/build/__FMT__.zip"
 }
 
@@ -440,26 +440,25 @@ def scaffold(org: str, formats: list[str], topic: str, runtime: str,
         format_lambda(root, fmt, org)
     terraform(root, org, topic, runtime, formats)
 
-    write(root, "reporting-lambdas/README.md", _r('''# reporting-lambdas — capa serverless de formatos
+    write(root, "terraform/backend/modules/reporting-lambdas/README.md", _r('''# reporting-lambdas — capa serverless de formatos
 
 Generado por `report_lambdas_scaffold.py` (PLAN-reporteria-spark-etl.md §7.2).
 
 ```
-reporting-lambdas/
+terraform/backend/modules/reporting-lambdas/
+├── variables.tf
+├── iam.tf
+├── eventbridge.tf
+├── formats.tf
+├── outputs.tf
 ├── kafka-consumer/   # consume __TOPIC__ -> PutEvents EventBridge (DR-5)
 __FORMAT_DIRS__
 ```
 
-## Terraform
-
-El módulo Terraform vive en el árbol creado por `base-infrastructure-builder.sh`:
-
-```
-terraform/backend/modules/reporting-lambdas/   # IAM + EventBridge bus + lambdas
-terraform/backend/environments/dev/main.tf     # module "reporting_lambdas" { ... }
-```
-
 ## Desplegar (dev, floci)
+
+Descomentar el bloque `module "reporting_lambdas"` en
+`terraform/backend/environments/dev/main.tf`, luego:
 
 ```bash
 cd terraform/backend/environments/dev
@@ -474,11 +473,12 @@ El **mismo** módulo aplica en staging/prod (AWS real): solo cambian las variabl
                             for f in formats)))
 
     abs_root = root.resolve()
-    print(f"\nDone! Reporting serverless layer scaffolded at: {abs_root}/reporting-lambdas")
-    print(f"Terraform module at:  {abs_root}/terraform/backend/modules/reporting-lambdas")
+    tf_module = abs_root / "terraform/backend/modules/reporting-lambdas"
+    print(f"\nDone! Reporting serverless layer scaffolded at: {tf_module}")
     print("\nNext:")
-    print("  cd terraform/backend/environments/dev && terraform init && terraform validate")
-    print("  terraform apply   # dev sobre floci (:4566)")
+    print("  1. Descomenta el bloque module \"reporting_lambdas\" en terraform/backend/environments/dev/main.tf")
+    print("  2. cd terraform/backend/environments/dev && terraform init && terraform validate")
+    print("  3. terraform apply   # dev sobre floci (:4566)")
 
 
 def main() -> None:
