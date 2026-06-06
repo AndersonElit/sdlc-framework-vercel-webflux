@@ -28,6 +28,7 @@ La skill genera los siguientes archivos en `docs/development/`:
 docs/development/
 ├── DEV-[proyecto]-roadmap.md              # Índice maestro y visión general
 ├── DEV-[proyecto]-00-infrastructure.md   # Etapa 0: Infraestructura local (Terraform + floci + K3d)
+├── DEV-[proyecto]-0c-observability.md    # Etapa 0c: Stack de observabilidad (OTEL + Prometheus + Grafana + CloudWatch)
 ├── DEV-[proyecto]-01-databases.md        # Etapa 1: Bases de datos y migraciones
 ├── DEV-[proyecto]-02-scaffold.md         # Etapa 2: Scaffolding de proyectos
 ├── DEV-[proyecto]-02b-cicd.md            # Etapa 2b: Configuración del pipeline CI/CD (Jenkins + ArgoCD)
@@ -154,6 +155,89 @@ Secciones en orden exacto:
 
 ---
 
+## Etapa 0c — DEV-[proyecto]-0c-observability.md
+
+Título H1: `# Etapa 0c — Stack de Observabilidad`
+
+**Propósito:** Instalar el stack de observabilidad en el cluster K3d del proyecto y documentar la instrumentación que el scaffold aplica automáticamente a cada microservicio. Esta etapa se ejecuta inmediatamente después de la Etapa 0 (`init-dev-environment.sh`) y antes de la Etapa 1 (bases de datos). Los microservicios generados en la Etapa 2 ya incluyen las dependencias, configuraciones y Helm chart modificados — el desarrollador no instrumenta manualmente nada.
+
+**Stack por ambiente:**
+
+| Pilar | Dev (K3d + floci) | Staging / Prod (EKS + AWS) |
+|---|---|---|
+| Trazas | OTEL Collector → Jaeger (all-in-one) | OTEL Collector → AWS X-Ray |
+| Métricas | Prometheus (`kube-prometheus-stack`) + Grafana | Amazon Managed Prometheus (AMP) + CloudWatch Metrics |
+| Logs | Fluent Bit DaemonSet → Loki + Grafana | `aws-for-fluent-bit` DaemonSet → CloudWatch Logs |
+| Alertas | Alertmanager + Grafana Alerts | CloudWatch Alarms + SNS |
+
+Secciones en orden exacto:
+
+1. **Objetivo y Stack de Observabilidad** — tabla dev vs staging/prod; principio central: instrumentación unificada con OpenTelemetry Java Agent (sin cambios en código de dominio) + Micrometer para métricas de aplicación.
+2. **Prerrequisitos** — Etapa 0 completa; cluster K3d `[proyecto]-dev` corriendo (`k3d cluster list`); `kubectl` apuntando al kubeconfig K3d (`terraform/backend/environments/dev/.kube/config-k3d`).
+3. **Instalación del stack en K3d**
+   - Comando único: `bash .claude/scripts/setup-observability.sh -P <nombre-proyecto>`
+   - Describir los pasos que ejecuta el script: añade repos Helm (`prometheus-community`, `grafana`, `jaeger-all-in-one`, `fluent`), instala `kube-prometheus-stack` en namespace `monitoring`, instala Jaeger all-in-one en namespace `tracing`, despliega OTEL Collector (Deployment + ConfigMap), despliega Fluent Bit DaemonSet apuntando a Loki.
+   - Tabla de endpoints locales tras ejecución (accesibles vía `kubectl port-forward`):
+
+     | Componente | Port-forward local | Endpoint interno K3d |
+     |---|---|---|
+     | Prometheus | `http://localhost:9090` | `prometheus-operated.monitoring:9090` |
+     | Grafana | `http://localhost:3000` (admin/admin) | `[proyecto]-grafana.monitoring:80` |
+     | Jaeger UI | `http://localhost:16686` | `jaeger.tracing:16686` |
+     | OTEL Collector (gRPC) | — | `[proyecto]-otel-collector.monitoring:4317` |
+     | Loki | — | `loki.monitoring:3100` |
+
+   - Indicar que el script persiste los endpoints en `terraform/backend/environments/dev/.observability-env` para referencia local.
+4. **Instrumentación de Microservicios Spring Boot (automática vía scaffold)**
+   - Aclarar que `maven_hexagonal_scaffold.py` ya genera todos los artefactos de observabilidad sin intervención manual. Esta sección es **referencia** de lo que el scaffold produce:
+   - **Dependencias Maven** en el `pom.xml` raíz: `spring-boot-starter-actuator`, `micrometer-registry-prometheus`, `micrometer-tracing-bridge-otel`, `opentelemetry-exporter-otlp`, `logstash-logback-encoder:7.4`.
+   - **`application.yml`**: bloque `management` con `endpoints.web.exposure.include: health,readiness,liveness,prometheus,info,metrics` y `metrics.tags` con `application` y `environment`; las variables OTEL (`OTEL_SERVICE_NAME`, `OTEL_EXPORTER_OTLP_ENDPOINT`, `JAVA_TOOL_OPTIONS`) se inyectan como env vars en el Helm chart, no en `application.yml`.
+   - **`logback-spring.xml`**: perfil no-dev usa `LogstashEncoder` (JSON con `traceId`, `spanId` desde MDC); perfil dev usa `ConsoleAppender` con patrón legible incluyendo `traceId`/`spanId`. Los campos de traza los inyecta automáticamente el bridge Micrometer-OTEL.
+5. **Instrumentación de Jobs Spark/Scala (si el diseño incluye reportería)**
+   - Si el diseño definió subsistema de reportería, indicar que los jobs Spark/Scala usan el OTEL Java Agent via `JAVA_TOOL_OPTIONS` en el CronJob K8s y métricas vía `spark.metrics.conf` con `PrometheusServlet` en el namespace `monitoring`. Logs: JSON estructurado con `logback-spark.xml` (misma lógica que el backend).
+6. **Modificaciones a los Helm Charts (automáticas vía scaffold)**
+   - Referencia de lo que genera `maven_hexagonal_scaffold.py` en cada chart:
+   - **Pod annotations** en `templates/deployment.yaml` (sección `spec.template.metadata`): `prometheus.io/scrape: "true"`, `prometheus.io/path: "/actuator/prometheus"`, `prometheus.io/port: "{{ .Values.service.port }}"`. El `kube-prometheus-stack` detecta estas annotations y configura el scrape automáticamente.
+   - **Init container `otel-agent`**: copia `opentelemetry-javaagent.jar` desde `ghcr.io/open-telemetry/opentelemetry-operator/autoinstrumentation-java:latest` a un `emptyDir` compartido montado en `/otel`.
+   - **Env vars OTEL**: `OTEL_SERVICE_NAME: "{{ .Chart.Name }}"`, `OTEL_EXPORTER_OTLP_ENDPOINT: "{{ .Values.otel.collectorEndpoint }}"`, `OTEL_RESOURCE_ATTRIBUTES: "deployment.environment={{ .Values.env }},service.version={{ .Values.image.tag }}"`, `JAVA_TOOL_OPTIONS: "-javaagent:/otel/opentelemetry-javaagent.jar"`.
+   - **`values-dev.yaml`**: `otel.collectorEndpoint: http://[proyecto]-otel-collector.monitoring:4317`.
+   - **`values-staging.yaml` / `values-prod.yaml`**: `otel.collectorEndpoint: http://otel-collector.monitoring:4317` (exporta a X-Ray vía exporter `awsxray`).
+7. **Dashboards y Alertas**
+   - **Dev (Grafana)**: importar dashboards JVM Micrometer (ID `4701`) y Spring Boot Statistics (ID `12685`) desde Grafana.com. Alertas en Alertmanager: error rate > 5 % durante 5 min, P99 latency > 2 s.
+   - **Staging/Prod (CloudWatch)**: el módulo Terraform `terraform/backend/modules/observability/` crea `aws_cloudwatch_log_group` por servicio (`/[proyecto]/<env>/<servicio>`), alarms de CPU/memoria/error rate con SNS como destino y `aws_xray_group` con filtro por servicio. El OTEL Collector en EKS exporta a X-Ray (exporter `awsxray`) y a CloudWatch EMF (exporter `awsemf`).
+8. **Terraform — Módulo `observability/` (staging/prod)**
+   - Estructura del módulo:
+     ```
+     terraform/backend/modules/observability/
+     ├── variables.tf          # org, env, services[], retention_days, alarm_thresholds
+     ├── cloudwatch_logs.tf    # aws_cloudwatch_log_group por servicio
+     ├── cloudwatch_metrics.tf # Container Insights + metric alarms (CPU, memoria, error_rate, p99)
+     ├── xray.tf               # aws_xray_group + sampling rules por servicio
+     ├── alarms.tf             # aws_cloudwatch_metric_alarm por servicio y métrica
+     ├── sns.tf                # aws_sns_topic + subscriptions (email/Slack)
+     └── outputs.tf            # log_group_names, alarm_arns, xray_group_arn
+     ```
+   - `staging/main.tf` y `prod/main.tf` llaman al módulo con `module "observability" { source = "../../modules/observability"; services = [...] }`. Dev no usa este módulo.
+9. **Integración con CI/CD**
+   - El step `runSmokeTests` de la Shared Library verifica `/actuator/prometheus` (HTTP 200) además de `/actuator/health/readiness`, confirmando que el endpoint de métricas está activo tras el despliegue.
+   - En dev con auto-sync ArgoCD: verificar que `curl http://localhost:16686/api/services` incluye el nombre del servicio tras el primer despliegue exitoso.
+10. **Criterios de Aceptación** — lista de verificación (`- [ ]`):
+    - `bash .claude/scripts/setup-observability.sh -P <nombre-proyecto>` finalizó con checklist ✓ y todos los pods en `Running`.
+    - `kubectl get pods -n monitoring` muestra Prometheus, Grafana, OTEL Collector y Fluent Bit en `Running`.
+    - `kubectl get pods -n tracing` muestra Jaeger en `Running`.
+    - Prometheus (`http://localhost:9090 → Status > Targets`) scrapea `/actuator/prometheus` de todos los microservicios desplegados.
+    - Jaeger (`http://localhost:16686`) muestra el servicio en la lista tras una request HTTP.
+    - Los logs en Grafana/Loki muestran JSON con campos `traceId`, `spanId`, `level`, `service`.
+    - En staging/prod: `terraform/backend/modules/observability/` existe y el `module "observability"` está referenciado en `staging/main.tf` y `prod/main.tf`.
+
+### Reglas para el documento de observabilidad
+
+- Derivar los nombres de los servicios exactamente de los microservicios identificados en el roadmap.
+- El endpoint del OTEL Collector en `values-dev.yaml` usa el slug del proyecto como nombre del Deployment (`[proyecto]-otel-collector`), derivado del parámetro `-P`.
+- Describir explícitamente qué hace el scaffold automáticamente (secciones 4 y 6) vs. qué configura el desarrollador manualmente (dashboards, alertas, módulo Terraform).
+
+---
+
 ## Etapa 1 — DEV-[proyecto]-01-databases.md
 
 Título H1: `# Etapa 1 — Bases de Datos y Migraciones`
@@ -208,6 +292,7 @@ Secciones en orden exacto:
    - Tabla resumen: servicio → puerto local → DB → mensajería → módulos generados.
    - Indicar si el servicio usa mensajería (kafka-producer / kafka-consumer / ambos / none).
    - Documentar los artefactos que produce el scaffold y que consume la Etapa 2b: `Jenkinsfile` (backend y frontend), `Dockerfile` multi-stage (backend) y charts Helm (`helm/<service>/`)
+   - **Observabilidad (automática):** el scaffold genera adicionalmente `logback-spring.xml` (JSON estructurado con `traceId`/`spanId` en el MDC), añade las dependencias `micrometer-registry-prometheus`, `micrometer-tracing-bridge-otel`, `opentelemetry-exporter-otlp` y `logstash-logback-encoder` al `pom.xml` raíz, configura el bloque `management` en `application.yml` con los endpoints de Actuator, e incorpora en el Helm chart las annotations de Prometheus, el init container del OTEL Java Agent y las variables de entorno OTEL. El desarrollador no instrumenta observabilidad manualmente.
    - Indicar que, en dev, cada scaffold (`maven_hexagonal_scaffold.py` / `nextjs_feature_scaffold.py`) además **crea el repositorio en Gitea** dentro de la organización `[proyecto]` y **hace push automático de la rama `main`** usando las credenciales fijas `gitea-admin:gitea-admin` (sin guardarlas en `.git/config`); si Gitea no está activo o el admin no existe, deja el push manual como fallback. No es necesario un `git push` manual en dev. La URL interna que consumen Jenkins/ArgoCD es `http://gitea:3000/[proyecto]/<servicio>.git`
    - **Backend `Jenkinsfile` (Spring Boot / Maven)**: tabla de stages con el step de la shared library: `computeImageTag`, `buildBackendService`, `runIntegrationTests`, `runQualityGates`, `runSecurityScans`, `buildAndPushImage`, `scanImage`, `bumpImageTag`, `runSmokeTests`, `notify`. El pod se carga desde `org/[proyecto]/podBackend.yaml` (contenedor `maven`); corre en K3d (dev) o EKS (staging/prod).
    - **Batch `Jenkinsfile` (Spark / Scala)**: para los servicios generados por `scala_hexagonal_scaffold.py` el pipeline es CI puro sin smoke tests (los batch jobs no exponen endpoints HTTP). Stages: `computeImageTag`, `buildScalaBatchJob`, `runQualityGates(projectType:'sbt')`, `runSecurityScans(projectType:'sbt')`, `buildAndPushImage`, `scanImage`, `bumpImageTag`, `notify`. El pod se carga desde `org/[proyecto]/podScalaBatch.yaml` (contenedor `sbt`; sin sidecar dind). El `bumpImageTag` actualiza `helm/<service>/values-<env>.yaml` y ArgoCD sincroniza el **CronJob** (no un Deployment).
@@ -508,11 +593,23 @@ Secciones en orden exacto:
    - Herramienta: k6
    - Escenarios: carga sostenida representativa del uso normal
    - Tabla: escenario → VUs → duración → umbral de aceptación (P95 < X ms, error rate < Y%)
-7. **Configuración del Ambiente de Pruebas**
+7. **Verificación E2E de Observabilidad**
+   - Verificar que el stack de observabilidad instalado en Etapa 0c está integrado correctamente con los microservicios desplegados:
+   - Tabla de escenarios de observabilidad E2E:
+
+     | Escenario | Herramienta | Precondición | Resultado esperado |
+     |---|---|---|---|
+     | Traza end-to-end generada | Jaeger UI (`http://localhost:16686`) | Request HTTP al endpoint de un microservicio | Traza visible con spans de todos los servicios involucrados; `traceId` correlacionado |
+     | Métrica scrapeada | Prometheus (`http://localhost:9090`) | Microservicio en `Running` | `http_server_requests_seconds_count` con la etiqueta `application=<servicio>` aparece en Prometheus |
+     | Log estructurado con traceId | Grafana/Loki | Request HTTP generada | Log en JSON con `traceId` y `spanId` coincidentes con la traza en Jaeger |
+     | Prometheus scrapea todos los servicios | Prometheus Status > Targets | Todos los microservicios en `Running` | Todos los targets en estado `UP`; ninguno en `DOWN` |
+
+   - Indicar que en staging/prod la verificación equivalente es: CloudWatch Logs recibe registros JSON, CloudWatch X-Ray muestra trazas y las alarmas de CloudWatch están en estado `OK` (no `ALARM`).
+8. **Configuración del Ambiente de Pruebas**
    - Variables de entorno específicas para el ambiente de test
    - Comandos para levantar todos los servicios en modo test con floci
    - Seeders de datos de prueba requeridos
-8. **Criterios de Aceptación** — lista de verificación final de la etapa de desarrollo.
+9. **Criterios de Aceptación** — lista de verificación final de la etapa de desarrollo. Incluir criterios de observabilidad: traza E2E visible en Jaeger, métrica en Prometheus, log JSON con `traceId` en Loki.
 
 ---
 
@@ -584,8 +681,8 @@ Analiza los bounded contexts, los roles de usuario y los flujos del sistema para
 
 Genera los documentos en este orden:
 
-1. Primero el roadmap (`DEV-[proyecto]-roadmap.md`) — necesita tener la visión completa antes de generarse; incluir la fila de Etapa 2b en la tabla de secuencia de etapas, posicionada entre la Etapa 2 (scaffold) y la Etapa 3a (primer microservicio), con dependencia `Etapa 2 + infra Jenkins/ArgoCD (Etapa 0)` y esfuerzo estimado de 1 día
-2. Luego las etapas 0, 1 y 2 (infraestructura, bases de datos, scaffolding)
+1. Primero el roadmap (`DEV-[proyecto]-roadmap.md`) — necesita tener la visión completa antes de generarse; incluir la fila de Etapa 2b en la tabla de secuencia de etapas, posicionada entre la Etapa 2 (scaffold) y la Etapa 3a (primer microservicio), con dependencia `Etapa 2 + infra Jenkins/ArgoCD (Etapa 0)` y esfuerzo estimado de 1 día; incluir también la fila de Etapa 0c, posicionada entre la Etapa 0 (infraestructura) y la Etapa 1 (bases de datos), con dependencia `Etapa 0 completa` y esfuerzo estimado de 0.5 días
+2. Luego las etapas 0, 0c y 1 y 2 (infraestructura, observabilidad, bases de datos, scaffolding)
 3. Luego la etapa 2b (configuración del pipeline CI/CD) — va antes de los microservicios para que cada commit de las etapas 3 y 4 sea validado automáticamente
 4. Luego los documentos de microservicios en el orden de implementación determinado en el Paso 3
 5. Luego los documentos de features frontend en orden de dependencia (auth primero, siempre)

@@ -60,6 +60,17 @@ def get_yaml_content(project_name: str, database: str, messaging_system: str, po
             ]
 
     lines += ["server:", f"  port: ${{SERVER_PORT:{port}}}"]
+    lines += [
+        "management:",
+        "  endpoints:",
+        "    web:",
+        "      exposure:",
+        "        include: health,readiness,liveness,prometheus,info,metrics",
+        "  metrics:",
+        "    tags:",
+        "      application: ${spring.application.name}",
+        "      environment: ${APP_ENV:dev}",
+    ]
     return "\n".join(lines) + "\n"
 
 
@@ -355,6 +366,37 @@ pipeline {
             .replace("__LIB_ORG__", lib_org))
 
 
+def get_logback_content() -> str:
+    return """\
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+    <!-- Fuera de dev: JSON estructurado con traceId/spanId (Micrometer-OTEL los inyecta en el MDC). -->
+    <springProfile name="!dev">
+        <appender name="JSON" class="ch.qos.logback.core.ConsoleAppender">
+            <encoder class="net.logstash.logback.encoder.LogstashEncoder">
+                <includeMdcKeyName>traceId</includeMdcKeyName>
+                <includeMdcKeyName>spanId</includeMdcKeyName>
+            </encoder>
+        </appender>
+        <root level="INFO">
+            <appender-ref ref="JSON"/>
+        </root>
+    </springProfile>
+    <!-- Dev: salida legible por consola, también incluye traceId/spanId. -->
+    <springProfile name="dev">
+        <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+            <encoder>
+                <pattern>%d{HH:mm:ss} %-5level [%X{traceId},%X{spanId}] %logger{36} - %msg%n</pattern>
+            </encoder>
+        </appender>
+        <root level="INFO">
+            <appender-ref ref="CONSOLE"/>
+        </root>
+    </springProfile>
+</configuration>
+"""
+
+
 def get_dockerignore_content() -> str:
     return """\
 target/
@@ -410,6 +452,10 @@ probes:
   readinessPath: /actuator/health/readiness
   livenessPath: /actuator/health/liveness
 
+# Observabilidad: endpoint del OTEL Collector. Se sobreescribe por ambiente en values-<env>.yaml.
+otel:
+  collectorEndpoint: ""
+
 env: []
 """
 
@@ -422,7 +468,7 @@ image:
   repository: ""
   tag: ""
 """
-    values_dev = image_block + """\
+    values_dev = image_block + f"""\
 replicaCount: 1
 resources:
   requests:
@@ -431,9 +477,13 @@ resources:
   limits:
     cpu: 500m
     memory: 512Mi
+otel:
+  collectorEndpoint: "http://{project_name}-otel-collector.monitoring:4317"
 """
     values_staging = image_block + """\
 replicaCount: 2
+otel:
+  collectorEndpoint: "http://otel-collector.monitoring:4317"
 """
     values_prod = image_block + """\
 replicaCount: 3
@@ -444,6 +494,8 @@ resources:
   limits:
     cpu: "2"
     memory: 2Gi
+otel:
+  collectorEndpoint: "http://otel-collector.monitoring:4317"
 """
 
     deployment_tpl = """\
@@ -462,7 +514,18 @@ spec:
     metadata:
       labels:
         app: {{ .Chart.Name }}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: "/actuator/prometheus"
+        prometheus.io/port: "{{ .Values.service.port }}"
     spec:
+      initContainers:
+        - name: otel-agent
+          image: ghcr.io/open-telemetry/opentelemetry-operator/autoinstrumentation-java:latest
+          command: ["cp", "/javaagent.jar", "/otel/opentelemetry-javaagent.jar"]
+          volumeMounts:
+            - name: otel-agent
+              mountPath: /otel
       containers:
         - name: {{ .Chart.Name }}
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
@@ -483,10 +546,24 @@ spec:
             periodSeconds: 15
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
-          {{- with .Values.env }}
           env:
+            - name: OTEL_SERVICE_NAME
+              value: "{{ .Chart.Name }}"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "{{ .Values.otel.collectorEndpoint }}"
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: "deployment.environment={{ .Values.env | default \"dev\" }},service.version={{ .Values.image.tag }}"
+            - name: JAVA_TOOL_OPTIONS
+              value: "-javaagent:/otel/opentelemetry-javaagent.jar"
+            {{- with .Values.env }}
             {{- toYaml . | nindent 12 }}
-          {{- end }}
+            {{- end }}
+          volumeMounts:
+            - name: otel-agent
+              mountPath: /otel
+      volumes:
+        - name: otel-agent
+          emptyDir: {}
 """
 
     service_tpl = """\
@@ -599,6 +676,27 @@ def get_root_pom(project_name: str, database: str, messaging_system: str, outbox
             <groupId>io.projectreactor</groupId>
             <artifactId>reactor-test</artifactId>
             <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-registry-prometheus</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-tracing-bridge-otel</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.opentelemetry</groupId>
+            <artifactId>opentelemetry-exporter-otlp</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>net.logstash.logback</groupId>
+            <artifactId>logstash-logback-encoder</artifactId>
+            <version>7.4</version>
         </dependency>
     </dependencies>
     <build>
@@ -1534,7 +1632,8 @@ public class ApplicationConfig {{
             resources_dir.mkdir(parents=True, exist_ok=True)
             (resources_dir / "application.yml").write_text(get_yaml_content(project_name, database, messaging_system, port, org))
             (resources_dir / "application-dev.yml").write_text(get_dev_yaml_content())
-            logger.debug("application.yml creado en: %s", resources_dir)
+            (resources_dir / "logback-spring.xml").write_text(get_logback_content())
+            logger.debug("application.yml y logback-spring.xml creados en: %s", resources_dir)
 
         logger.info("Módulo listo: %s", module)
 
