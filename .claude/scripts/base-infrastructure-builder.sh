@@ -4082,7 +4082,7 @@ module "argocd" {
 #   org              = var.project_name
 #   kafka_topic      = "report.processed"
 #   lambda_runtime   = "python3.12"
-#   report_bucket    = "${var.project_name}-reports"
+#   report_bucket    = "\${var.project_name}-reports"
 #   aws_endpoint_url = ""
 # }
 EOF
