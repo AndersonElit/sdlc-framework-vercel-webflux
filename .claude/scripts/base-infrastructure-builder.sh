@@ -2674,7 +2674,7 @@ variable "vercel_org_id" {
 }
 
 variable "vercel_project_id" {
-  description = "ID del proyecto flexicredit-web en Vercel"
+  description = "ID del proyecto __PROJECT_NAME__-web en Vercel"
   type        = string
   default     = ""
 }
@@ -3225,18 +3225,18 @@ terraform {
 }
 
 # Providers Kubernetes/Helm apuntando al cluster K3d local (lo crea floci-start con
-# `k3d cluster create flexicredit-dev`). A diferencia de staging/prod (EKS, auth por
+# `k3d cluster create __PROJECT_NAME__-dev`). A diferencia de staging/prod (EKS, auth por
 # `aws eks get-token`), aquí la autenticación es por certificado de cliente del
 # kubeconfig que k3d genera. El cluster debe existir antes de `terraform apply`.
 provider "kubernetes" {
   config_path    = "${path.module}/.kube/config-k3d"
-  config_context = "k3d-flexicredit-dev"
+  config_context = "k3d-__PROJECT_NAME__-dev"
 }
 
 provider "helm" {
   kubernetes {
     config_path    = "${path.module}/.kube/config-k3d"
-    config_context = "k3d-flexicredit-dev"
+    config_context = "k3d-__PROJECT_NAME__-dev"
   }
 }
 
@@ -3321,7 +3321,7 @@ variable "availability_zone" {
 variable "db_name" {
   description = "Nombre de la base de datos inicial (floci: valor de prueba)"
   type        = string
-  default     = "flexicredit_dev"
+  default     = "__PROJECT_NAME___dev"
 }
 
 variable "db_username" {
@@ -3432,13 +3432,13 @@ locals {
 
   # Apache Kafka standalone (KRaft) que levanta floci-start en floci-net (no MSK).
   # Interno: para microservicios como contenedores en floci-net. Externo: desde el host.
-  kafka_bootstrap_brokers          = "flexicredit-kafka-dev:9092"
+  kafka_bootstrap_brokers          = "__PROJECT_NAME__-kafka-dev:9092"
   kafka_bootstrap_brokers_external = "localhost:29092"
 
   # Registry de imágenes de dev: el que crea k3d (`--registry-create`). Reemplaza al
   # ECR emulado de floci (cuyo pull de capas es poco fiable). Jenkins/Kaniko empuja
   # aquí y K3d hace pull desde aquí. Interno a floci-net; el host lo ve en localhost:5100.
-  dev_registry = "k3d-flexicredit-registry:5100"
+  dev_registry = "k3d-__PROJECT_NAME__-registry:5100"
 }
 
 module "iam" {
@@ -3479,7 +3479,7 @@ module "ecr" {
 }
 
 # En dev NO se usa EKS (módulo eks): el plano de cómputo real es el cluster K3d que
-# levanta floci-start (flexicredit-dev en floci-net). Tampoco se usa el módulo jenkins
+# levanta floci-start (__PROJECT_NAME__-dev en floci-net). Tampoco se usa el módulo jenkins
 # (controller EC2 + agentes EKS): en dev el controller Jenkins corre como contenedor
 # en floci-net y lanza agentes como pods en K3d (lo configura setup-cicd-pipeline.sh).
 #
@@ -3496,7 +3496,7 @@ module "argocd" {
 
 # MSK desactivado en dev: floci deja el cluster en estado CREATING para siempre y el
 # provider de AWS crashea al leerlo (nil pointer en kafka/cluster.go). Kafka local lo
-# da el contenedor Apache Kafka standalone (flexicredit-kafka-dev en floci-net, KRaft)
+# da el contenedor Apache Kafka standalone (__PROJECT_NAME__-kafka-dev en floci-net, KRaft)
 # que levanta floci-start; los microservicios apuntan a local.kafka_bootstrap_brokers.
 # El módulo queda reservado para staging/prod (AWS real).
 module "msk" {
@@ -3579,7 +3579,7 @@ output "ecr_repository_urls" {
 # En dev el registry es el de k3d (no ECR). setup-cicd-pipeline.sh lee este output
 # para configurar ECR_REGISTRY del JCasC de Jenkins y construir los image tags.
 output "ecr_registry" {
-  description = "Registry de imágenes de dev (k3d). En floci-net: k3d-flexicredit-registry:5100"
+  description = "Registry de imágenes de dev (k3d). En floci-net: k3d-__PROJECT_NAME__-registry:5100"
   value       = local.dev_registry
 }
 
@@ -3657,10 +3657,10 @@ cat > "$TF_BACKEND/environments/dev/argocd-bootstrap/appproject.yaml" << 'EOF'
 apiVersion: argoproj.io/v1alpha1
 kind: AppProject
 metadata:
-  name: flexicredit
+  name: __PROJECT_NAME__
   namespace: argocd
 spec:
-  description: Microservicios FlexiCredit (dev)
+  description: Microservicios __PROJECT_NAME__ (dev)
   sourceRepos:
     - '*'
   destinations:
@@ -3680,7 +3680,7 @@ cat > "$TF_BACKEND/environments/dev/argocd-bootstrap/applicationset.yaml" << 'EO
 apiVersion: argoproj.io/v1alpha1
 kind: ApplicationSet
 metadata:
-  name: flexicredit-dev
+  name: __PROJECT_NAME__-dev
   namespace: argocd
 spec:
   goTemplate: true
@@ -3689,12 +3689,12 @@ spec:
         elements:
           # -- services managed by scaffold --
           # repoURL apunta a Gitea en floci-net (http://gitea:3000); ArgoCD (pod en
-          # el cluster K3d flexicredit-dev) lo alcanza porque está en la misma red floci-net.
+          # el cluster K3d __PROJECT_NAME__-dev) lo alcanza porque está en la misma red floci-net.
   template:
     metadata:
       name: '{{.service}}-dev'
     spec:
-      project: flexicredit
+      project: __PROJECT_NAME__
       source:
         repoURL: '{{.repoURL}}'
         targetRevision: '{{.revision}}'
@@ -3716,18 +3716,18 @@ EOF
 
 cat > "$TF_BACKEND/environments/dev/argocd-bootstrap/repo-credentials.example.yaml" << 'EOF'
 # Credenciales de repositorio para ArgoCD. ArgoCD (pod en el cluster K3d
-# flexicredit-dev) alcanza Gitea por http://gitea:3000 porque ambos están en floci-net.
+# __PROJECT_NAME__-dev) alcanza Gitea por http://gitea:3000 porque ambos están en floci-net.
 # Aplicar con: kubectl apply -f repo-credentials.example.yaml
 apiVersion: v1
 kind: Secret
 metadata:
-  name: repo-creds-gitea-flexicredit
+  name: repo-creds-gitea-__PROJECT_NAME__
   namespace: argocd
   labels:
     argocd.argoproj.io/secret-type: repo-creds
 stringData:
   type: git
-  url: http://gitea:3000/flexicredit
+  url: http://gitea:3000/__PROJECT_NAME__
   username: gitea-admin
   password: gitea-admin
 EOF
@@ -4229,10 +4229,10 @@ cat > "$TF_BACKEND/environments/$env/argocd-bootstrap/appproject.yaml" << EOF
 apiVersion: argoproj.io/v1alpha1
 kind: AppProject
 metadata:
-  name: flexicredit
+  name: ${PROJECT_NAME}
   namespace: argocd
 spec:
-  description: Microservicios FlexiCredit ($env)
+  description: Microservicios ${PROJECT_NAME} ($env)
   sourceRepos:
     - '*'              # restringe a los repos de tus servicios en producción
   destinations:
@@ -4253,7 +4253,7 @@ cat > "$TF_BACKEND/environments/$env/argocd-bootstrap/applicationset.yaml" << EO
 apiVersion: argoproj.io/v1alpha1
 kind: ApplicationSet
 metadata:
-  name: flexicredit-$env
+  name: ${PROJECT_NAME}-$env
   namespace: argocd
 spec:
   goTemplate: true
@@ -4268,7 +4268,7 @@ spec:
     metadata:
       name: '{{.service}}-$env'
     spec:
-      project: flexicredit
+      project: ${PROJECT_NAME}
       source:
         repoURL: '{{.repoURL}}'
         targetRevision: '{{.revision}}'
@@ -4293,13 +4293,13 @@ cat > "$TF_BACKEND/environments/$env/argocd-bootstrap/repo-credentials.example.y
 apiVersion: v1
 kind: Secret
 metadata:
-  name: repo-creds-gitea-flexicredit
+  name: repo-creds-gitea-__PROJECT_NAME__
   namespace: argocd
   labels:
     argocd.argoproj.io/secret-type: repo-creds
 stringData:
   type: git
-  url: http://gitea:3000/flexicredit
+  url: http://gitea:3000/__PROJECT_NAME__
   username: gitea-admin
   password: gitea-admin
 EOF
@@ -4307,19 +4307,14 @@ EOF
 done
 
 # ---------------------------------------------------------------------------
-# Genericidad: los heredocs de arriba se emiten con el slug literal "flexicredit"
-# para mantenerlos legibles; aquí se sustituye por $PROJECT_NAME en todo el árbol
-# Terraform generado (módulos, environments y argocd-bootstrap). El cuerpo del
-# script ya usa $PROJECT_NAME para el cluster K3d / registry / Kafka, así que tras
-# esta pasada los providers kubernetes/helm y los manifiestos ArgoCD quedan
-# alineados con esos nombres.
+# Sustituye el placeholder __PROJECT_NAME__ en los archivos Terraform/YAML
+# generados por el nombre real del proyecto.
 # ---------------------------------------------------------------------------
-if [[ "$PROJECT_NAME" != "flexicredit" ]]; then
-  log "Aplicando nombre de proyecto '$PROJECT_NAME' al árbol Terraform generado..."
-  find "$TERRAFORM_ROOT" -type f \
-    \( -name '*.tf' -o -name '*.yaml' -o -name '*.yml' -o -name '*.tfvars' -o -name '*.json' \) \
-    -print0 | xargs -0 --no-run-if-empty sed -i "s/flexicredit/${PROJECT_NAME}/g"
-  log_ok "Nombre de proyecto aplicado al árbol Terraform."
-fi
+log "Aplicando nombre de proyecto '$PROJECT_NAME' al árbol Terraform generado..."
+find "$TERRAFORM_ROOT" -type f \
+  \( -name '*.tf' -o -name '*.yaml' -o -name '*.yml' -o -name '*.tfvars' -o -name '*.json' \) \
+  -print0 | xargs -0 --no-run-if-empty sed -i \
+    -e "s#__PROJECT_NAME__#${PROJECT_NAME}#g"
+log_ok "Nombre de proyecto '$PROJECT_NAME' aplicado al árbol Terraform."
 
 log_ok "Estructura Terraform creada en $TERRAFORM_ROOT."

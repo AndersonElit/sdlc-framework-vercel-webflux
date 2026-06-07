@@ -516,10 +516,10 @@ def jobs = [
   ['ciclovida-service',      'ciclovida-service',      false],
   ['auditoria-service',      'auditoria-service',      false],
   ['reportes-service',       'reportes-service',       false],
-  ['flexicredit-web',        'flexicredit-web',        true ],
+  ['__PROJECT_NAME__-web',   '__PROJECT_NAME__-web',   true ],
 ]
 
-def gitBase = System.getenv('GIT_BASE_URL') ?: 'http://gitea:3000/flexicredit'
+def gitBase = System.getenv('GIT_BASE_URL') ?: 'http://gitea:3000/__PROJECT_NAME__'
 
 jobs.each { jobName, repoName, isFrontend ->
   def fullName = jobName
@@ -567,10 +567,8 @@ println "Listo. ${jobs.size()} jobs procesados."
 GROOVY_EOF
 
   # --- Inyectar git_base real y el nombre del proyecto en el script ---
-  # Reemplazar el fallback del script con el valor detectado y el job frontend
-  # (el heredoc se emite con el literal 'flexicredit-web' por legibilidad).
   sed -i "s|def gitBase = .*|def gitBase = '${git_base}'|" "$jobs_script"
-  sed -i "s|flexicredit-web|${PROJECT_NAME}-web|g" "$jobs_script"
+  sed -i "s|__PROJECT_NAME__|${PROJECT_NAME}|g" "$jobs_script"
 
   log "Script Groovy generado: $jobs_script"
 

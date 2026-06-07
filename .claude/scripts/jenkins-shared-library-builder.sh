@@ -275,8 +275,8 @@ def call(Map args = [:]) {
     withCredentials([usernamePassword(credentialsId: credId, usernameVariable: 'GIT_USER', passwordVariable: 'GIT_TOKEN')]) {
         withEnv(["VALUES_FILE=${valuesFile}", "SVC=${service}", "ENVN=${envName}", "TAG=${imageTag}", "TARGET_BRANCH=${branch}"]) {
             sh '''
-                git config user.email "cicd@flexicredit.local"
-                git config user.name  "FlexiCredit CI"
+                git config user.email "cicd@__ORG_SLUG__.local"
+                git config user.name  "__PROJECT_NAME__ CI"
                 git add "$VALUES_FILE"
                 if git diff --cached --quiet; then
                   echo "Sin cambios en $VALUES_FILE (tag ya fijado); nada que commitear."
@@ -361,7 +361,7 @@ log_ok "Pasos vars/ generados (11 archivos)."
 # src/ — clases auxiliares
 # ---------------------------------------------------------------------------
 cat > "$OUT_DIR/src/org/$ORG_SLUG/PipelineDefaults.groovy" <<'EOF'
-package org.flexicredit
+package org.__ORG_SLUG__
 
 // Constantes y utilidades compartidas por los pasos de la Shared Library.
 class PipelineDefaults implements Serializable {
@@ -564,7 +564,7 @@ EOF
 # el user_data de la instancia EC2 del controller).
 cat > "$OUT_DIR/docker/jenkins.yaml" <<'EOF'
 jenkins:
-  systemMessage: "FlexiCredit CI/CD — configurado con JCasC"
+  systemMessage: "__PROJECT_NAME__ CI/CD — configurado con JCasC"
   numExecutors: 0   # el controller no ejecuta builds; todo va a agentes en el cluster
 
   clouds:
@@ -672,7 +672,7 @@ log_ok "Imagen del controller (docker/Dockerfile, plugins.txt, jenkins.yaml) gen
 cat > "$OUT_DIR/README.md" <<'EOF'
 # jenkins-shared-library
 
-Shared Library de Jenkins con los pasos reutilizables del CI/CD de FlexiCredit.
+Shared Library de Jenkins con los pasos reutilizables del CI/CD de __PROJECT_NAME__.
 Encapsula la lógica común para mantener los `Jenkinsfile` mínimos.
 
 ## Uso desde un Jenkinsfile
@@ -717,7 +717,7 @@ Terraform `argocd` y los manifiestos `argocd-bootstrap/` (ver `base-infrastructu
 - **Controller**: contenedor Docker en EC2 + EBS (config declarativa con JCasC,
   ver `docker/`). No ejecuta builds (`numExecutors: 0`).
 - **Agentes**: pods efímeros en EKS (Kubernetes plugin). Los Jenkinsfile cargan
-  el pod con `agent { kubernetes { yaml libraryResource('org/flexicredit/podBackend.yaml') } }`
+  el pod con `agent { kubernetes { yaml libraryResource('org/__ORG_SLUG__/podBackend.yaml') } }`
   (frontend: `podFrontend.yaml`).
 - **Autenticación**: el ServiceAccount `jenkins-agent` usa IRSA. kaniko hace push
   a ECR; `bumpImageTag` hace push a Git con la credencial `gitops-git-credentials`;
@@ -744,7 +744,7 @@ Terraform `argocd` y los manifiestos `argocd-bootstrap/` (ver `base-infrastructu
 4. Instala ArgoCD (módulo Terraform `argocd`) y aplica los manifiestos
    `argocd-bootstrap/` del ambiente; ArgoCD se encarga del CD por GitOps.
 
-## Pods de agentes (`resources/org/flexicredit/`)
+## Pods de agentes (`resources/org/__ORG_SLUG__/`)
 
 - `podBackend.yaml` — contenedores `maven` (default), `kaniko`, `trivy`,
   `gitleaks`, `deploy` (alpine/k8s) y sidecar `dind` (Testcontainers).
@@ -766,18 +766,13 @@ EOF
 log_ok "README.md y .gitignore generados."
 
 # ---------------------------------------------------------------------------
-# Genericidad: los heredocs de arriba se emiten con los literales "flexicredit"/
-# "FlexiCredit" por legibilidad. Aquí se sustituyen por el proyecto real en TODO
-# el contenido generado. El paquete Java / path de recursos usan el slug saneado
-# (org.<slug>); el resto (organización Gitea, dominios, marca) usa el nombre tal cual.
-# Las reglas de "org/" y "org." se aplican primero para que coincidan con los
-# directorios ya creados con $ORG_SLUG.
+# Sustituye los placeholders de los heredocs por los valores reales del proyecto.
+# __ORG_SLUG__     → slug técnico lowercase (paquete Java, paths, dominios)
+# __PROJECT_NAME__ → nombre del proyecto tal cual se pasó con -P (textos de display)
 # ---------------------------------------------------------------------------
 find "$OUT_DIR" -type f -print0 | xargs -0 --no-run-if-empty sed -i \
-  -e "s#org/flexicredit#org/${ORG_SLUG}#g" \
-  -e "s#org\.flexicredit#org.${ORG_SLUG}#g" \
-  -e "s#flexicredit#${PROJECT_NAME}#g" \
-  -e "s#FlexiCredit#${PROJECT_NAME}#g"
+  -e "s#__ORG_SLUG__#${ORG_SLUG}#g" \
+  -e "s#__PROJECT_NAME__#${PROJECT_NAME}#g"
 log_ok "Nombre de proyecto '$PROJECT_NAME' aplicado al contenido de la Shared Library."
 
 # ---------------------------------------------------------------------------
