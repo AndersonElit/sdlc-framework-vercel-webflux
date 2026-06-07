@@ -238,17 +238,26 @@ helm upgrade --install loki grafana/loki \
   --set backend.replicas=0 \
   --wait --timeout=4m
 
+_fluent_values=$(mktemp /tmp/fluent-bit-values-XXXX.yaml)
+cat > "$_fluent_values" <<'FLUENT_EOF'
+config:
+  outputs: |
+    [OUTPUT]
+        Name        loki
+        Match       kube.*
+        Host        loki.monitoring
+        Port        3100
+        Labels      job=fluentbit,namespace=$kubernetes['namespace_name'],pod=$kubernetes['pod_name']
+        label_keys  $traceId,$spanId
+        auto_kubernetes_labels on
+FLUENT_EOF
+
 helm upgrade --install fluent-bit fluent/fluent-bit \
   --namespace monitoring \
-  --set config.outputs="[OUTPUT]
-    Name        loki
-    Match       kube.*
-    Host        loki.monitoring
-    Port        3100
-    Labels      job=fluentbit,namespace=\$kubernetes['namespace_name'],pod=\$kubernetes['pod_name']
-    label_keys  \$traceId,\$spanId
-    auto_kubernetes_labels on" \
+  --values "$_fluent_values" \
   --wait --timeout=3m
+
+rm -f "$_fluent_values"
 
 log_ok "Loki + Fluent Bit instalados."
 
