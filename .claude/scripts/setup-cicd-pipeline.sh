@@ -5,11 +5,16 @@
 # Cada sección es una función autocontenida. Se ejecutan en orden.
 #
 # Uso:
-#   bash .claude/scripts/setup-cicd-pipeline.sh -P <proyecto>
+#   bash .claude/scripts/setup-cicd-pipeline.sh -P <proyecto> -S <svc1,svc2,...> [-F <frontend>]
 #
-#   -P, --project NOMBRE   Slug del proyecto (obligatorio). Nombra la imagen del
-#                          controller (<proyecto>-jenkins), el cluster K3d/EKS,
-#                          la organización Gitea y los recursos de ArgoCD.
+#   -P, --project NOMBRE      Slug del proyecto (obligatorio). Nombra la imagen del
+#                             controller (<proyecto>-jenkins), el cluster K3d/EKS,
+#                             la organización Gitea y los recursos de ArgoCD.
+#   -S, --services SVC1,SVC2  Lista de microservicios backend separados por coma (obligatorio).
+#                             Ejemplo: --services seguridad,clientes,tasas,originacion
+#   -F, --frontend NOMBRE     Nombre del repositorio/job del frontend (opcional).
+#                             Si se omite no se crea job de frontend.
+#                             Ejemplo: --frontend pagofacil-web
 #
 set -euo pipefail
 
@@ -21,11 +26,17 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 PROJECT_NAME=""
+SERVICES=""
+FRONTEND_NAME=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -P|--project) PROJECT_NAME="${2:-}"; shift 2 ;;
-    --project=*)  PROJECT_NAME="${1#*=}"; shift ;;
-    -h|--help)    grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -P|--project)  PROJECT_NAME="${2:-}"; shift 2 ;;
+    --project=*)   PROJECT_NAME="${1#*=}"; shift ;;
+    -S|--services) SERVICES="${2:-}"; shift 2 ;;
+    --services=*)  SERVICES="${1#*=}"; shift ;;
+    -F|--frontend) FRONTEND_NAME="${2:-}"; shift 2 ;;
+    --frontend=*)  FRONTEND_NAME="${1#*=}"; shift ;;
+    -h|--help)     grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) log_err "Argumento desconocido: $1"; exit 1 ;;
   esac
 done
@@ -33,7 +44,20 @@ if [[ -z "$PROJECT_NAME" ]]; then
   log_err "Falta el parámetro obligatorio -P/--project."
   exit 1
 fi
+if [[ -z "$SERVICES" ]]; then
+  log_err "Falta el parámetro obligatorio -S/--services (ej: --services seguridad,clientes,tasas)."
+  exit 1
+fi
 ORG_SLUG="$(echo "$PROJECT_NAME" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9')"
+
+# Calcular total de jobs esperados (backends + frontend opcional)
+EXPECTED_JOB_COUNT=0
+IFS=',' read -ra _svc_arr <<< "$SERVICES"
+for _svc in "${_svc_arr[@]}"; do
+  _svc="${_svc// /}"
+  [[ -n "$_svc" ]] && EXPECTED_JOB_COUNT=$((EXPECTED_JOB_COUNT + 1))
+done
+[[ -n "$FRONTEND_NAME" ]] && EXPECTED_JOB_COUNT=$((EXPECTED_JOB_COUNT + 1))
 
 # ---------------------------------------------------------------------------
 # Sección 0 — Generar la Shared Library
@@ -493,7 +517,9 @@ section_4_crear_jobs_jenkins() {
 
   # --- Generar script Groovy para Jenkins Script Console ---
   log "Generando script de creación de jobs: $jobs_script"
-  cat > "$jobs_script" <<'GROOVY_EOF'
+
+  # Cabecera del script Groovy (heredoc quoted: $ de Groovy no se interpolan)
+  cat > "$jobs_script" <<'GROOVY_HEADER'
 import jenkins.model.Jenkins
 import jenkins.branch.BranchSource
 import jenkins.plugins.git.GitSCMSource
@@ -508,19 +534,28 @@ if (jenkins == null) {
 
 // Lista de jobs a crear: [nombre, repo-url-relativo, es-frontend]
 def jobs = [
-  ['seguridad-service',      'seguridad-service',      false],
-  ['configuracion-service',  'configuracion-service',  false],
-  ['clientes-service',       'clientes-service',       false],
-  ['tasas-service',          'tasas-service',          false],
-  ['originacion-service',    'originacion-service',    false],
-  ['ciclovida-service',      'ciclovida-service',      false],
-  ['auditoria-service',      'auditoria-service',      false],
-  ['reportes-service',       'reportes-service',       false],
-  ['__PROJECT_NAME__-web',   '__PROJECT_NAME__-web',   true ],
+GROOVY_HEADER
+
+  # Inyectar jobs dinámicamente desde --services y --frontend
+  IFS=',' read -ra _svc_list <<< "$SERVICES"
+  for _svc in "${_svc_list[@]}"; do
+    _svc="${_svc// /}"
+    [[ -z "$_svc" ]] && continue
+    printf "  ['%s', '%s', false],\n" "$_svc" "$_svc" >> "$jobs_script"
+  done
+  if [[ -n "$FRONTEND_NAME" ]]; then
+    printf "  ['%s', '%s', true ],\n" "$FRONTEND_NAME" "$FRONTEND_NAME" >> "$jobs_script"
+  fi
+
+  # Resto del script Groovy
+  cat >> "$jobs_script" <<GROOVY_FOOTER
 ]
 
-def gitBase = System.getenv('GIT_BASE_URL') ?: 'http://gitea:3000/__PROJECT_NAME__'
+def gitBase = '${git_base}'
 
+GROOVY_FOOTER
+
+  cat >> "$jobs_script" <<'GROOVY_BODY'
 jobs.each { jobName, repoName, isFrontend ->
   def fullName = jobName
   def existing = jenkins.getItemByFullName(fullName)
@@ -564,11 +599,7 @@ jobs.each { jobName, repoName, isFrontend ->
 }
 
 println "Listo. ${jobs.size()} jobs procesados."
-GROOVY_EOF
-
-  # --- Inyectar git_base real y el nombre del proyecto en el script ---
-  sed -i "s|def gitBase = .*|def gitBase = '${git_base}'|" "$jobs_script"
-  sed -i "s|__PROJECT_NAME__|${PROJECT_NAME}|g" "$jobs_script"
+GROOVY_BODY
 
   log "Script Groovy generado: $jobs_script"
 
@@ -899,10 +930,10 @@ section_6_verificar_pipeline() {
     local app_count
     app_count=$(kubectl --kubeconfig "$kubeconfig" get applications -n argocd \
       --no-headers 2>/dev/null | wc -l || echo 0)
-    if [[ "$app_count" -ge 8 ]]; then
-      chk_ok "$app_count Applications registradas en ArgoCD (≥ 8 esperadas)"
+    if [[ "$app_count" -ge "$EXPECTED_JOB_COUNT" ]]; then
+      chk_ok "$app_count Applications registradas en ArgoCD (≥ ${EXPECTED_JOB_COUNT} esperadas)"
     else
-      chk_fail "Se esperan ≥ 8 Applications, se encontraron $app_count"
+      chk_fail "Se esperan ≥ ${EXPECTED_JOB_COUNT} Applications, se encontraron $app_count"
     fi
 
     local synced_count
