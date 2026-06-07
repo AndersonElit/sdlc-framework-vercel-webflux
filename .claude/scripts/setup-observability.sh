@@ -227,6 +227,12 @@ helm upgrade --install loki grafana/loki \
   --set singleBinary.replicas=1 \
   --set loki.commonConfig.replication_factor=1 \
   --set loki.storage.type=filesystem \
+  --set 'loki.schemaConfig.configs[0].from=2024-01-01' \
+  --set 'loki.schemaConfig.configs[0].store=tsdb' \
+  --set 'loki.schemaConfig.configs[0].object_store=filesystem' \
+  --set 'loki.schemaConfig.configs[0].schema=v13' \
+  --set 'loki.schemaConfig.configs[0].index.prefix=loki_index_' \
+  --set 'loki.schemaConfig.configs[0].index.period=24h' \
   --set read.replicas=0 \
   --set write.replicas=0 \
   --set backend.replicas=0 \
