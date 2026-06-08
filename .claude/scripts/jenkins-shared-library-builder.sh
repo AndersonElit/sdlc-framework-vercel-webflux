@@ -13,12 +13,13 @@
 # (vps-setup.sh k3s en dev; módulo Terraform 'argocd' en staging/prod).
 #
 # Uso:
-#   bash .claude/scripts/jenkins-shared-library-builder.sh -P <proyecto> [-o DIR] [--no-git]
+#   bash .claude/scripts/jenkins-shared-library-builder.sh -P <proyecto> --vps-ip <IP> [-o DIR] [--no-git]
 #
 #   -P, --project NOMBRE   Slug del proyecto (obligatorio). Determina el paquete
 #                          Java de la librería (org.<slug>), el path de los
 #                          recursos (org/<slug>/podBackend.yaml) y la organización
 #                          Gitea donde se publica el repo.
+#   --vps-ip IP            IP del VPS donde corre Gitea (:3000). (obligatorio)
 #   -o DIR     Directorio de salida (por defecto: ./jenkins-shared-library)
 #   --no-git   No inicializar repositorio git ni hacer commit inicial
 
@@ -55,10 +56,12 @@ if [[ -z "$PROJECT_NAME" ]]; then
   log_err "Falta el parámetro obligatorio -P/--project."
   exit 1
 fi
+if [[ -z "$VPS_IP" ]]; then
+  log_err "Falta el parámetro obligatorio --vps-ip."
+  exit 1
+fi
 
-# Gitea URL: si hay VPS_IP usarla; si no, fallback a localhost (port-forward manual)
-GITEA_BASE="${VPS_IP:+http://${VPS_IP}:3000}"
-GITEA_BASE="${GITEA_BASE:-http://localhost:3000}"
+GITEA_BASE="http://${VPS_IP}:3000"
 
 # Slug saneado para el paquete Java / path de recursos (sin guiones ni mayúsculas).
 ORG_SLUG="$(echo "$PROJECT_NAME" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9')"

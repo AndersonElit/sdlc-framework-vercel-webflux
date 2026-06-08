@@ -4,12 +4,13 @@
 # run-liquibase-migrations.sh — Liquibase standalone multi-servicio
 #
 # Aplica (o inspecciona) los changelogs Liquibase de cada microservicio que
-# tenga un directorio db/<servicio>/ en la raíz del repo. No requiere JDK ni
-# Liquibase instalados: corre la imagen oficial liquibase/liquibase vía Docker
-# conectándose directamente a PostgreSQL nativo en el VPS (VPS_IP:5432).
+# tenga un directorio db/<servicio>/ en la raíz del repo. Requiere Liquibase
+# instalado en el VPS (vps-setup.sh prereqs). Los changelogs se copian al VPS
+# vía scp, se ejecutan con liquibase nativo y se limpian después.
 #
-# Prerrequisito: init-databases.sh completado (BDs y usuario de aplicación
-#                creados en el VPS). Docker debe estar activo en el host local.
+# Prerrequisito: vps-setup.sh prereqs completado (Liquibase en /usr/local/bin).
+#                init-databases.sh completado (BDs y usuario de aplicación
+#                creados en el VPS).
 #
 # Uso:
 #   bash run-liquibase-migrations.sh -P <proyecto> -p <pg-prefix> -u <usuario> -w <clave>
@@ -19,18 +20,21 @@
 #   -p, --pg-db      PREFIX   Prefijo de BD PostgreSQL (<prefix>_<svc_slug>)(obligatorio)
 #   -u, --user       NOMBRE   Usuario de aplicación en PostgreSQL            (obligatorio)
 #   -w, --password   CLAVE    Clave del usuario de aplicación                (obligatorio)
-#   --vps-ip         IP       IP del VPS donde corre PostgreSQL 16 nativo    (obligatorio)
+#   --vps-ip         IP       IP del VPS donde corren Liquibase y PostgreSQL (obligatorio)
+#   --vps-user       USER     Usuario SSH del VPS   (default: ubuntu)
+#   --vps-ssh-key    FILE     Clave SSH privada      (default: ~/.ssh/id_ed25519)
 #   -s, --service    SLUG     Procesar solo este servicio (ej: clientes-service)
 #   -a, --action     ACCION   update (default) | rollback | status | validate
 #   -h, --help                Muestra esta ayuda
 #
 # Qué hace:
-#   1. Verifica prerequisitos (docker)
-#   2. Verifica conectividad con PostgreSQL en VPS_IP:5432
+#   1. Verifica prerequisitos (ssh, scp, nc)
+#   2. Verifica conectividad SSH al VPS y que liquibase esté disponible
 #   3. Descubre directorios db/*-service/ en la raíz del repo
-#   4. Por cada servicio (o solo el indicado con -s), ejecuta:
-#        docker run liquibase/liquibase <action>
-#      montando db/<svc>/changelog/ y db/<svc>/liquibase.properties
+#   4. Por cada servicio (o solo el indicado con -s):
+#        a. Copia db/<svc>/changelog/ y db/<svc>/liquibase.properties al VPS
+#        b. Ejecuta liquibase <action> en el VPS vía SSH
+#        c. Elimina los archivos temporales del VPS
 #   5. Checklist de criterios de aceptación
 # ===========================================================================
 
@@ -49,8 +53,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 DB_DIR="$REPO_ROOT/db"
 
-LIQUIBASE_IMAGE="liquibase/liquibase:latest"
-
 # ──────────────────────────────────────────────────────────────────────────────
 # 0. Parámetros
 # ──────────────────────────────────────────────────────────────────────────────
@@ -59,6 +61,8 @@ PG_DB_NAME=""
 APP_USER=""
 APP_PASS=""
 VPS_IP=""
+VPS_USER="${VPS_USER:-ubuntu}"
+VPS_SSH_KEY="${VPS_SSH_KEY:-$HOME/.ssh/id_ed25519}"
 FILTER_SERVICE=""
 ACTION="update"
 
@@ -69,15 +73,17 @@ usage() {
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -P|--project)  PROJECT_NAME="$2";    shift 2 ;;
-    -p|--pg-db)    PG_DB_NAME="$2";      shift 2 ;;
-    -u|--user)     APP_USER="$2";        shift 2 ;;
-    -w|--password) APP_PASS="$2";        shift 2 ;;
-    --vps-ip)      VPS_IP="$2";          shift 2 ;;
-    --vps-ip=*)    VPS_IP="${1#*=}";     shift ;;
-    -s|--service)  FILTER_SERVICE="$2";  shift 2 ;;
-    -a|--action)   ACTION="$2";          shift 2 ;;
-    -h|--help)     usage 0 ;;
+    -P|--project)    PROJECT_NAME="$2";    shift 2 ;;
+    -p|--pg-db)      PG_DB_NAME="$2";      shift 2 ;;
+    -u|--user)       APP_USER="$2";        shift 2 ;;
+    -w|--password)   APP_PASS="$2";        shift 2 ;;
+    --vps-ip)        VPS_IP="$2";          shift 2 ;;
+    --vps-ip=*)      VPS_IP="${1#*=}";     shift ;;
+    --vps-user)      VPS_USER="$2";        shift 2 ;;
+    --vps-ssh-key)   VPS_SSH_KEY="$2";     shift 2 ;;
+    -s|--service)    FILTER_SERVICE="$2";  shift 2 ;;
+    -a|--action)     ACTION="$2";          shift 2 ;;
+    -h|--help)       usage 0 ;;
     *) log_err "Opción desconocida: $1"; usage 1 ;;
   esac
 done
@@ -99,22 +105,29 @@ case "$ACTION" in
   *) log_err "Acción no soportada: '$ACTION'. Opciones: update, rollback, status, validate"; exit 1 ;;
 esac
 
+ssh_vps() {
+  ssh -i "$VPS_SSH_KEY" -o StrictHostKeyChecking=no -o ConnectTimeout=15 \
+      -o BatchMode=yes "${VPS_USER}@${VPS_IP}" "$@"
+}
+
+scp_to_vps() {
+  scp -i "$VPS_SSH_KEY" -o StrictHostKeyChecking=no -r "$1" "${VPS_USER}@${VPS_IP}:$2"
+}
+
+PG_PORT="5432"
+
 # ──────────────────────────────────────────────────────────────────────────────
 # 1. Verificar prerequisitos
 # ──────────────────────────────────────────────────────────────────────────────
 HEADER "1. Verificando prerequisitos"
 
-if ! command -v docker &>/dev/null; then
-  log_err "docker no está instalado o no está en PATH."
-  exit 1
-fi
-log_ok "docker encontrado ($(docker --version | head -1))."
-
-if ! docker info &>/dev/null; then
-  log_err "Docker daemon no está activo. Inicia Docker y reintenta."
-  exit 1
-fi
-log_ok "Docker daemon activo."
+for dep in ssh scp; do
+  if ! command -v "$dep" &>/dev/null; then
+    log_err "'$dep' no está instalado o no está en PATH."
+    exit 1
+  fi
+done
+log_ok "ssh y scp disponibles."
 
 if [[ ! -d "$DB_DIR" ]]; then
   log_err "Directorio db/ no encontrado: $DB_DIR"
@@ -123,23 +136,33 @@ if [[ ! -d "$DB_DIR" ]]; then
 fi
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 2. Verificar conectividad con PostgreSQL nativo en VPS
+# 2. Verificar conectividad VPS y Liquibase nativo
 # ──────────────────────────────────────────────────────────────────────────────
-HEADER "2. Verificando PostgreSQL en VPS ($VPS_IP:5432)"
+HEADER "2. Verificando VPS ($VPS_IP)"
 
-PG_PORT="5432"
+if ! ssh_vps "echo OK" &>/dev/null; then
+  log_err "No se puede conectar al VPS $VPS_IP via SSH."
+  log_err "  Verifica la IP y la clave $VPS_SSH_KEY"
+  exit 1
+fi
+log_ok "VPS $VPS_IP accesible via SSH."
 
-# Verificar conectividad básica (timeout 3s)
+if ! ssh_vps "command -v liquibase" &>/dev/null; then
+  log_err "Liquibase no está instalado en el VPS."
+  log_err "  Ejecutar: vps-setup.sh prereqs --vm-ip $VPS_IP"
+  exit 1
+fi
+LIQUIBASE_VER=$(ssh_vps "liquibase --version 2>&1 | head -1" || true)
+log_ok "Liquibase disponible en VPS: $LIQUIBASE_VER"
+
 if command -v nc &>/dev/null; then
   if ! nc -z -w3 "$VPS_IP" "$PG_PORT" &>/dev/null; then
     log_err "No se puede alcanzar PostgreSQL en $VPS_IP:$PG_PORT."
-    log_err "  Verifica que el VPS está activo y postgresql.service está corriendo."
     exit 1
   fi
   log_ok "PostgreSQL accesible en $VPS_IP:$PG_PORT"
 else
-  log_warn "nc no disponible — se omite la verificación de conectividad previa."
-  log "  PostgreSQL: $VPS_IP:$PG_PORT"
+  log_warn "nc no disponible — se omite la verificación de puerto PostgreSQL."
 fi
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -171,13 +194,14 @@ fi
 # ──────────────────────────────────────────────────────────────────────────────
 # 4. Ejecutar Liquibase por servicio
 # ──────────────────────────────────────────────────────────────────────────────
-HEADER "4. Ejecutando Liquibase — acción: $ACTION"
+HEADER "4. Ejecutando Liquibase en VPS — acción: $ACTION"
 
 SERVICES_OK=()
 SERVICES_FAILED=()
 
-# Convierte nombre de servicio a slug de BD: clientes-service → clientes_service
 svc_to_slug() { echo "${1//-/_}"; }
+
+VPS_TMP="/tmp/liquibase-migrations-$$"
 
 run_liquibase_for_service() {
   local svc_path="$1"
@@ -202,18 +226,23 @@ run_liquibase_for_service() {
 
   log "  → $svc_name  [BD: $db_name  host: $VPS_IP:$PG_PORT]"
 
-  local jdbc_url="jdbc:postgresql://${VPS_IP}:${PG_PORT}/${db_name}"
+  local jdbc_url="jdbc:postgresql://localhost:${PG_PORT}/${db_name}"
+  local vps_svc_dir="${VPS_TMP}/${svc_name}"
 
-  if docker run --rm \
-    -v "$changelog_dir:/liquibase/changelog:ro" \
-    -v "$props_file:/liquibase/liquibase.properties:ro" \
-    "$LIQUIBASE_IMAGE" \
-    --url="$jdbc_url" \
-    --username="$APP_USER" \
-    --password="$APP_PASS" \
-    --changeLogFile="changelog/root.yaml" \
+  # Crear directorio temporal en VPS y copiar changelogs
+  ssh_vps "mkdir -p '${vps_svc_dir}/changelog'"
+  scp_to_vps "$props_file"    "${vps_svc_dir}/liquibase.properties"
+  scp_to_vps "$changelog_dir" "${vps_svc_dir}/"
+
+  if ssh_vps "liquibase \
+    --url='${jdbc_url}' \
+    --username='${APP_USER}' \
+    --password='${APP_PASS}' \
+    --changeLogFile='changelog/root.yaml' \
     --log-level=WARNING \
-    "$ACTION"; then
+    --defaultsFile='${vps_svc_dir}/liquibase.properties' \
+    --search-path='${vps_svc_dir}' \
+    '${ACTION}'" 2>&1; then
     log_ok "  $svc_name — $ACTION completado."
     SERVICES_OK+=("$svc_name")
   else
@@ -222,9 +251,15 @@ run_liquibase_for_service() {
   fi
 }
 
+# Crear directorio raíz temporal en VPS
+ssh_vps "mkdir -p '$VPS_TMP'"
+
 for svc_path in "${ALL_DB_SERVICES[@]}"; do
   run_liquibase_for_service "$svc_path"
 done
+
+# Limpiar archivos temporales del VPS
+ssh_vps "rm -rf '$VPS_TMP'" && log "Archivos temporales del VPS eliminados."
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 5. Checklist de criterios de aceptación
@@ -246,6 +281,7 @@ check_item() {
 }
 
 check_item "PostgreSQL nativo accesible en $VPS_IP:$PG_PORT" 0
+check_item "Liquibase nativo disponible en VPS $VPS_IP" 0
 
 for svc_path in "${ALL_DB_SERVICES[@]}"; do
   svc_name="$(basename "$svc_path")"
@@ -277,6 +313,7 @@ HEADER "Resumen"
 echo ""
 printf "  %-40s %s\n" "Acción" "$ACTION"
 printf "  %-40s %s\n" "PostgreSQL (VPS nativo)" "$VPS_IP:$PG_PORT"
+printf "  %-40s %s\n" "Liquibase" "nativo en VPS $VPS_IP"
 printf "  %-40s %s\n" "Servicios procesados" "${#SERVICES_OK[@]} OK  /  ${#SERVICES_FAILED[@]} fallidos"
 echo ""
 

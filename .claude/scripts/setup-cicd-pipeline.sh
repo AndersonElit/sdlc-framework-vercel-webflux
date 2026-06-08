@@ -428,7 +428,7 @@ section_4_crear_jobs_jenkins() {
 
   local env_name="${DEPLOY_ENV:-dev}"
   local jobs_script="$PROJECT_ROOT/jenkins-shared-library/bootstrap/create-jobs.groovy"
-  local jenkins_url="${JENKINS_URL:-http://localhost:8080}"
+  local jenkins_url="${JENKINS_URL:-http://${VPS_IP}:8080}"
   local jenkins_user="${JENKINS_USER:-admin}"
   local jenkins_token="${JENKINS_TOKEN:-}"
 
@@ -754,7 +754,7 @@ section_6_verificar_pipeline() {
   local gitea_http
   # El repo se crea privado; sin credenciales Gitea responde 404 al anónimo.
   gitea_http=$(curl -s -o /dev/null -w "%{http_code}" -u "gitea-admin:gitea-admin" \
-    "http://localhost:3000/api/v1/repos/${PROJECT_NAME}/jenkins-shared-library" 2>/dev/null || echo "000")
+    "http://${VPS_IP}:3000/api/v1/repos/${PROJECT_NAME}/jenkins-shared-library" 2>/dev/null || echo "000")
   if [[ "$gitea_http" == "200" ]]; then
     chk_ok "Repositorio jenkins-shared-library accesible en Gitea (HTTP 200)"
   else
@@ -762,37 +762,22 @@ section_6_verificar_pipeline() {
     echo "         → cd jenkins-shared-library && git push -u origin main"
   fi
 
-  # --- 2. Imagen del controller ---
+  # --- 2. Jenkins controller (systemd en VPS) ---
   echo ""
-  log "--- 2. Imagen del controller ---"
-  if docker image inspect "${PROJECT_NAME}-jenkins:latest" &>/dev/null; then
-    chk_ok "Imagen Docker ${PROJECT_NAME}-jenkins:latest existe localmente"
-  else
-    chk_fail "Imagen Docker ${PROJECT_NAME}-jenkins:latest no encontrada"
-  fi
-
-  # --- 3. Jenkins controller corriendo ---
-  echo ""
-  log "--- 3. Jenkins controller ---"
-  if docker ps --filter "name=jenkins-controller" --filter "status=running" \
-       --format "{{.Names}}" 2>/dev/null | grep -q "jenkins-controller"; then
-    chk_ok "Contenedor jenkins-controller está corriendo"
+  log "--- 2. Jenkins controller ---"
+  if ssh_vps "systemctl is-active --quiet jenkins" 2>/dev/null; then
+    chk_ok "jenkins.service activo en VPS ($VPS_IP)"
     local jenkins_http
     jenkins_http=$(curl -s -o /dev/null -w "%{http_code}" \
-      "http://localhost:8080/login" 2>/dev/null || echo "000")
+      "http://${VPS_IP}:8080/login" 2>/dev/null || echo "000")
     if [[ "$jenkins_http" == "200" ]]; then
-      chk_ok "Jenkins UI responde en http://localhost:8080 (HTTP 200)"
+      chk_ok "Jenkins UI responde en http://${VPS_IP}:8080 (HTTP 200)"
     else
-      chk_warn "Jenkins UI en http://localhost:8080 devolvió HTTP $jenkins_http (iniciando aún?)"
+      chk_warn "Jenkins UI en http://${VPS_IP}:8080 devolvió HTTP $jenkins_http (iniciando aún?)"
     fi
   else
-    chk_warn "Contenedor jenkins-controller no está corriendo — iniciarlo con:"
-    echo "         docker run -d --name jenkins-controller \\"
-    echo "           --env-file jenkins-shared-library/docker/.env.jenkins \\"
-    echo "           --network floci-net -p 8080:8080 -p 50000:50000 \\"
-    echo "           -v jenkins_home:/var/jenkins_home \\"
-    echo "           -v \$(pwd)/terraform/backend/environments/dev/.kube/config-k3d-internal:/var/jenkins_home/.kube/config:ro \\"
-    echo "           ${PROJECT_NAME}-jenkins:latest"
+    chk_warn "jenkins.service no está activo en VPS — iniciarlo con:"
+    echo "         ssh ${VPS_USER}@${VPS_IP} sudo systemctl start jenkins"
   fi
 
   # --- 3b. Jobs Jenkins + webhooks Gitea (dev) ---
@@ -800,7 +785,7 @@ section_6_verificar_pipeline() {
     echo ""
     log "--- 3b. Jobs Jenkins + webhooks Gitea ---"
     local job_count
-    job_count=$(curl -s "http://localhost:8080/api/json?tree=jobs[name]" 2>/dev/null \
+    job_count=$(curl -s "http://${VPS_IP}:8080/api/json?tree=jobs[name]" 2>/dev/null \
       | grep -c '"name"' || true)
     if [[ "${job_count:-0}" -gt 0 ]]; then
       chk_ok "$job_count job(s) registrados en Jenkins"
@@ -809,12 +794,12 @@ section_6_verificar_pipeline() {
     fi
     local hooked=0 repo
     for repo in $(curl -s -u gitea-admin:gitea-admin \
-        "http://localhost:3000/api/v1/orgs/${PROJECT_NAME}/repos?limit=100" 2>/dev/null \
+        "http://${VPS_IP}:3000/api/v1/orgs/${PROJECT_NAME}/repos?limit=100" 2>/dev/null \
         | grep -o '"name":"[^"]*"' | cut -d'"' -f4 || true); do
       [[ "$repo" == "jenkins-shared-library" ]] && continue
       local n
       n=$(curl -s -u gitea-admin:gitea-admin \
-        "http://localhost:3000/api/v1/repos/${PROJECT_NAME}/${repo}/hooks" 2>/dev/null \
+        "http://${VPS_IP}:3000/api/v1/repos/${PROJECT_NAME}/${repo}/hooks" 2>/dev/null \
         | grep -c "multibranch-webhook-trigger" || true)
       [[ "${n:-0}" -gt 0 ]] && hooked=$((hooked + 1))
     done

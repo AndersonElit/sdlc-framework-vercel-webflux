@@ -19,7 +19,7 @@
 # Variables de entorno opcionales (anulan los Terraform outputs):
 #   RDS_PORT            Puerto dinámico de PostgreSQL RDS en floci
 #   COGNITO_ISSUER_URI  Endpoint del User Pool de Cognito emulado
-#   FLOCI_ENDPOINT      URL del emulador (default: http://localhost:4566)
+#   FLOCI_ENDPOINT      URL del emulador (default: http://<vps-ip>:4566)
 #   AWS_REGION          Región (default: us-east-1)
 
 set -euo pipefail
@@ -29,11 +29,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 BACKEND_DIR="${REPO_ROOT}/backend"
 TF_DEV_DIR="${REPO_ROOT}/terraform/backend/environments/dev"
-FLOCI_ENDPOINT="${FLOCI_ENDPOINT:-http://localhost:4566}"
+FLOCI_ENDPOINT="${FLOCI_ENDPOINT:-}"   # se fija tras parsear --vps-ip
 AWS_REGION="${AWS_REGION:-us-east-1}"
 SECRET_PREFIX=""   # se deriva de -P/--project: <proyecto>/dev
-
-AWS_CMD="aws --endpoint-url=$FLOCI_ENDPOINT --region $AWS_REGION"
 
 # ── Helpers de log ────────────────────────────────────────────────────────────
 log()      { echo "[$(date '+%H:%M:%S')]     $*"; }
@@ -87,6 +85,8 @@ if [[ ${#MISSING_ARGS[@]} -gt 0 ]]; then
 fi
 
 SECRET_PREFIX="${PROJECT_NAME}/dev"
+FLOCI_ENDPOINT="${FLOCI_ENDPOINT:-http://${VPS_IP}:4566}"
+AWS_CMD="aws --endpoint-url=$FLOCI_ENDPOINT --region $AWS_REGION"
 
 # ── Dependencias ──────────────────────────────────────────────────────────────
 for dep in aws jq terraform; do

@@ -96,19 +96,19 @@ cmd_prereqs() {
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
-echo "[1/9] Actualizando índice apt..."
+echo "[1/10] Actualizando índice apt..."
 sudo apt-get update -qq
 
-echo "[2/9] Paquetes base..."
+echo "[2/10] Paquetes base..."
 sudo apt-get install -y -qq \
   curl wget git jq python3 python3-pip unzip gnupg lsb-release \
   ca-certificates apt-transport-https software-properties-common
 
-echo "[3/9] Java 21 LTS..."
+echo "[3/10] Java 21 LTS..."
 sudo apt-get install -y -qq openjdk-21-jdk
 java -version 2>&1 | head -1
 
-echo "[4/9] Maven 3.9+..."
+echo "[4/10] Maven 3.9+..."
 MAVEN_VERSION="3.9.9"
 if ! mvn --version &>/dev/null 2>&1; then
   wget -qO /tmp/maven.tar.gz \
@@ -120,7 +120,7 @@ if ! mvn --version &>/dev/null 2>&1; then
 fi
 mvn --version | head -1
 
-echo "[5/9] yq..."
+echo "[5/10] yq..."
 YQ_VERSION="v4.44.2"
 if ! yq --version &>/dev/null 2>&1; then
   sudo wget -qO /usr/local/bin/yq \
@@ -129,7 +129,7 @@ if ! yq --version &>/dev/null 2>&1; then
 fi
 yq --version
 
-echo "[6/9] kubectl..."
+echo "[6/10] kubectl..."
 if ! kubectl version --client &>/dev/null 2>&1; then
   KUBECTL_VERSION=$(curl -sL https://dl.k8s.io/release/stable.txt)
   sudo curl -sLo /usr/local/bin/kubectl \
@@ -138,13 +138,13 @@ if ! kubectl version --client &>/dev/null 2>&1; then
 fi
 kubectl version --client --short 2>/dev/null || kubectl version --client
 
-echo "[7/9] Helm..."
+echo "[7/10] Helm..."
 if ! helm version &>/dev/null 2>&1; then
   curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
 fi
 helm version --short
 
-echo "[8/9] Terraform..."
+echo "[8/10] Terraform..."
 if ! terraform version &>/dev/null 2>&1; then
   wget -qO /tmp/tf.zip \
     "$(curl -sL https://releases.hashicorp.com/terraform/index.json \
@@ -155,7 +155,7 @@ if ! terraform version &>/dev/null 2>&1; then
 fi
 terraform version | head -1
 
-echo "[9/9] AWS CLI v2..."
+echo "[9/10] AWS CLI v2..."
 if ! aws --version &>/dev/null 2>&1; then
   curl -sL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
   unzip -q /tmp/awscliv2.zip -d /tmp/
@@ -163,6 +163,18 @@ if ! aws --version &>/dev/null 2>&1; then
   rm -rf /tmp/aws /tmp/awscliv2.zip
 fi
 aws --version
+
+echo "[10/10] Liquibase..."
+LIQUIBASE_VERSION="4.29.2"
+if ! command -v liquibase &>/dev/null; then
+  wget -qO /tmp/liquibase.tar.gz \
+    "https://github.com/liquibase/liquibase/releases/download/v${LIQUIBASE_VERSION}/liquibase-${LIQUIBASE_VERSION}.tar.gz"
+  sudo mkdir -p /opt/liquibase
+  sudo tar -xzf /tmp/liquibase.tar.gz -C /opt/liquibase
+  sudo ln -sfn /opt/liquibase/liquibase /usr/local/bin/liquibase
+  rm /tmp/liquibase.tar.gz
+fi
+liquibase --version 2>&1 | head -1
 
 echo "[OK] Prerequisitos instalados."
 REMOTE
@@ -489,6 +501,21 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now lra-coordinator
 sleep 2
 systemctl is-active lra-coordinator && echo "[OK] LRA Coordinator activo." || echo "[WARN] LRA Coordinator no activo."
+
+# ── 9. PostgreSQL 16 ──────────────────────────────────────────────────────────
+echo "[PostgreSQL] Instalando PostgreSQL 16..."
+if ! command -v psql &>/dev/null; then
+  sudo apt-get install -y -qq postgresql-16 postgresql-contrib-16
+fi
+# Escuchar en todas las interfaces para que los pods K3s accedan vía VPS_IP
+sudo sed -i "s|^#listen_addresses.*|listen_addresses = '*'|" \
+  /etc/postgresql/16/main/postgresql.conf
+# Permitir conexiones desde cualquier IP (autenticación por contraseña)
+echo "host  all  all  0.0.0.0/0  scram-sha-256" \
+  | sudo tee -a /etc/postgresql/16/main/pg_hba.conf > /dev/null
+sudo systemctl enable --now postgresql
+sleep 2
+systemctl is-active postgresql && echo "[OK] PostgreSQL 16 activo." || echo "[WARN] PostgreSQL no activo."
 
 echo ""
 echo "[OK] Todos los servicios instalados en el VPS."

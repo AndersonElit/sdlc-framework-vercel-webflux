@@ -271,28 +271,23 @@ HEADER "9. Verificación de conectividad"
 
 FAILED=()
 
-# ── PostgreSQL (RDS emulado vía puerto dinámico) ──
-RDS_PORT=$(cd "$TF_DEV_DIR" && terraform output -raw rds_port 2>/dev/null || echo "")
-if [[ -n "$RDS_PORT" ]]; then
-  log "PostgreSQL en localhost:$RDS_PORT"
-  if command -v psql &>/dev/null; then
-    if PGPASSWORD=changeme123 psql "postgresql://admin:changeme123@localhost:$RDS_PORT/$PG_DB_NAME" -c '\conninfo' &>/dev/null; then
-      log_ok "PostgreSQL — conexión exitosa en localhost:$RDS_PORT."
-    else
-      log_err "PostgreSQL — falló la conexión en localhost:$RDS_PORT."
-      FAILED+=("PostgreSQL")
-    fi
+# ── PostgreSQL (nativo en VPS :5432) ──
+log "PostgreSQL en $VPS_IP:5432"
+if command -v psql &>/dev/null; then
+  if PGPASSWORD=changeme123 psql "postgresql://admin:changeme123@${VPS_IP}:5432/${PG_DB_NAME}" -c '\conninfo' &>/dev/null; then
+    log_ok "PostgreSQL — conexión exitosa en $VPS_IP:5432."
   else
-    log_warn "psql no instalado; omitiendo verificación PostgreSQL."
+    log_err "PostgreSQL — falló la conexión en $VPS_IP:5432."
+    FAILED+=("PostgreSQL")
   fi
 else
-  log_warn "rds_port no disponible; omitiendo verificación PostgreSQL."
+  log_warn "psql no instalado; omitiendo verificación PostgreSQL."
 fi
 
-# ── MongoDB ──
-log "MongoDB en localhost:27017"
+# ── MongoDB (nativo en VPS :27017) ──
+log "MongoDB en $VPS_IP:27017"
 if command -v mongosh &>/dev/null; then
-  if mongosh "mongodb://localhost:27017" --eval 'db.runCommand({ ping: 1 })' --quiet 2>/dev/null | grep -q '"ok" : 1'; then
+  if mongosh "mongodb://${VPS_IP}:27017" --eval 'db.runCommand({ ping: 1 })' --quiet 2>/dev/null | grep -q '"ok" : 1'; then
     log_ok "MongoDB — ping exitoso."
   else
     log_err "MongoDB — falló el ping."
@@ -302,17 +297,17 @@ else
   log_warn "mongosh no instalado; omitiendo verificación MongoDB."
 fi
 
-# ── Kafka ──
-log "Kafka en localhost:29092"
-if docker exec "$KAFKA_CONTAINER" /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list &>/dev/null; then
-  log_ok "Kafka — respuesta del broker (lista de tópicos vacía esperada)."
+# ── Kafka (systemd en VPS) ──
+log "Kafka en $VPS_IP:9092"
+if ssh_vps "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list" &>/dev/null; then
+  log_ok "Kafka — respuesta del broker (lista de tópicos OK)."
 else
   log_err "Kafka — no responde."
   FAILED+=("Kafka")
 fi
 
 # ── Gitea ──
-if curl -sf http://localhost:3000/api/healthz &>/dev/null; then
+if curl -sf "http://${VPS_IP}:3000/api/healthz" &>/dev/null; then
   log_ok "Gitea — healthz OK."
 else
   log_err "Gitea — healthz falló."
@@ -409,24 +404,24 @@ fi
 rm -f /tmp/floci-health-check.json
 
 # psql conecta
-if [[ -n "$RDS_PORT" ]] && command -v psql &>/dev/null; then
-  if PGPASSWORD=changeme123 psql "postgresql://admin:changeme123@localhost:$RDS_PORT/$PG_DB_NAME" -c '\conninfo' &>/dev/null; then
-    check_item "psql conecta a $PG_DB_NAME en localhost:$RDS_PORT" 0
+if command -v psql &>/dev/null; then
+  if PGPASSWORD=changeme123 psql "postgresql://admin:changeme123@${VPS_IP}:5432/${PG_DB_NAME}" -c '\conninfo' &>/dev/null; then
+    check_item "psql conecta a $PG_DB_NAME en $VPS_IP:5432" 0
   else
-    check_item "psql conecta a $PG_DB_NAME en localhost:$RDS_PORT" 1
+    check_item "psql conecta a $PG_DB_NAME en $VPS_IP:5432" 1
     checklist_ok=1
   fi
 else
-  check_item "psql conecta a $PG_DB_NAME (psql no disponible o rds_port vacío)" 1
+  check_item "psql conecta a $PG_DB_NAME (psql no disponible)" 1
   checklist_ok=1
 fi
 
 # mongosh ping
 if command -v mongosh &>/dev/null; then
-  if mongosh "mongodb://localhost:27017" --eval 'db.runCommand({ ping: 1 })' --quiet 2>/dev/null | grep -q '"ok" : 1'; then
-    check_item "mongosh responde { ok: 1 } al ping" 0
+  if mongosh "mongodb://${VPS_IP}:27017" --eval 'db.runCommand({ ping: 1 })' --quiet 2>/dev/null | grep -q '"ok" : 1'; then
+    check_item "mongosh responde { ok: 1 } al ping en $VPS_IP:27017" 0
   else
-    check_item "mongosh responde { ok: 1 } al ping" 1
+    check_item "mongosh responde { ok: 1 } al ping en $VPS_IP:27017" 1
     checklist_ok=1
   fi
 else
@@ -435,18 +430,18 @@ else
 fi
 
 # kafka responde
-if docker exec "$KAFKA_CONTAINER" /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list &>/dev/null; then
-  check_item "kafka-topics --list responde" 0
+if ssh_vps "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list" &>/dev/null; then
+  check_item "kafka-topics --list responde en $VPS_IP:9092" 0
 else
-  check_item "kafka-topics --list responde" 1
+  check_item "kafka-topics --list responde en $VPS_IP:9092" 1
   checklist_ok=1
 fi
 
 # Gitea healthz OK
-if curl -sf http://localhost:3000/api/healthz &>/dev/null; then
-  check_item "Gitea /api/healthz responde OK" 0
+if curl -sf "http://${VPS_IP}:3000/api/healthz" &>/dev/null; then
+  check_item "Gitea /api/healthz responde OK en $VPS_IP:3000" 0
 else
-  check_item "Gitea /api/healthz responde OK" 1
+  check_item "Gitea /api/healthz responde OK en $VPS_IP:3000" 1
   checklist_ok=1
 fi
 
