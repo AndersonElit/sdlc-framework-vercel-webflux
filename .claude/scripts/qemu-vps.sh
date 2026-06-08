@@ -29,23 +29,25 @@
 #   setup      Paso 4-5: config post-instalación vía SSH (OCI-compatible)
 #   snapshot   Paso 6:   crea snapshot 'base-oci-config'
 #   status     Muestra estado, IP y snapshots de la VM
-#
-# Para eliminar la VM usar: qemu-vps-delete.sh
+#   delete     Destruye VM, snapshots, iptables y disco completamente
 #
 # Opciones:
 #   --vcpus  N      vCPUs              (default: 4)
 #   --ram    N      RAM en MB          (default: 8192)
 #   --disksize S    Tamaño del disco   (default: 120G)
 #   --name   NAME   Nombre de la VM    (default: sdlc-vps)
-#   --vm-ip  IP     IP de la VM        (requerido en setup)
+#   --vm-ip  IP     IP de la VM        (requerido en setup; opcional en delete)
 #   --ssh-key FILE  Clave SSH pública  (default: ~/.ssh/id_ed25519.pub)
 #                   Si no existe:  ssh-keygen -t ed25519 -C "sdlc-vps" -f ~/.ssh/id_ed25519
+#   --force         Omite confirmación interactiva (solo en delete)
 #
 # Ejemplos:
 #   ./qemu-vps.sh create --vcpus 2 --ram 4096 --disksize 60G
 #   ./qemu-vps.sh status
 #   ./qemu-vps.sh setup --vm-ip 192.168.122.50
 #   ./qemu-vps.sh snapshot
+#   ./qemu-vps.sh delete --vm-ip 192.168.122.50
+#   ./qemu-vps.sh delete --vm-ip 192.168.122.50 --force
 
 set -euo pipefail
 
@@ -58,6 +60,7 @@ ok()     { echo -e "${GREEN}[OK]${RESET}    $*"; }
 warn()   { echo -e "${YELLOW}[WARN]${RESET}  $*"; }
 err()    { echo -e "${RED}[ERROR]${RESET} $*" >&2; }
 header() { echo -e "\n${BOLD}${CYAN}══ $* ══${RESET}"; }
+step()   { echo -e "\n${BOLD}[$1]${RESET} $2"; }
 die()    { err "$*"; exit 1; }
 
 # ─── defaults ────────────────────────────────────────────────────────────────
@@ -69,6 +72,7 @@ VM_IP=""
 SSH_KEY="$HOME/.ssh/id_ed25519.pub"
 ISO_PATH="$HOME/vms/iso/ubuntu-26.04-live-server-amd64.iso"
 DISK_DIR="$HOME/vms/disks"
+FORCE=false
 PORTS=(22 80 443 3000 3001 4566 6443 8080 9000 9090 16686)
 
 # ─── parsear argumentos ───────────────────────────────────────────────────────
@@ -83,7 +87,7 @@ while [[ $# -gt 0 ]]; do
     --name)     VM_NAME="$2";  shift 2 ;;
     --vm-ip)    VM_IP="$2";    shift 2 ;;
     --ssh-key)  SSH_KEY="$2";  shift 2 ;;
-    delete) die "Usa el script dedicado: qemu-vps-delete.sh" ;;
+    --force)    FORCE=true;    shift   ;;
     *) die "Opción desconocida: $1" ;;
   esac
 done
@@ -141,18 +145,23 @@ cmd_create() {
   header "Paso 2 — Crear VM con virt-install"
   info "name=$VM_NAME  vcpus=$VCPUS  ram=${RAM}MB  disk=$DISKSIZE"
 
+  # libvirt-qemu necesita permiso de traversal en el home para acceder a ~/vms/
+  if [[ "$(stat -c '%a' "$HOME")" != *[1357]* ]]; then
+    info "Concediendo permiso de traversal a libvirt-qemu en $HOME..."
+    sudo chmod o+x "$HOME"
+  fi
+
   virt-install \
     --name "$VM_NAME" \
     --ram "$RAM" \
     --vcpus "$VCPUS" \
-    --cpu host \
+    --cpu host-model \
     --os-variant ubuntu24.04 \
     --disk "path=${DISK_PATH},format=qcow2,bus=virtio" \
     --cdrom "$ISO_PATH" \
     --network network=default,model=virtio \
     --graphics none \
     --console pty,target_type=serial \
-    --extra-args 'console=ttyS0,115200n8 serial' \
     --noautoconsole \
     --boot cdrom,hd
 
@@ -338,12 +347,103 @@ cmd_status() {
   fi
 }
 
+# ─── COMANDO: delete ──────────────────────────────────────────────────────────
+cmd_delete() {
+  echo -e "${RED}${BOLD}"
+  echo "  ╔══════════════════════════════════════════════════════╗"
+  echo "  ║         ELIMINACIÓN DESTRUCTIVA E IRREVERSIBLE       ║"
+  echo "  ╚══════════════════════════════════════════════════════╝"
+  echo -e "${RESET}"
+  echo -e "  VM:    ${BOLD}${VM_NAME}${RESET}"
+  echo -e "  Disco: ${BOLD}${DISK_PATH}${RESET}"
+  [[ -n "$VM_IP" ]] && echo -e "  IP:    ${BOLD}${VM_IP}${RESET} (se limpiarán reglas iptables)"
+  echo ""
+  warn "Se eliminará: apagado forzado, snapshots, definición libvirt, disco qcow2."
+  [[ -z "$VM_IP" ]] && warn "Sin --vm-ip: las reglas iptables NO se limpiarán automáticamente."
+  echo ""
+
+  if [[ "$FORCE" == false ]]; then
+    read -r -p "  ¿Confirmas? (escribe 'si' para continuar): " confirm
+    [[ "$confirm" == "si" ]] || { info "Operación cancelada."; exit 0; }
+  fi
+
+  echo ""
+
+  step "1/5" "Forzar apagado de la VM"
+  if virsh domstate "$VM_NAME" &>/dev/null; then
+    virsh destroy "$VM_NAME" 2>/dev/null && info "VM detenida." || info "VM ya estaba apagada."
+  else
+    warn "La VM '$VM_NAME' no existe en libvirt — continuando limpieza."
+  fi
+
+  step "2/5" "Eliminar snapshots"
+  mapfile -t SNAPS < <(virsh snapshot-list "$VM_NAME" --name 2>/dev/null || true)
+  if [[ ${#SNAPS[@]} -eq 0 ]]; then
+    info "Sin snapshots."
+  else
+    for snap in "${SNAPS[@]}"; do
+      [[ -z "$snap" ]] && continue
+      virsh snapshot-delete "$VM_NAME" --snapshotname "$snap"
+      ok "Snapshot eliminado: $snap"
+    done
+  fi
+
+  step "3/5" "Desregistrar VM de libvirt (--remove-all-storage)"
+  virsh undefine "$VM_NAME" \
+    --remove-all-storage \
+    --snapshots-metadata \
+    --nvram 2>/dev/null \
+    && ok "VM desregistrada." \
+    || warn "No se pudo desregistrar (¿ya no existía?)."
+
+  step "4/5" "Limpiar reglas iptables"
+  if [[ -n "$VM_IP" ]]; then
+    info "Eliminando port-forwarding para $VM_IP (puertos: ${PORTS[*]})..."
+    for PORT in "${PORTS[@]}"; do
+      sudo iptables -t nat -D PREROUTING -p tcp --dport "$PORT" -j DNAT \
+        --to-destination "${VM_IP}:${PORT}" 2>/dev/null || true
+      sudo iptables -D FORWARD -p tcp -d "$VM_IP" --dport "$PORT" -j ACCEPT 2>/dev/null || true
+    done
+    sudo netfilter-persistent save
+    ok "Reglas iptables eliminadas."
+  else
+    warn "Sin --vm-ip: iptables no modificado."
+    warn "Limpieza manual:  sudo iptables -t nat -L --line-numbers"
+  fi
+
+  step "5/5" "Eliminar disco qcow2 si quedó huérfano"
+  if [[ -f "$DISK_PATH" ]]; then
+    rm -f "$DISK_PATH"
+    ok "Disco eliminado: $DISK_PATH"
+  else
+    info "Disco no encontrado (ya fue eliminado por --remove-all-storage)."
+  fi
+
+  echo ""
+  echo -e "${BOLD}── Verificación ──────────────────────────────────────────${RESET}"
+  virsh list --all 2>/dev/null | grep "$VM_NAME" \
+    && warn "La VM aún aparece en virsh list" \
+    || ok  "VM ausente de virsh list"
+
+  [[ -f "$DISK_PATH" ]] \
+    && warn "Disco aún existe: $DISK_PATH" \
+    || ok  "Disco ausente: $DISK_PATH"
+
+  virsh snapshot-list "$VM_NAME" 2>/dev/null \
+    && warn "Aún hay snapshots registrados" \
+    || ok  "Sin snapshots registrados"
+
+  echo ""
+  ok "Eliminación completa de '${VM_NAME}'."
+}
+
 # ─── dispatcher ───────────────────────────────────────────────────────────────
 case "$COMMAND" in
   create)   cmd_create   ;;
   setup)    cmd_setup    ;;
   snapshot) cmd_snapshot ;;
   status)   cmd_status   ;;
+  delete)   cmd_delete   ;;
   help|--help|-h) cmd_help ;;
   *) err "Comando desconocido: $COMMAND"; echo ""; cmd_help; exit 1 ;;
 esac
