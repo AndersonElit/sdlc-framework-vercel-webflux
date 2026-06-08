@@ -34,7 +34,7 @@
 #   5. Detecta servicios en backend/ y crea una BD MongoDB por cada uno
 #      que use el adaptador driven/mongo, con usuario de solo lectura/escritura
 #      restringido a esa BD
-#   6. Crea BD de reportería (<prefix>_reporting) para report_schema_catalog
+#   6. Crea BDs de reportería (<prefix>_reporting, <prefix>_readmodel) vacías
 #   7. Checklist de criterios de aceptación
 # ===========================================================================
 
@@ -226,8 +226,7 @@ create_pg_db() {
   fi
 
   env $pg_env psql -d "$db_name" -c "GRANT ALL ON SCHEMA public TO \"$APP_USER\"" &>/dev/null
-  env $pg_env psql -d "$db_name" -c "CREATE EXTENSION IF NOT EXISTS pgcrypto" &>/dev/null
-  log_ok "  $db_name — permisos y pgcrypto listos."
+  log_ok "  $db_name — permisos listos."
   PG_DBS_CREATED+=("$db_name")
 }
 
@@ -272,16 +271,7 @@ if [[ "$HAS_REPORTING" -eq 1 ]]; then
 
   log "  BD catálogo de schemas: $REPORTING_DB"
   create_pg_db "$REPORTING_DB"
-  PGPASSWORD=changeme123 psql "$PGADMIN/$REPORTING_DB" -v ON_ERROR_STOP=1 <<'SQL'
-CREATE TABLE IF NOT EXISTS report_schema_catalog (
-  report_type      TEXT PRIMARY KEY,
-  schema_version   TEXT        NOT NULL,
-  columns          JSONB       NOT NULL,
-  integrity_rules  JSONB       NOT NULL DEFAULT '[]'::jsonb,
-  updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-SQL
-  log_ok "BD $REPORTING_DB + tabla report_schema_catalog lista."
+  log_ok "BD $REPORTING_DB lista (schema se aplica vía Liquibase)."
 
   # BD del read model CQRS (PostgreSQL relacional).
   # El Projection Service proyecta eventos de dominio (Kafka) sobre tablas
@@ -385,14 +375,9 @@ for db_name in "${PG_DBS_CREATED[@]}"; do
   DB_OWNER=$(PGPASSWORD=changeme123 psql "$PGADMIN/postgres" \
     -tc "SELECT pg_catalog.pg_get_userbyid(datdba) FROM pg_database WHERE datname='$db_name'" \
     2>/dev/null | tr -d '[:space:]')
-  EXT_OK=$(PGPASSWORD=changeme123 psql "$PGADMIN/$db_name" \
-    -tc "SELECT 1 FROM pg_extension WHERE extname='pgcrypto'" 2>/dev/null | tr -d '[:space:]')
   [[ "$DB_OWNER" == "$APP_USER" ]] \
     && check_item "BD $db_name (owner=$APP_USER)" 0 \
     || check_item "BD $db_name — owner incorrecto o no existe" 1
-  [[ "$EXT_OK" == "1" ]] \
-    && check_item "  pgcrypto habilitada en $db_name" 0 \
-    || check_item "  pgcrypto NO habilitada en $db_name" 1
 done
 
 [[ ${#PG_DBS_CREATED[@]} -eq 0 ]] && \

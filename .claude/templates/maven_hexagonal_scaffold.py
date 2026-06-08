@@ -1410,14 +1410,18 @@ public class CompensationController {{
 
 
 def write_liquibase_structure(root: Path, project_name: str, pg_db_prefix: str,
-                               outbox: bool, saga_participant: bool) -> None:
-    """Genera db/<project_name>/changelog/ en la raíz del repo (Liquibase standalone).
+                               outbox: bool, saga_participant: bool,
+                               migrations_dir: str = "") -> None:
+    """Genera <migrations_dir>/<project_name>/changelog/ (Liquibase standalone).
 
     Flyway requiere JDBC bloqueante — incompatible con servicios R2DBC. Liquibase corre
-    como proceso independiente (Docker) antes del despliegue; no va en el classpath del JAR.
-    root = Path(project_name), cwd = backend/ → db/ vive en ../../db/ = REPO_ROOT/db/.
+    como proceso independiente antes del despliegue; no va en el classpath del JAR.
+    Si migrations_dir está vacío usa REPO_ROOT/db/ (root.parent.parent / "db").
     """
-    db_svc_dir = root.parent.parent / "db" / project_name
+    if migrations_dir:
+        db_svc_dir = Path(migrations_dir) / project_name
+    else:
+        db_svc_dir = root.parent.parent / "db" / project_name
     changelog_dir = db_svc_dir / "changelog"
     changelog_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1507,7 +1511,8 @@ def write_liquibase_structure(root: Path, project_name: str, pg_db_prefix: str,
 
 def scaffold(project_name: str, database: str, messaging_system: str, port: int = 8080,
              org: str = "myproject", outbox: bool = False, saga_participant: bool = False,
-             pg_db_prefix: str = "", mongo_db_prefix: str = "") -> None:
+             pg_db_prefix: str = "", mongo_db_prefix: str = "",
+             migrations_dir: str = "") -> None:
     safe_name = project_name.replace("-", "")
     root = Path(project_name)
     logger.info("Creando proyecto: %s (db=%s, messaging=%s, port=%d, outbox=%s, saga_participant=%s)",
@@ -1651,7 +1656,8 @@ public class ApplicationConfig {{
     if saga_participant:
         create_compensation_controller(root, safe_name)
     if database.lower() != "mongo":
-        write_liquibase_structure(root, project_name, pg_db_prefix, outbox, saga_participant)
+        write_liquibase_structure(root, project_name, pg_db_prefix, outbox, saga_participant,
+                                  migrations_dir=migrations_dir)
 
     secrets_dir = root / "scripts"
     secrets_dir.mkdir(parents=True, exist_ok=True)
@@ -1942,6 +1948,9 @@ def main() -> None:
     parser.add_argument("--saga-participant", action="store_true",
                         help="Marca el servicio como participante de una saga: genera el "
                              "endpoint de compensación idempotente y la tabla processed_message.")
+    parser.add_argument("--migrations-dir", default="", metavar="PATH",
+                        help="Ruta absoluta al repositorio de migraciones Liquibase. "
+                             "Si se omite, los changelogs se generan en <repo_root>/db/.")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Mostrar logs detallados (DEBUG)")
 
@@ -1958,7 +1967,8 @@ def main() -> None:
     try:
         scaffold(args.service_name, args.database, args.messaging_system, args.port, args.org,
                  outbox=args.outbox, saga_participant=args.saga_participant,
-                 pg_db_prefix=args.pg_db, mongo_db_prefix=args.mongo_db)
+                 pg_db_prefix=args.pg_db, mongo_db_prefix=args.mongo_db,
+                 migrations_dir=args.migrations_dir)
     except OSError as e:
         logger.error("No se pudo crear el proyecto: %s", e)
         sys.exit(1)

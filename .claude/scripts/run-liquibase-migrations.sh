@@ -23,6 +23,10 @@
 #   --vps-ip         IP       IP del VPS donde corren Liquibase y PostgreSQL (obligatorio)
 #   --vps-user       USER     Usuario SSH del VPS   (default: ubuntu)
 #   --vps-ssh-key    FILE     Clave SSH privada      (default: ~/.ssh/id_ed25519)
+#   --db-dir         PATH     Ruta local al repo de migraciones ya clonado
+#                             (default: <repo_root>/db/ del propio proyecto)
+#   --gitea-clone             Clona automáticamente <project>-migrations desde Gitea
+#                             (http://<vps-ip>:3000/<project>/<project>-migrations)
 #   -s, --service    SLUG     Procesar solo este servicio (ej: clientes-service)
 #   -a, --action     ACCION   update (default) | rollback | status | validate
 #   -h, --help                Muestra esta ayuda
@@ -52,6 +56,7 @@ HEADER() { echo -e "\n${BOLD}━━━ $* ━━━${RESET}"; }
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 DB_DIR="$REPO_ROOT/db"
+EXTERNAL_DB_DIR=""
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 0. Parámetros
@@ -65,6 +70,7 @@ VPS_USER="${VPS_USER:-ubuntu}"
 VPS_SSH_KEY="${VPS_SSH_KEY:-$HOME/.ssh/id_ed25519}"
 FILTER_SERVICE=""
 ACTION="update"
+GITEA_CLONE=0
 
 usage() {
   sed -n '9,18p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
@@ -83,6 +89,9 @@ while [[ $# -gt 0 ]]; do
     --vps-ssh-key)   VPS_SSH_KEY="$2";     shift 2 ;;
     -s|--service)    FILTER_SERVICE="$2";  shift 2 ;;
     -a|--action)     ACTION="$2";          shift 2 ;;
+    --db-dir)        EXTERNAL_DB_DIR="$2"; shift 2 ;;
+    --db-dir=*)      EXTERNAL_DB_DIR="${1#*=}"; shift ;;
+    --gitea-clone)   GITEA_CLONE=1; shift ;;
     -h|--help)       usage 0 ;;
     *) log_err "Opción desconocida: $1"; usage 1 ;;
   esac
@@ -104,6 +113,26 @@ case "$ACTION" in
   update|rollback|status|validate) ;;
   *) log_err "Acción no soportada: '$ACTION'. Opciones: update, rollback, status, validate"; exit 1 ;;
 esac
+
+# Resolver DB_DIR: --db-dir > --gitea-clone > default ($REPO_ROOT/db)
+if [[ -n "$EXTERNAL_DB_DIR" ]]; then
+  DB_DIR="$EXTERNAL_DB_DIR"
+elif [[ "$GITEA_CLONE" -eq 1 ]]; then
+  GITEA_MIGRATIONS_REPO="${PROJECT_NAME}-migrations"
+  GITEA_CLONE_URL="http://gitea-admin:gitea-admin@${VPS_IP}:3000/${PROJECT_NAME}/${GITEA_MIGRATIONS_REPO}.git"
+  GITEA_LOCAL_DIR="/tmp/${PROJECT_NAME}-migrations-$$"
+  log "Clonando repo de migraciones desde Gitea..."
+  log "  URL: http://${VPS_IP}:3000/${PROJECT_NAME}/${GITEA_MIGRATIONS_REPO}"
+  if git clone "$GITEA_CLONE_URL" "$GITEA_LOCAL_DIR" 2>&1; then
+    log_ok "Repo clonado en $GITEA_LOCAL_DIR"
+    DB_DIR="$GITEA_LOCAL_DIR"
+    # Registrar limpieza al salir
+    trap 'rm -rf "$GITEA_LOCAL_DIR"' EXIT
+  else
+    log_err "No se pudo clonar desde Gitea. Verifica que el repo ${PROJECT_NAME}/${GITEA_MIGRATIONS_REPO} exista."
+    exit 1
+  fi
+fi
 
 ssh_vps() {
   ssh -i "$VPS_SSH_KEY" -o StrictHostKeyChecking=no -o ConnectTimeout=15 \

@@ -93,6 +93,7 @@ MONGO_DB_NAME=""
 DB_USER=""
 DB_PASSWORD=""
 VPS_IP=""
+MIGRATIONS_REPO=""
 
 usage() {
   cat <<EOF
@@ -132,6 +133,12 @@ Uso: $0 -P <proyecto> --backend nombre:db:messaging:puerto [--backend ...] \
   --bc-tags   Par servicio=BC-XX (opcional, repetible).
               Mapea un servicio PostgreSQL a su tag en el schema.sql para
               generar el changelog Liquibase inicial (00001_initial_schema.yaml).
+
+  --migrations-repo PATH  (opcional)
+              Ruta local donde se generan los changelogs Liquibase antes del push.
+              Si se omite: se usa <repo_root>/db/.
+              En ambos casos se crea el repo <project>-migrations en Gitea (VPS_IP:3000)
+              y se hace push automático del schema inicial.
 
   --report-extraction <svc>:<source>:<topic-out>   (opcional, repetible)
               Genera el report-extraction-service (MS1, Spark) con scala_hexagonal_scaffold.py
@@ -383,6 +390,14 @@ while [[ $# -gt 0 ]]; do
       VPS_IP="${1#*=}"
       shift
       ;;
+    --migrations-repo)
+      MIGRATIONS_REPO="${2:?--migrations-repo requiere una ruta}"
+      shift 2
+      ;;
+    --migrations-repo=*)
+      MIGRATIONS_REPO="${1#*=}"
+      shift
+      ;;
     -h|--help)
       usage
       ;;
@@ -407,6 +422,8 @@ if [[ ${#MISSING_ARGS[@]} -gt 0 ]]; then
   log_err "Ejecute con --help para ver la ayuda."
   exit 1
 fi
+
+MIGRATIONS_REPO_DIR="${MIGRATIONS_REPO:-$REPO_ROOT/db}"
 
 log "Servicios backend: ${#BACKEND_SERVICES[@]} definidos."
 if [[ "$HAS_FRONTEND" -eq 1 ]]; then
@@ -494,6 +511,7 @@ for svc_spec in "${BACKEND_SERVICES[@]}"; do
   if (cd "$BACKEND_DIR" && python3 "$MAVEN_TEMPLATE" -n "$name" -d "$db" -m "$messaging" -p "$port" \
         --org "$PROJECT_NAME" \
         --pg-db "$PG_DB_NAME" --mongo-db "$MONGO_DB_NAME" \
+        --migrations-dir "$MIGRATIONS_REPO_DIR" \
         "${EXTRA_FLAGS[@]}"); then
     log_ok "$name generado."
   else
@@ -656,7 +674,7 @@ if [[ "${#BC_TAGS[@]}" -gt 0 ]]; then
   else
     for SERVICE in "${!BC_TAGS[@]}"; do
       TAG="${BC_TAGS[$SERVICE]}"
-      CHANGELOG_DIR="$REPO_ROOT/db/$SERVICE/changelog"
+      CHANGELOG_DIR="$MIGRATIONS_REPO_DIR/$SERVICE/changelog"
       CHANGELOG_FILE="$CHANGELOG_DIR/00001_initial_schema.yaml"
 
       BLOCK=$(awk -v tag="-- $TAG:" '
@@ -704,7 +722,7 @@ fi
 # ──────────────────────────────────────────────────────────────────────────────
 HEADER "6. seguridad-service — generando 00002_seed_roles.yaml"
 
-SEGURIDAD_CHANGELOG_DIR="$REPO_ROOT/db/seguridad-service/changelog"
+SEGURIDAD_CHANGELOG_DIR="$MIGRATIONS_REPO_DIR/seguridad-service/changelog"
 V2_FILE="$SEGURIDAD_CHANGELOG_DIR/00002_seed_roles.yaml"
 
 if [[ -d "$BACKEND_DIR/seguridad-service" ]]; then
@@ -794,6 +812,90 @@ else
 fi
 
 # ──────────────────────────────────────────────────────────────────────────────
+# 6b. Gitea — crear repo de migraciones y hacer push de los changelogs
+# ──────────────────────────────────────────────────────────────────────────────
+# El repo se crea bajo la org del proyecto en Gitea (VPS_IP:3000).
+# Nombre del repo: <PROJECT_NAME>-migrations
+# Se ejecuta siempre que se hayan generado changelogs (--bc-tags presentes).
+# ──────────────────────────────────────────────────────────────────────────────
+if [[ "${#BC_TAGS[@]}" -gt 0 ]]; then
+  HEADER "6b. Gitea — creando repo de migraciones (${VPS_IP}:3000)"
+
+  GITEA_API="http://${VPS_IP}:3000/api/v1"
+  GITEA_AUTH="gitea-admin:gitea-admin"
+  GITEA_MIGRATIONS_REPO="${PROJECT_NAME}-migrations"
+  GITEA_REPO_URL="http://gitea-admin:gitea-admin@${VPS_IP}:3000/${PROJECT_NAME}/${GITEA_MIGRATIONS_REPO}.git"
+
+  # Verificar disponibilidad de Gitea
+  GITEA_READY=0
+  for _i in 1 2 3; do
+    if curl -sf "http://${VPS_IP}:3000/api/healthz" &>/dev/null; then
+      GITEA_READY=1; break
+    fi
+    sleep 3
+  done
+
+  if [[ "$GITEA_READY" -eq 0 ]]; then
+    log_warn "Gitea no responde en ${VPS_IP}:3000 — repo de migraciones NO creado."
+    log_warn "Ejecuta manualmente cuando Gitea esté disponible:"
+    log_warn "  curl -u gitea-admin:gitea-admin -X POST http://${VPS_IP}:3000/api/v1/orgs/${PROJECT_NAME}/repos \\"
+    log_warn "    -H 'Content-Type: application/json' \\"
+    log_warn "    -d '{\"name\":\"${GITEA_MIGRATIONS_REPO}\",\"private\":false,\"auto_init\":false}'"
+  else
+    log_ok "Gitea disponible en ${VPS_IP}:3000"
+
+    # Crear repo en Gitea bajo la org del proyecto (idempotente)
+    HTTP_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" \
+      -u "$GITEA_AUTH" -X POST "$GITEA_API/orgs/${PROJECT_NAME}/repos" \
+      -H "Content-Type: application/json" \
+      -d "{\"name\":\"${GITEA_MIGRATIONS_REPO}\",\"description\":\"Changelogs Liquibase — ${PROJECT_NAME}\",\"private\":false,\"auto_init\":false}" \
+      2>/dev/null || echo "000")
+
+    if [[ "$HTTP_STATUS" == "201" ]]; then
+      log_ok "Repo ${PROJECT_NAME}/${GITEA_MIGRATIONS_REPO} creado en Gitea."
+    elif [[ "$HTTP_STATUS" == "409" ]]; then
+      log "Repo ${PROJECT_NAME}/${GITEA_MIGRATIONS_REPO} ya existe en Gitea — continuando."
+    else
+      log_warn "No se pudo crear el repo en Gitea (HTTP $HTTP_STATUS) — se omite el push."
+      GITEA_READY=0
+    fi
+  fi
+
+  if [[ "$GITEA_READY" -eq 1 ]]; then
+    mkdir -p "$MIGRATIONS_REPO_DIR"
+
+    if [[ ! -d "$MIGRATIONS_REPO_DIR/.git" ]]; then
+      git -C "$MIGRATIONS_REPO_DIR" init -b main
+      log_ok "git init en $MIGRATIONS_REPO_DIR"
+    fi
+
+    git -C "$MIGRATIONS_REPO_DIR" add .
+    if ! git -C "$MIGRATIONS_REPO_DIR" diff --cached --quiet 2>/dev/null; then
+      git -C "$MIGRATIONS_REPO_DIR" \
+        -c user.email="scaffold@${PROJECT_NAME}" \
+        -c user.name="scaffold" \
+        commit -m "feat: initial schema — ${PROJECT_NAME}
+
+Changelogs Liquibase generados por scaffold-all-services.sh"
+      log_ok "Commit inicial creado."
+    fi
+
+    # Agregar o actualizar remote origin
+    if git -C "$MIGRATIONS_REPO_DIR" remote get-url origin &>/dev/null; then
+      git -C "$MIGRATIONS_REPO_DIR" remote set-url origin "$GITEA_REPO_URL"
+    else
+      git -C "$MIGRATIONS_REPO_DIR" remote add origin "$GITEA_REPO_URL"
+    fi
+
+    if git -C "$MIGRATIONS_REPO_DIR" push -u origin main 2>&1; then
+      log_ok "Changelogs publicados en http://${VPS_IP}:3000/${PROJECT_NAME}/${GITEA_MIGRATIONS_REPO}"
+    else
+      log_warn "Push falló — verifica credenciales Gitea o conectividad al VPS."
+    fi
+  fi
+fi
+
+# ──────────────────────────────────────────────────────────────────────────────
 # 7. Checklist de verificación
 # ──────────────────────────────────────────────────────────────────────────────
 HEADER "7. Checklist de verificación"
@@ -830,8 +932,8 @@ fi
 # Verificar changelogs Liquibase iniciales
 if [[ "${#BC_TAGS[@]}" -gt 0 ]]; then
   for SERVICE in "${!BC_TAGS[@]}"; do
-    CL="$REPO_ROOT/db/$SERVICE/changelog/00001_initial_schema.yaml"
-    PROPS="$REPO_ROOT/db/$SERVICE/liquibase.properties"
+    CL="$MIGRATIONS_REPO_DIR/$SERVICE/changelog/00001_initial_schema.yaml"
+    PROPS="$MIGRATIONS_REPO_DIR/$SERVICE/liquibase.properties"
     [[ -f "$CL" ]]    && check_item "$SERVICE — db/$SERVICE/changelog/00001_initial_schema.yaml existe" 0 \
                        || check_item "$SERVICE — db/$SERVICE/changelog/00001_initial_schema.yaml existe" 1
     [[ -f "$PROPS" ]] && check_item "$SERVICE — db/$SERVICE/liquibase.properties existe" 0 \
@@ -841,7 +943,7 @@ fi
 
 # Verificar 00002_seed_roles.yaml de seguridad-service
 if [[ -d "$BACKEND_DIR/seguridad-service" ]]; then
-  V2="$REPO_ROOT/db/seguridad-service/changelog/00002_seed_roles.yaml"
+  V2="$MIGRATIONS_REPO_DIR/seguridad-service/changelog/00002_seed_roles.yaml"
   [[ -f "$V2" ]] && check_item "seguridad-service — db/seguridad-service/changelog/00002_seed_roles.yaml existe" 0 \
                   || check_item "seguridad-service — db/seguridad-service/changelog/00002_seed_roles.yaml existe" 1
 fi
@@ -862,7 +964,7 @@ else
   printf "  %-35s %s\n" "Frontend" "omitido"
 fi
 if [[ "${#BC_TAGS[@]}" -gt 0 ]]; then
-  printf "  %-35s %s\n" "Changelogs Liquibase (00001)" "${#BC_TAGS[@]} servicios en db/"
+  printf "  %-35s %s\n" "Changelogs Liquibase (00001)" "${#BC_TAGS[@]} servicios en $MIGRATIONS_REPO_DIR"
 else
   printf "  %-35s %s\n" "Changelogs Liquibase (00001)" "omitidos (sin --bc-tags)"
 fi

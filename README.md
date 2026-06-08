@@ -183,13 +183,13 @@ Los planes generados en el paso 7 referencian scripts ejecutables en `.claude/sc
 | `base-infrastructure-builder.sh` | Genera el árbol Terraform multi-ambiente, verifica servicios en VPS vía SSH, descarga kubeconfig K3s, genera Helm chart del frontend (K3s + Traefik) | `-P`, `--vps-ip` |
 | `init-dev-environment.sh` | Terraform apply sobre floci en VPS, verifica K3s y ArgoCD, muestra tabla de endpoints del VPS | `-P`, `--vps-ip` |
 | `init-databases.sh` | Crea usuario y bases en PostgreSQL 16 nativo y MongoDB 7 nativo del VPS | `-P`, `--vps-ip`, `-p`, `-m`, `-u`, `-w` |
-| `run-liquibase-migrations.sh` | Aplica changelogs Liquibase contra PostgreSQL nativo del VPS (via imagen Docker local) | `-P`, `--vps-ip`, `-p`, `-u`, `-w` |
+| `run-liquibase-migrations.sh` | Aplica changelogs Liquibase contra PostgreSQL nativo del VPS; `--gitea-clone` clona el repo `<proyecto>-migrations` desde Gitea automáticamente; `--db-dir` acepta un clon local | `-P`, `--vps-ip`, `-p`, `-u`, `-w`, `[--gitea-clone\|--db-dir]` |
 
 ### Scripts de scaffold y CI/CD
 
 | Script | Propósito | Parámetros clave |
 |--------|-----------|-----------------|
-| `scaffold-all-services.sh` | Scaffolding de microservicios (Maven hexagonal) y frontend (Next.js), changelogs Liquibase, secrets y push a Gitea en VPS | `-P`, `--vps-ip`, `--backend`, `--frontend`, `-p`, `-m`, `-u`, `-w` |
+| `scaffold-all-services.sh` | Scaffolding de microservicios (Maven hexagonal) y frontend (Next.js), changelogs Liquibase, crea repo `<proyecto>-migrations` en Gitea del VPS y hace push del schema inicial, secrets | `-P`, `--vps-ip`, `--backend`, `--frontend`, `-p`, `-m`, `-u`, `-w`, `[--migrations-repo]` |
 | `jenkins-shared-library-builder.sh` | Genera la Shared Library de Jenkins (vars/, pods, JCasC, Dockerfile del controller) | `-P`, `--vps-ip`, `-o` |
 | `setup-cicd-pipeline.sh` | Configura el pipeline CI/CD: shared library, imagen controller → Gitea registry, bootstrap K3s, jobs multibranch, webhooks Gitea, ArgoCD bootstrap | `-P`, `-S`, `--vps-ip`, `-F` |
 | `setup-observability.sh` | Instala stack de observabilidad (Prometheus, Grafana, Jaeger, OTEL, Loki, Fluent Bit) en K3s del VPS via Helm | `-P` |
@@ -381,7 +381,7 @@ Se propaga por todo el pipeline: el ADC (sección 13) declara tipos de reporte/f
 | Capa serverless de formatos | `report_lambdas_scaffold.py --org <proyecto> --formats pdf,xls,csv` (lambdas + Terraform EventBridge) |
 | Orquestación | `scaffold-all-services.sh` con `--report-extraction`, `--report-processing`, `--report-types`, `--report-formats` y `--vps-ip` |
 | Infraestructura VPS | `base-infrastructure-builder.sh` crea el bucket S3, los topics `report.*` y el bus EventBridge en floci del VPS (`VPS_IP:4566`). Omitir con `ENABLE_REPORTING=0`; solo serverless con `ENABLE_REPORTING_SERVERLESS=0` |
-| Catálogo de esquemas | `init-databases.sh --vps-ip` crea la tabla opcional `report_schema_catalog` en PostgreSQL nativo del VPS |
+| Catálogo de esquemas | `init-databases.sh --vps-ip` crea la BD `<prefijo>_reporting` vacía; el schema de `report_schema_catalog` lo aplica Liquibase vía `run-liquibase-migrations.sh --gitea-clone` |
 | Secretos | `create-all-secrets-dev.sh --vps-ip` crea el secret `<proyecto>/dev/reporting` (S3/floci `VPS_IP:4566`, Kafka `VPS_IP:29092`, EventBridge) |
 | CI/CD | Steps `assembleSparkService` (fat JAR Spark + Kaniko → Gitea registry) y `deployReportingLambdas` (Terraform con `TF_VAR_aws_endpoint_url=http://VPS_IP:4566`) en la shared library |
 
