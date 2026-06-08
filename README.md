@@ -181,6 +181,159 @@ Los planes generados en el paso 7 referencian scripts ejecutables en `.claude/sc
 
 ---
 
+## VPS Local con QEMU/KVM (`qemu-vps.sh`)
+
+El script `.claude/scripts/qemu-vps.sh` automatiza la creación y gestión de una VM Ubuntu que replica el entorno de un servidor OCI/cloud real, útil para validar despliegues antes de subir a producción.
+
+### Prerrequisitos (una sola vez)
+
+```bash
+# 1. Verificar soporte de virtualización en el CPU (debe ser > 0)
+egrep -c '(vmx|svm)' /proc/cpuinfo
+
+# 2. Instalar QEMU/KVM y herramientas de gestión
+sudo apt update
+sudo apt install -y qemu-system-x86 qemu-utils libvirt-daemon-system \
+  libvirt-clients virtinst bridge-utils cpu-checker iptables-persistent
+sudo kvm-ok
+sudo usermod -aG libvirt,kvm $USER
+newgrp libvirt
+
+# 3. Descargar ISO Ubuntu 26.04 LTS
+mkdir -p ~/vms/iso
+wget -P ~/vms/iso https://releases.ubuntu.com/26.04/ubuntu-26.04-live-server-amd64.iso
+wget -P ~/vms/iso https://releases.ubuntu.com/26.04/SHA256SUMS
+cd ~/vms/iso && sha256sum -c SHA256SUMS --ignore-missing
+```
+
+### Crear un VPS local paso a paso
+
+**Paso 1 — Crear el disco y la VM**
+
+```bash
+# Valores por defecto: 4 vCPUs, 8 GB RAM, disco 60 GB, nombre "sdlc-vps"
+.claude/scripts/qemu-vps.sh create
+
+# O con valores personalizados
+.claude/scripts/qemu-vps.sh create --vcpus 2 --ram 4096 --disksize 40G --name mi-vps
+```
+
+**Paso 2 — Instalar Ubuntu (manual vía consola serial)**
+
+```bash
+virsh console sdlc-vps
+# Sigue el instalador de Ubuntu: idioma, teclado, red, particionado mínimo,
+# usuario "ubuntu" con contraseña temporal, instalar OpenSSH server.
+# Al terminar: sudo poweroff  →  Ctrl+] para salir de la consola.
+```
+
+**Paso 3 — Arrancar la VM e identificar su IP**
+
+```bash
+virsh start sdlc-vps
+.claude/scripts/qemu-vps.sh status     # muestra IP, estado y snapshots
+```
+
+**Paso 4 — Configuración post-instalación (OCI-compatible)**
+
+```bash
+# El script copia tu clave SSH y ejecuta la configuración en la VM:
+# SSH key-only, sudo NOPASSWD, hostname, UTC, NTP, UFW, cloud-init NoCloud,
+# vm.max_map_count, límites nofile, consola serial persistente.
+.claude/scripts/qemu-vps.sh setup --vm-ip 192.168.122.50
+
+# Si tu clave pública no está en ~/.ssh/id_ed25519.pub:
+.claude/scripts/qemu-vps.sh setup --vm-ip 192.168.122.50 --ssh-key ~/.ssh/id_rsa.pub
+```
+
+**Paso 5 — Crear snapshot de la imagen base**
+
+```bash
+# Guarda el estado limpio como "base-oci-config" para restaurar en cualquier momento
+.claude/scripts/qemu-vps.sh snapshot
+```
+
+Para restaurar al estado base en el futuro:
+```bash
+virsh snapshot-revert sdlc-vps base-oci-config
+```
+
+### Otras operaciones
+
+**Ver estado completo de la VM**
+
+```bash
+.claude/scripts/qemu-vps.sh status
+# Muestra: estado, vCPUs/RAM, IP asignada, snapshots y tamaño del disco
+```
+
+**Conectarse por SSH**
+
+```bash
+ssh ubuntu@$(virsh domifaddr sdlc-vps | awk '/ipv4/{print $4}' | cut -d/ -f1)
+# o bien la IP que muestra "status"
+```
+
+**Apagar / arrancar manualmente**
+
+```bash
+virsh shutdown sdlc-vps   # apagado limpio (ACPI)
+virsh start    sdlc-vps   # arranque
+virsh suspend  sdlc-vps   # suspender (pausa, libera CPU)
+virsh resume   sdlc-vps   # reanudar
+```
+
+**Eliminar la VM completamente**
+
+```bash
+# Con confirmación interactiva (escribe "si" para confirmar)
+.claude/scripts/qemu-vps.sh delete --vm-ip 192.168.122.50
+
+# Sin confirmación (ideal para scripts)
+.claude/scripts/qemu-vps.sh delete --vm-ip 192.168.122.50 --force
+```
+
+El comando `delete` realiza en orden: apagado forzado → eliminación de snapshots → desregistro de libvirt + borrado del disco qcow2 → limpieza de reglas iptables → verificación final.
+
+### Referencia de comandos y opciones
+
+| Comando | Descripción |
+|---------|-------------|
+| `create` | Crea el disco qcow2 y define la VM en libvirt (pasos 1-2) |
+| `setup` | Configuración post-instalación OCI-compatible + port-forwarding iptables (pasos 4-5) |
+| `snapshot` | Crea el snapshot `base-oci-config` con la imagen limpia (paso 6) |
+| `status` | Muestra estado, IP, snapshots y tamaño del disco |
+| `delete` | Destruye la VM, snapshots, definición libvirt, disco y reglas iptables |
+| `help` | Muestra la ayuda del script |
+
+| Opción | Por defecto | Descripción |
+|--------|-------------|-------------|
+| `--vcpus N` | `4` | Número de vCPUs |
+| `--ram N` | `8192` | RAM en MB |
+| `--disksize S` | `60G` | Tamaño del disco (p. ej. `40G`, `120G`) |
+| `--name NAME` | `sdlc-vps` | Nombre de la VM en libvirt |
+| `--vm-ip IP` | _(autodetectado)_ | IP de la VM (requerido en `setup`; opcional en `delete`) |
+| `--ssh-key FILE` | `~/.ssh/id_ed25519.pub` | Ruta a la clave SSH pública |
+| `--force` | `false` | Omite confirmación interactiva (solo en `delete`) |
+
+### Puertos habilitados por defecto
+
+El script configura UFW en la VM y port-forwarding en el host para los siguientes puertos:
+
+| Puerto | Servicio |
+|--------|----------|
+| 22 | SSH |
+| 80 / 443 | HTTP / HTTPS |
+| 3000 / 3001 | Frontend / dev server |
+| 4566 | LocalStack (floci) |
+| 6443 | Kubernetes API (K3d) |
+| 8080 | Jenkins / app backend |
+| 9000 | SonarQube |
+| 9090 | Prometheus |
+| 16686 | Jaeger UI |
+
+---
+
 ## Integración con Sistemas Externos (Apache Camel) y Transacciones Distribuidas (Saga)
 
 El framework soporta, de forma **opt-in y trazable end-to-end**, dos capacidades para arquitecturas de microservicios:
