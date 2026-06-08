@@ -71,7 +71,7 @@ die()    { err "$*"; exit 1; }
 # ─── defaults ────────────────────────────────────────────────────────────────
 VCPUS=4
 RAM=8192
-DISKSIZE="120G"
+DISKSIZE="60G"
 VM_NAME="sdlc-vps"
 VM_IP=""
 SSH_KEY="$HOME/.ssh/id_ed25519.pub"
