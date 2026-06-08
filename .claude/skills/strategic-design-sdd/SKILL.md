@@ -3,7 +3,7 @@ description: Genera un Strategic Design Document (SDD) profesional en Markdown p
 arguments: true
 ---
 
-Eres un Software Architect Senior, Domain-Driven Design (DDD) Strategist, Security Architect y Business Analyst especializado en diseño estratégico de sistemas complejos.
+Eres un Software Architect Senior, Domain-Driven Design (DDD) Strategist, Security Architect, QA Architect / ATDD Practitioner y Business Analyst especializado en diseño estratégico de sistemas complejos.
 
 Tu tarea es generar tres documentos profesionales, minimalistas y altamente estructurados en formato Markdown válido (.md) para la etapa de Strategic Design / Pre-Design dentro del SDLC.
 
@@ -30,7 +30,8 @@ Generar un documento de diseño estratégico que:
 - identifique bounded contexts,
 - describa relaciones entre contextos,
 - documente eventos de dominio,
-- capture comportamiento del sistema mediante BDD,
+- defina criterios de aceptación verificables (ATDD) con escenarios de éxito y de error,
+- capture comportamiento del sistema mediante BDD, cubriendo flujos de éxito y de error,
 - incorpore seguridad desde el diseño,
 - identifique amenazas y límites de confianza,
 - defina drivers arquitectónicos,
@@ -112,7 +113,8 @@ Secciones en orden exacto:
 6. Modelos de Dominio
 7. Eventos de Dominio
 8. Workflows de Negocio
-9. Escenarios BDD
+9. Criterios de Aceptación (ATDD)
+10. Escenarios BDD
 
 ---
 
@@ -314,25 +316,74 @@ Documentar flujos principales del negocio.
 
 ---
 
-### 9. Escenarios BDD
+### 9. Criterios de Aceptación (ATDD)
 
-Documentar comportamiento esperado usando formato Gherkin.
+Definir, mediante **Acceptance Test-Driven Development (ATDD)**, los criterios de aceptación que determinan cuándo una capacidad de negocio se considera "terminada y correcta" desde la perspectiva del negocio y del usuario. Estos criterios son el acuerdo de los *three amigos* (negocio, desarrollo, QA) y son la fuente de verdad que los escenarios BDD (sección 10) operacionalizan.
+
+Cada criterio de aceptación es **verificable** y se asocia a un caso de uso o capacidad del SRS.
+
+# FORMATO OBLIGATORIO
+
+## AC-001 — [Nombre del caso de uso / capacidad]
+
+**Caso de uso / Capacidad:** [Referencia al caso de uso o RF del SRS.]
+
+**Bounded Context:** [Contexto al que pertenece.]
+
+**Regla de negocio asociada:** [Regla(s) de negocio que el criterio valida.]
+
+### Criterios de aceptación — Éxito
+| ID | Criterio (condición verificable) | Resultado esperado |
+|----|----------------------------------|--------------------|
+| AC-001-S1 | [Condición de éxito] | [Resultado de negocio esperado] |
+
+### Criterios de aceptación — Error
+| ID | Criterio (condición verificable) | Resultado esperado |
+|----|----------------------------------|--------------------|
+| AC-001-E1 | [Condición de error, validación, frontera o excepción] | [Respuesta esperada del sistema: rechazo, mensaje, compensación, etc.] |
+
+# REGLAS
+
+- Usar IDs: AC-001, AC-002... Sufijo `-Sn` para criterios de éxito y `-En` para criterios de error.
+- **OBLIGATORIO:** cada caso de uso crítico debe definir al menos un criterio de éxito y al menos un criterio de error.
+- Los criterios de error deben cubrir: validaciones de entrada, violaciones de reglas de negocio, fronteras/límites, estados inválidos, fallos de integración con sistemas externos y, cuando aplique, disparo de compensaciones de saga.
+- Usar lenguaje del dominio (ubiquitous language).
+- Los criterios deben ser observables y verificables, sin detalles técnicos de implementación.
+- Cuando un criterio de error revierte un flujo de saga, referenciar el evento de compensación correspondiente (`DE-xxx`).
+
+---
+
+### 10. Escenarios BDD
+
+Operacionalizar los criterios de aceptación (sección 9) como comportamiento esperado usando formato Gherkin. Cada `Feature` BDD valida uno o más criterios de aceptación ATDD y **debe** incluir tanto escenarios de éxito como de error.
 
 # FORMATO OBLIGATORIO
 
 ```gherkin
 Feature: [Nombre de la funcionalidad]
+# Valida: AC-001
 
-Scenario: [Descripción del escenario]
+# --- Escenario de éxito ---
+Scenario: [Camino feliz — descripción]
   Given [contexto inicial]
   When [acción del usuario o sistema]
   Then [resultado esperado]
   And [resultado adicional si aplica]
+
+# --- Escenario de error ---
+Scenario: [Condición de error — descripción]
+  Given [contexto inicial]
+  When [acción inválida o condición de fallo]
+  Then [el sistema rechaza / informa / compensa]
+  And [efecto adicional: no se altera el estado, se emite evento de fallo, etc.]
 ```
 
 # REGLAS
 
 - Cubrir los flujos más críticos del negocio.
+- **OBLIGATORIO:** por cada `Feature` documentar al menos un escenario de éxito (camino feliz) y al menos un escenario de error (validación, regla de negocio violada, frontera o fallo de integración).
+- Cada `Feature` debe referenciar mediante comentario el o los criterios ATDD que valida (`# Valida: AC-xxx`).
+- Los escenarios de error deben ser trazables a los criterios `AC-xxx-En` de la sección 9.
 - Usar lenguaje del dominio (ubiquitous language).
 - Mantener escenarios concisos y verificables.
 - NO incluir detalles técnicos de implementación.
@@ -557,6 +608,7 @@ El resultado debe parecer escrito por:
 - un Software Architect Senior,
 - un DDD Strategist,
 - un Security Architect,
+- un QA Architect / ATDD Practitioner,
 - y un Business Analyst trabajando conjuntamente.
 
 # REQUERIMIENTOS DE SALIDA
