@@ -122,7 +122,7 @@ Secciones en orden exacto:
 
 ## Documento 2 — SDD-[proyecto]-design.md
 
-Contiene el diseño técnico detallado: APIs, persistencia, flujos y seguridad.
+Contiene el diseño técnico detallado: APIs, persistencia, flujos, seguridad y trazabilidad de pruebas.
 
 Secciones en orden exacto:
 
@@ -130,6 +130,7 @@ Secciones en orden exacto:
 2. Diseño de Persistencia
 3. Flujos Técnicos Principales
 4. Diseño de Seguridad Técnica
+5. Especificación de Pruebas (ATDD)
 
 ---
 
@@ -489,6 +490,44 @@ Definir:
 
 ---
 
+### 5. Especificación de Pruebas (ATDD)
+
+Trazar cada criterio de aceptación del Strategic Design (AC-xxx) hacia los tipos de prueba técnica y los contratos verificables en implementación. Esta sección garantiza que cada criterio ATDD sea ejecutable como prueba en el pipeline de CI/CD.
+
+# CONTENIDO OBLIGATORIO
+
+## Matriz de trazabilidad AC → Prueba técnica
+
+Tabla con columnas:
+
+| Criterio ATDD | Tipo de prueba | Componente bajo prueba | Escenarios técnicos clave | Gate de aceptación |
+
+Derivar las filas a partir de los criterios AC-xxx-Sn (éxito) y AC-xxx-En (error) del Strategic Design.
+
+**Para cada criterio incluir:**
+- **Tipo de prueba:** `Unit` / `Integration` / `Contract` / `E2E` / `Carga`; puede ser combinado.
+- **Componente bajo prueba:** microservicio(s) involucrado(s), sus dependencias y protocolo de comunicación (REST, Kafka, JDBC).
+- **Escenarios técnicos clave:** las condiciones concretas a verificar, expresadas en términos técnicos coherentes con el stack (nombres de tablas, eventos Kafka, estados de BD, códigos HTTP).
+- **Gate de aceptación:** criterio observable y verificable que marca el test como exitoso.
+
+## Estrategia de prueba por capa
+
+Tabla que documente herramientas y alcance por capa de prueba según el stack definido en `system.md`.
+
+## Convención de nombrado de tests de integración
+
+Indicar que los tests de integración que validan criterios ATDD deben incluir el ID del criterio (AC-xxx-Sn / AC-xxx-En) en `@DisplayName` o en el nombre del método, para trazabilidad directa en el reporte de CI.
+
+# REGLAS
+
+- Derivar las filas de la matriz exclusivamente de los criterios AC-xxx del Strategic Design — no inventar criterios nuevos.
+- Los escenarios técnicos deben usar el lenguaje del stack (`pagofacil_readmodel`, `processed_message`, `saga_instance`, etc.) pero sin detalles de implementación interna de los métodos.
+- Los criterios de error (AC-xxx-En) que involucren compensaciones de saga deben referenciar el evento de compensación (`DE-xxx`) correspondiente.
+- Cada criterio AC-xxx debe aparecer en al menos una fila.
+- NO generar código de tests; solo especificación de qué verificar, con qué herramienta y cuál es el gate.
+
+---
+
 ## Documento 3 — Infraestructura y Gobernanza
 
 ### 1. Infraestructura y Deployment
@@ -736,7 +775,9 @@ Del Strategic Design extrae:
 - entidades y aggregates del dominio,
 - eventos de dominio relevantes,
 - workflows de negocio principales,
-- lenguaje ubicuo establecido.
+- lenguaje ubicuo establecido,
+- criterios de aceptación ATDD (AC-xxx) con sus criterios de éxito (AC-xxx-Sn) y de error (AC-xxx-En),
+- escenarios BDD con los identificadores `# Valida: AC-xxx` asociados.
 
 ### Del documento de seguridad (`security.md`):
 - modelo de identidad y autenticación,
