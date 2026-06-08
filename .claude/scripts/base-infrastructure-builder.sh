@@ -10,25 +10,38 @@ log_err() { echo "[$(date '+%H:%M:%S')] ERR $*" >&2; }
 # Argumentos
 # ---------------------------------------------------------------------------
 PROJECT_NAME=""
+VPS_IP=""
+VPS_USER="${VPS_USER:-ubuntu}"
+VPS_SSH_KEY="${VPS_SSH_KEY:-$HOME/.ssh/id_ed25519}"
+
 usage() {
   cat <<USAGE
-Uso: $0 -P <proyecto>
+Uso: $0 -P <proyecto> --vps-ip <IP> [OPCIONES]
 
   -P, --project NOMBRE   Slug del proyecto en minúsculas (p. ej. 'mibanco').
-                         Nombra el cluster K3d (<proyecto>-dev), su registry,
-                         la organización Gitea, el contenedor Kafka, la base
-                         PostgreSQL de dev (<proyecto>_dev) y los recursos
-                         emitidos en el árbol Terraform. (obligatorio)
+                         Nombra el cluster K3s, la organización Gitea, los
+                         recursos Terraform y el registry de imágenes. (obligatorio)
                          Recomendado: solo [a-z0-9-]; sin guiones para máxima
                          compatibilidad con nombres de base de datos.
+
+  --vps-ip IP            IP del VPS Ubuntu 26.04 LTS donde corren los servicios
+                         systemd (MongoDB, Kafka, Gitea, SonarQube, Jenkins, etc.)
+                         Previamente configurado con vps-setup.sh. (obligatorio)
+
+  --vps-user USER        Usuario SSH del VPS  (default: ubuntu, o \$VPS_USER)
+  --vps-ssh-key FILE     Clave SSH privada    (default: ~/.ssh/id_ed25519, o \$VPS_SSH_KEY)
 USAGE
   exit "${1:-0}"
 }
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -P|--project) PROJECT_NAME="${2:-}"; shift 2 ;;
-    --project=*)  PROJECT_NAME="${1#*=}"; shift ;;
-    -h|--help)    usage 0 ;;
+    -P|--project)    PROJECT_NAME="${2:-}"; shift 2 ;;
+    --project=*)     PROJECT_NAME="${1#*=}"; shift ;;
+    --vps-ip)        VPS_IP="${2:-}"; shift 2 ;;
+    --vps-ip=*)      VPS_IP="${1#*=}"; shift ;;
+    --vps-user)      VPS_USER="${2:-}"; shift 2 ;;
+    --vps-ssh-key)   VPS_SSH_KEY="${2:-}"; shift 2 ;;
+    -h|--help)       usage 0 ;;
     *) log_err "Argumento desconocido: $1"; usage 1 ;;
   esac
 done
@@ -36,10 +49,18 @@ if [[ -z "$PROJECT_NAME" ]]; then
   log_err "Falta el parámetro obligatorio -P/--project."
   usage 1
 fi
+if [[ -z "$VPS_IP" ]]; then
+  log_err "Falta el parámetro obligatorio --vps-ip."
+  usage 1
+fi
 
-log "Iniciando floci-start (proyecto: $PROJECT_NAME)..."
+# Helper SSH al VPS
+ssh_vps() { ssh -i "$VPS_SSH_KEY" -o StrictHostKeyChecking=no -o ConnectTimeout=15 \
+              -o BatchMode=yes "${VPS_USER}@${VPS_IP}" "$@"; }
 
-log "Verificando dependencias..."
+log "Iniciando base-infrastructure-builder (proyecto: $PROJECT_NAME, VPS: $VPS_IP)..."
+
+log "Verificando dependencias locales..."
 check_cmd() {
   if command -v "$1" &>/dev/null; then
     log_ok "$1 encontrado ($(command -v "$1"))."
@@ -48,151 +69,89 @@ check_cmd() {
     exit 1
   fi
 }
-check_cmd docker
 check_cmd terraform
-check_cmd k3d
 check_cmd kubectl
 
-# El prune de Docker de más abajo borraría los contenedores del cluster K3d, pero
-# dejaría a k3d con estado inconsistente (cluster "fantasma"). Lo eliminamos limpio
-# primero para poder recrearlo desde cero.
-log "Eliminando cluster K3d previo (si existe)..."
-k3d cluster delete "${PROJECT_NAME}-dev" &>/dev/null && log_ok "Cluster K3d ${PROJECT_NAME}-dev eliminado." || log "No había cluster K3d previo."
-k3d registry delete "k3d-${PROJECT_NAME}-registry" &>/dev/null || true
+log "Verificando conectividad SSH al VPS ($VPS_IP)..."
+ssh_vps "echo OK" &>/dev/null \
+  || { log_err "No se puede conectar al VPS $VPS_IP via SSH. Verifica la IP y la clave $VPS_SSH_KEY"; exit 1; }
+log_ok "VPS $VPS_IP accesible via SSH."
 
-log "Deteniendo contenedores activos..."
-if docker ps -aq | grep -q .; then
-  docker stop $(docker ps -aq) && log_ok "Contenedores detenidos."
+# ---------------------------------------------------------------------------
+# Verificar servicios en VPS (instalados previamente con vps-setup.sh)
+# ---------------------------------------------------------------------------
+log "Verificando servicios systemd en el VPS ($VPS_IP)..."
+SERVICES_OK=true
+for svc in mongod kafka gitea jenkins; do
+  if ssh_vps "systemctl is-active --quiet '$svc'" 2>/dev/null; then
+    log_ok "$svc activo en el VPS."
+  else
+    log_err "$svc NO está activo en el VPS. Ejecuta primero: vps-setup.sh services --vm-ip $VPS_IP"
+    SERVICES_OK=false
+  fi
+done
+[[ "$SERVICES_OK" == true ]] || exit 1
+
+log "Verificando floci en el VPS ($VPS_IP)..."
+if ssh_vps "curl -sf http://localhost:4566/_localstack/health" &>/dev/null; then
+  log_ok "floci activo en VPS ($VPS_IP:4566)."
 else
-  log "No hay contenedores activos."
+  log "floci no activo — iniciando en VPS..."
+  ssh_vps "floci start 2>/dev/null || docker start floci 2>/dev/null || true"
+  sleep 5
+  ssh_vps "curl -sf http://localhost:4566/_localstack/health" &>/dev/null \
+    && log_ok "floci iniciado." \
+    || { log_err "No se pudo iniciar floci en el VPS. Ejecuta: vps-setup.sh floci --vm-ip $VPS_IP"; exit 1; }
 fi
 
-log "Eliminando contenedores..."
-if docker ps -aq | grep -q .; then
-  docker rm $(docker ps -aq) && log_ok "Contenedores eliminados."
+# ---------------------------------------------------------------------------
+# MongoDB — verificar servicio systemd en VPS
+# Corre como servicio nativo (mongod.service) en el VPS (vps-setup.sh services).
+# Accesible desde microservicios vía $VPS_IP:27017.
+# ---------------------------------------------------------------------------
+log "Verificando MongoDB en VPS ($VPS_IP:27017)..."
+if ssh_vps "systemctl is-active --quiet mongod" 2>/dev/null; then
+  log_ok "MongoDB activo en VPS ($VPS_IP:27017)."
 else
-  log "No hay contenedores para eliminar."
+  log "Iniciando MongoDB en VPS..."
+  ssh_vps "sudo systemctl start mongod"
+  log_ok "MongoDB iniciado."
 fi
 
-log "Eliminando imágenes..."
-if docker images -aq | grep -q .; then
-  docker rmi $(docker images -aq) && log_ok "Imágenes eliminadas."
+# ---------------------------------------------------------------------------
+# Apache Kafka — verificar servicio systemd en VPS (KRaft, sin ZooKeeper)
+# Listeners: INTERNAL ($VPS_IP:9092) para microservicios, EXTERNAL ($VPS_IP:29092) CLI.
+# El módulo terraform/backend/modules/msk queda reservado para staging/prod (AWS real).
+# ---------------------------------------------------------------------------
+log "Verificando Apache Kafka en VPS ($VPS_IP:9092)..."
+if ssh_vps "systemctl is-active --quiet kafka" 2>/dev/null; then
+  log_ok "Kafka activo en VPS ($VPS_IP:9092 / $VPS_IP:29092)."
 else
-  log "No hay imágenes para eliminar."
+  log "Iniciando Kafka en VPS..."
+  ssh_vps "sudo systemctl start kafka"
+  log_ok "Kafka iniciado."
 fi
 
-log "Creando red Docker floci-net..."
-if docker network inspect floci-net &>/dev/null; then
-  log "Red floci-net ya existe."
-else
-  docker network create floci-net
-  log_ok "Red floci-net creada."
-fi
-
-log "Levantando contenedor floci..."
-docker run -d \
-  --name floci \
-  --network floci-net \
-  -p 4566:4566 \
-  -p 5000-5099:5000-5099 \
-  -p 5101-6499:5101-6499 \
-  -p 6501-8000:6501-8000 \
-  -v /var/run/docker.sock:/var/run/docker.sock \
-  --add-host=host.docker.internal:host-gateway \
-  -e DOCKER_NETWORK=floci-net \
-  floci/floci:latest
-
-log_ok "Floci listo."
-
 # ---------------------------------------------------------------------------
-# MongoDB (dev local)
-# Floci EC2 no soporta launch templates ni autoscaling groups, y sus "instancias"
-# son contenedores Docker sin systemd/yum/EBS, por lo que el módulo mongodb (EC2)
-# no puede arrancar mongod en floci. Para dev se levanta un contenedor mongo:7 real
-# en :27017 — el mismo enfoque con que floci respalda internamente RDS y MSK.
-# El módulo terraform/backend/modules/mongodb queda reservado para staging/prod (AWS real).
-# El volumen floci-mongo-data sobrevive a los reinicios (docker rm no elimina volúmenes).
-# ---------------------------------------------------------------------------
-log "Levantando contenedor MongoDB (dev)..."
-docker run -d \
-  --name floci-mongo \
-  --network floci-net \
-  -p 27017:27017 \
-  -v floci-mongo-data:/data/db \
-  mongo:7
-log_ok "MongoDB listo (interno floci-mongo:27017 / host localhost:27017)."
-
-# ---------------------------------------------------------------------------
-# Apache Kafka (dev local, KRaft)
-# Floci (community) deja el cluster MSK en estado CREATING indefinidamente y, peor,
-# el provider de AWS crashea al leerlo (nil pointer en kafka/cluster.go), por lo que
-# el recurso aws_msk_cluster es inviable en dev. En su lugar se levanta un broker
-# Apache Kafka real en modo KRaft (sin ZooKeeper) en la red floci-net, igual que el
-# contenedor mongo:7. El módulo terraform/backend/modules/msk queda desactivado en
-# dev (enabled=false) y reservado para staging/prod (AWS real).
-#
-# Doble listener para cubrir ambos consumidores:
-#   - INTERNAL (<proyecto>-kafka-dev:9092) → microservicios como contenedores en floci-net.
-#   - EXTERNAL (localhost:29092)            → herramientas/CLI desde el host.
-# ---------------------------------------------------------------------------
-log "Levantando contenedor Apache Kafka (dev, KRaft)..."
-docker run -d \
-  --name "${PROJECT_NAME}-kafka-dev" \
-  --network floci-net \
-  -p 29092:29092 \
-  -e KAFKA_NODE_ID=1 \
-  -e KAFKA_PROCESS_ROLES=broker,controller \
-  -e KAFKA_LISTENERS=INTERNAL://0.0.0.0:9092,EXTERNAL://0.0.0.0:29092,CONTROLLER://0.0.0.0:9093 \
-  -e KAFKA_ADVERTISED_LISTENERS=INTERNAL://${PROJECT_NAME}-kafka-dev:9092,EXTERNAL://localhost:29092 \
-  -e KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT \
-  -e KAFKA_INTER_BROKER_LISTENER_NAME=INTERNAL \
-  -e KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER \
-  -e KAFKA_CONTROLLER_QUORUM_VOTERS=1@localhost:9093 \
-  -e KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1 \
-  -e KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1 \
-  -e KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1 \
-  -e KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS=0 \
-  apache/kafka:3.7.0
-log_ok "Apache Kafka listo (interno ${PROJECT_NAME}-kafka-dev:9092 / host localhost:29092)."
-
-# ---------------------------------------------------------------------------
-# Soporte de Saga (orquestación) e integración (Camel):
-#   - Coordinador Narayana LRA  → respalda el Saga EIP de Camel del integration-service.
-#   - WireMock                  → simula los sistemas externos en las pruebas de integración
-#                                 (contract tests de las rutas Camel de salida).
-# Se levantan por defecto; para omitirlos en proyectos sin saga: ENABLE_SAGA=0.
+# Soporte de Saga (LRA) y contrato (WireMock) — servicios systemd en VPS
 # ---------------------------------------------------------------------------
 ENABLE_SAGA="${ENABLE_SAGA:-1}"
 if [[ "$ENABLE_SAGA" == "1" ]]; then
-  LRA_CONTAINER="${PROJECT_NAME}-lra-coordinator"
-  log "Levantando coordinador Narayana LRA (saga)..."
-  if docker inspect "$LRA_CONTAINER" &>/dev/null; then
-    log "Coordinador LRA ya existe ($LRA_CONTAINER)."
+  log "Verificando Narayana LRA Coordinator en VPS ($VPS_IP:50000)..."
+  if ssh_vps "systemctl is-active --quiet lra-coordinator" 2>/dev/null; then
+    log_ok "LRA Coordinator activo en VPS ($VPS_IP:50000)."
   else
-    docker run -d \
-      --name "$LRA_CONTAINER" \
-      --network floci-net \
-      --restart unless-stopped \
-      -p 50000:8080 \
-      quay.io/jbosstm/lra-coordinator:latest >/dev/null
-    log_ok "Coordinador LRA listo (interno ${LRA_CONTAINER}:8080/lra-coordinator / host localhost:50000)."
+    ssh_vps "sudo systemctl start lra-coordinator" && log_ok "LRA Coordinator iniciado." || true
   fi
 
-  WIREMOCK_CONTAINER="${PROJECT_NAME}-wiremock"
-  log "Levantando WireMock (simulador de sistemas externos)..."
-  if docker inspect "$WIREMOCK_CONTAINER" &>/dev/null; then
-    log "WireMock ya existe ($WIREMOCK_CONTAINER)."
+  log "Verificando WireMock en VPS ($VPS_IP:9999)..."
+  if ssh_vps "systemctl is-active --quiet wiremock" 2>/dev/null; then
+    log_ok "WireMock activo en VPS ($VPS_IP:9999)."
   else
-    docker run -d \
-      --name "$WIREMOCK_CONTAINER" \
-      --network floci-net \
-      --restart unless-stopped \
-      -p 9999:8080 \
-      wiremock/wiremock:3.9.1 >/dev/null
-    log_ok "WireMock listo (interno ${WIREMOCK_CONTAINER}:8080 / host localhost:9999)."
+    ssh_vps "sudo systemctl start wiremock" && log_ok "WireMock iniciado." || true
   fi
 else
-  log "ENABLE_SAGA=0 — se omiten el coordinador LRA y WireMock."
+  log "ENABLE_SAGA=0 — se omiten LRA Coordinator y WireMock."
 fi
 
 # ---------------------------------------------------------------------------
@@ -255,62 +214,35 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Gitea (servidor Git local para dev)
-# Reemplaza GitHub/GitLab para los repos internos del proyecto: microservicios
-# y jenkins-shared-library. El SDLC principal permanece en GitHub.
-#
-# Acceso desde floci-net (Jenkins, ArgoCD, pods k3s) → http://gitea:3000
-# Acceso desde el host                                → http://localhost:3000
-# SSH desde el host                                   → localhost:2222
-#
-# SQLite como backend (sin BD adicional en dev).
-# El volumen gitea-data persiste repos, usuarios y configuración entre reinicios.
+# Gitea — verificar servicio systemd en VPS
+# Acceso: http://$VPS_IP:3000 (HTTP) / $VPS_IP:2222 (SSH)
+# Package Registry OCI disponible en: http://$VPS_IP:3000/$PROJECT_NAME
 # ---------------------------------------------------------------------------
-log "Levantando contenedor Gitea (servidor Git local)..."
-docker run -d \
-  --name gitea \
-  --network floci-net \
-  -p 3000:3000 \
-  -p 2222:22 \
-  -v gitea-data:/data \
-  -e GITEA__security__INSTALL_LOCK=true \
-  -e GITEA__database__DB_TYPE=sqlite3 \
-  -e GITEA__server__ROOT_URL=http://gitea:3000/ \
-  -e GITEA__server__HTTP_PORT=3000 \
-  -e GITEA__server__SSH_PORT=2222 \
-  -e GITEA__server__SSH_LISTEN_PORT=22 \
-  -e GITEA__log__MODE=console \
-  -e GITEA__log__LEVEL=warn \
-  gitea/gitea:1.22
+log "Verificando Gitea en VPS ($VPS_IP:3000)..."
+if ssh_vps "systemctl is-active --quiet gitea" 2>/dev/null; then
+  log_ok "Gitea activo en VPS."
+else
+  log "Iniciando Gitea en VPS..."
+  ssh_vps "sudo systemctl start gitea"
+  sleep 5
+fi
 
 log "Esperando que Gitea esté listo..."
 GITEA_READY=0
 for i in $(seq 1 30); do
-  if curl -sf http://localhost:3000/api/healthz &>/dev/null; then
+  if curl -sf "http://${VPS_IP}:3000/api/healthz" &>/dev/null; then
     GITEA_READY=1
     break
   fi
   sleep 2
 done
 if [[ "$GITEA_READY" -eq 0 ]]; then
-  log_err "Gitea no respondió en 60 s. Revisar logs con: docker logs gitea"
+  log_err "Gitea no respondió en 60 s. SSH al VPS y ejecuta: sudo systemctl status gitea"
   exit 1
 fi
 
-log "Creando usuario admin en Gitea..."
-# IMPORTANTE: 'docker exec' entra como root y Gitea aborta con
-# "[F] Gitea is not supposed to be run as root". Hay que correr el CLI
-# como el usuario 'git' del contenedor, si no el usuario admin nunca se crea.
-docker exec -u git gitea gitea admin user create \
-  --username gitea-admin \
-  --password gitea-admin \
-  --email "admin@${PROJECT_NAME}.local" \
-  --admin \
-  --must-change-password=false 2>/dev/null \
-  && log_ok "Usuario gitea-admin creado." \
-  || log "Usuario gitea-admin ya existe (o se omitió la creación)."
-
-GITEA_API="http://localhost:3000/api/v1"
+log "Verificando usuario admin en Gitea..."
+GITEA_API="http://${VPS_IP}:3000/api/v1"
 GITEA_AUTH="gitea-admin:gitea-admin"
 
 # Verificar que la autenticación realmente funcione antes de seguir.
@@ -330,11 +262,10 @@ curl -sf -u "$GITEA_AUTH" -X POST "$GITEA_API/orgs" \
   || log "Organización $PROJECT_NAME ya existe."
 
 log_ok "Gitea listo."
-log "  UI:           http://localhost:3000"
-log "  Credenciales: gitea-admin / gitea-admin"
-log "  Organización: $PROJECT_NAME"
-log "  Los repositorios se crean bajo esta organización a medida que se generan"
-log "  los servicios con los scripts de scaffold y jenkins-shared-library-builder.sh"
+log "  UI:                http://${VPS_IP}:3000"
+log "  Credenciales:      gitea-admin / gitea-admin"
+log "  Organización:      $PROJECT_NAME"
+log "  Package Registry:  http://${VPS_IP}:3000/${PROJECT_NAME}  (OCI/Docker nativo)"
 
 # ---------------------------------------------------------------------------
 # Estructura base de Terraform (frontend / backend desacoplados)
@@ -392,44 +323,27 @@ mkdir -p \
 KUBE_DIR="$TF_BACKEND/environments/dev/.kube"
 
 # ---------------------------------------------------------------------------
-# SonarQube (quality gate del pipeline CI en dev).
-# Se levanta ANTES del cluster K3d para que k3d lo inyecte en CoreDNS como
-# miembro de floci-net; así los agentes (pods) resuelven http://<name>:9000
-# al correr `mvn sonar:sonar`. La URL + token se persisten en .sonar-env para
-# que setup-cicd-pipeline.sh los cargue en .env.jenkins sin intervención manual.
-# El bloque es no-fatal: si SonarQube falla, la infra sigue y Sonar queda pendiente.
+# SonarQube — verificar servicio systemd en VPS
+# URL externa: http://$VPS_IP:9000
+# La URL + token se persisten en .sonar-env para setup-cicd-pipeline.sh.
 # ---------------------------------------------------------------------------
-SONAR_CONTAINER="${PROJECT_NAME}-sonarqube"
-SONAR_URL_INTERNAL="http://${SONAR_CONTAINER}:9000"   # desde floci-net (agentes K3d)
+SONAR_URL_EXTERNAL="http://${VPS_IP}:9000"
 SONAR_ADMIN_PASS="sonar-admin-dev"
 SONAR_ENV_FILE="$TF_BACKEND/environments/dev/.sonar-env"
 
-log "Verificando vm.max_map_count (requerido por Elasticsearch de SonarQube)..."
-CURRENT_MMC=$(sysctl -n vm.max_map_count 2>/dev/null || echo 0)
-if [[ "$CURRENT_MMC" -lt 262144 ]]; then
-  if sudo -n sysctl -w vm.max_map_count=262144 &>/dev/null; then
-    log_ok "vm.max_map_count elevado a 262144."
-  else
-    log "vm.max_map_count=$CURRENT_MMC (< 262144) y no se pudo elevar sin sudo."
-    log "  SonarQube arranca igual (SONAR_ES_BOOTSTRAP_CHECKS_DISABLE=true), pero si"
-    log "  crashea, ejecutá: sudo sysctl -w vm.max_map_count=262144"
-  fi
+log "Verificando SonarQube en VPS ($VPS_IP:9000)..."
+if ssh_vps "systemctl is-active --quiet sonarqube" 2>/dev/null; then
+  log_ok "SonarQube activo en VPS."
 else
-  log_ok "vm.max_map_count=$CURRENT_MMC (>= 262144)."
+  log "Iniciando SonarQube en VPS..."
+  ssh_vps "sudo systemctl start sonarqube"
 fi
-
-log "Levantando contenedor SonarQube (dev)..."
-docker run -d \
-  --name "$SONAR_CONTAINER" \
-  --network floci-net \
-  -p 9000:9000 \
-  -e SONAR_ES_BOOTSTRAP_CHECKS_DISABLE=true \
-  sonarqube:lts-community >/dev/null
 
 log "Esperando que SonarQube esté listo (puede tardar 1-2 min)..."
 SONAR_READY=0
 for _ in $(seq 1 90); do
-  status=$(curl -s http://localhost:9000/api/system/status 2>/dev/null | grep -o '"status":"[A-Z]*"' | cut -d'"' -f4 || true)
+  status=$(curl -s "${SONAR_URL_EXTERNAL}/api/system/status" 2>/dev/null \
+    | grep -o '"status":"[A-Z]*"' | cut -d'"' -f4 || true)
   if [[ "$status" == "UP" ]]; then
     SONAR_READY=1
     break
@@ -438,223 +352,209 @@ for _ in $(seq 1 90); do
 done
 
 if [[ "$SONAR_READY" -eq 0 ]]; then
-  log_err "SonarQube no respondió UP (~4.5 min). Revisá: docker logs $SONAR_CONTAINER"
+  log_err "SonarQube no respondió UP en $VPS_IP:9000. SSH al VPS: sudo systemctl status sonarqube"
   log_err "  La infra continúa; SONAR_URL/SONAR_TOKEN quedarán pendientes en .env.jenkins."
 else
-  log_ok "SonarQube listo (interno $SONAR_URL_INTERNAL / host http://localhost:9000)."
-  # Cambiar password admin (admin/admin → fijo de dev). Fresh container cada run.
+  log_ok "SonarQube listo en $SONAR_URL_EXTERNAL."
   curl -s -u admin:admin -X POST \
-    "http://localhost:9000/api/users/change_password?login=admin&previousPassword=admin&password=${SONAR_ADMIN_PASS}" \
+    "${SONAR_URL_EXTERNAL}/api/users/change_password?login=admin&previousPassword=admin&password=${SONAR_ADMIN_PASS}" \
     -o /dev/null && log_ok "Password admin de SonarQube actualizado." \
-    || log "Password admin ya estaba cambiado (o se omitió)."
-  # Generar token para Jenkins (revoca el previo del mismo nombre → idempotente).
+    || log "Password admin ya estaba cambiado."
   curl -s -u "admin:${SONAR_ADMIN_PASS}" -X POST \
-    "http://localhost:9000/api/user_tokens/revoke?name=jenkins-ci" -o /dev/null || true
+    "${SONAR_URL_EXTERNAL}/api/user_tokens/revoke?name=jenkins-ci" -o /dev/null || true
   SONAR_TOKEN_VALUE=$(curl -s -u "admin:${SONAR_ADMIN_PASS}" -X POST \
-    "http://localhost:9000/api/user_tokens/generate?name=jenkins-ci" 2>/dev/null \
+    "${SONAR_URL_EXTERNAL}/api/user_tokens/generate?name=jenkins-ci" 2>/dev/null \
     | grep -o '"token":"[^"]*"' | cut -d'"' -f4 || true)
   if [[ -n "$SONAR_TOKEN_VALUE" ]]; then
     mkdir -p "$TF_BACKEND/environments/dev"
     cat > "$SONAR_ENV_FILE" <<EOFSONAR
-SONAR_URL=${SONAR_URL_INTERNAL}
+SONAR_URL=${SONAR_URL_EXTERNAL}
 SONAR_TOKEN=${SONAR_TOKEN_VALUE}
 EOFSONAR
-    log_ok "Token de SonarQube generado y persistido en $SONAR_ENV_FILE."
+    log_ok "Token de SonarQube persistido en $SONAR_ENV_FILE."
   else
-    log_err "No se pudo generar el token de SonarQube. Revisá: docker logs $SONAR_CONTAINER"
+    log_err "No se pudo generar token de SonarQube."
   fi
 fi
 
-log "Levantando cluster K3d (${PROJECT_NAME}-dev) en floci-net..."
-k3d cluster create "${PROJECT_NAME}-dev" \
-  --network floci-net \
-  --registry-create "${PROJECT_NAME}-registry:0.0.0.0:5100" \
-  --servers 1 \
-  --agents 1 \
-  --kubeconfig-update-default=false \
-  --kubeconfig-switch-context=false \
-  --wait
-log_ok "Cluster K3d ${PROJECT_NAME}-dev creado (registry k3d-${PROJECT_NAME}-registry:5100)."
+# ---------------------------------------------------------------------------
+# Cluster Kubernetes — K3s nativo en VPS (reemplaza K3d)
+# kubeconfig descargado desde el VPS; context renombrado a k3s-vps.
+# ---------------------------------------------------------------------------
+log "Descargando kubeconfig de K3s desde el VPS..."
+mkdir -p "$KUBE_DIR"
+scp -i "$VPS_SSH_KEY" -o StrictHostKeyChecking=no \
+  "${VPS_USER}@${VPS_IP}:/home/${VPS_USER}/.kube/config" \
+  "$KUBE_DIR/config-k3s" 2>/dev/null \
+  || { log_err "No se pudo descargar el kubeconfig de K3s. Ejecuta primero: vps-setup.sh k3s --vm-ip $VPS_IP"; exit 1; }
 
-log "Generando kubeconfig de K3d..."
-# Variante host (Terraform corre en el host): server en localhost:<puerto mapeado>.
-k3d kubeconfig get "${PROJECT_NAME}-dev" > "$KUBE_DIR/config-k3d"
+# El kubeconfig descargado ya tiene el VPS_IP como server; renombrar contexto.
+sed -i "s|server: https://127.0.0.1|server: https://${VPS_IP}|g" "$KUBE_DIR/config-k3s" 2>/dev/null || true
+kubectl --kubeconfig "$KUBE_DIR/config-k3s" config rename-context \
+  "$(kubectl --kubeconfig "$KUBE_DIR/config-k3s" config current-context 2>/dev/null)" \
+  "k3s-${PROJECT_NAME}-dev" 2>/dev/null || true
 
-# Variante interna (Jenkins corre como contenedor en floci-net): el API server se
-# alcanza por el hostname del load balancer de k3d en floci-net. Se omite la
-# verificación TLS porque el SAN del cert no necesariamente incluye ese hostname.
-cp "$KUBE_DIR/config-k3d" "$KUBE_DIR/config-k3d-internal"
-kubectl --kubeconfig "$KUBE_DIR/config-k3d-internal" config set-cluster "k3d-${PROJECT_NAME}-dev" \
-  --server="https://k3d-${PROJECT_NAME}-dev-serverlb:6443" >/dev/null
-kubectl --kubeconfig "$KUBE_DIR/config-k3d-internal" config set-cluster "k3d-${PROJECT_NAME}-dev" \
-  --insecure-skip-tls-verify=true >/dev/null
-# insecure-skip-tls-verify y certificate-authority-data son mutuamente excluyentes.
-kubectl --kubeconfig "$KUBE_DIR/config-k3d-internal" config unset "clusters.k3d-${PROJECT_NAME}-dev.certificate-authority-data" >/dev/null
-
-log "Esperando a que el API server de K3d responda..."
-K3D_READY=0
+log "Esperando a que el API server de K3s responda..."
+K3S_READY=0
 for i in $(seq 1 30); do
-  if kubectl --kubeconfig "$KUBE_DIR/config-k3d" get nodes &>/dev/null; then
-    K3D_READY=1
+  if kubectl --kubeconfig "$KUBE_DIR/config-k3s" get nodes &>/dev/null; then
+    K3S_READY=1
     break
   fi
   sleep 2
 done
-if [[ "$K3D_READY" -eq 0 ]]; then
-  log_err "El cluster K3d no respondió en 60 s. Revisar: k3d cluster list / docker logs k3d-${PROJECT_NAME}-dev-server-0"
+if [[ "$K3S_READY" -eq 0 ]]; then
+  log_err "K3s en VPS no respondió en 60 s. SSH al VPS: sudo systemctl status k3s"
   exit 1
 fi
-log_ok "K3d listo."
-log "  kubeconfig (host):     $KUBE_DIR/config-k3d   (contexto k3d-${PROJECT_NAME}-dev)"
-log "  kubeconfig (Jenkins):  $KUBE_DIR/config-k3d-internal"
-log "  Registry:              k3d-${PROJECT_NAME}-registry:5100 (floci-net) / localhost:5100 (host)"
+log_ok "K3s listo (VPS $VPS_IP:6443)."
+log "  kubeconfig: $KUBE_DIR/config-k3s  (contexto k3s-${PROJECT_NAME}-dev)"
+log "  Registry:   http://${VPS_IP}:3000/${PROJECT_NAME}  (Gitea Package Registry)"
 
 # ===========================================================================
-# FRONTEND — provider Vercel
+# FRONTEND — Helm chart K3s (reemplaza provider Vercel)
+# Jenkins construye la imagen → push a Gitea Package Registry → ArgoCD deploya en K3s.
 # ===========================================================================
 
-cat > "$TF_FRONTEND/modules/vercel-project/main.tf" << 'EOF'
-# Sin git_repository: Jenkins es el único disparador de despliegues (vercel.json
-# tiene "deploymentEnabled": false). Terraform solo provee el proyecto y sus vars.
-resource "vercel_project" "this" {
-  name      = var.project_name
-  framework = var.framework
-}
+log "Generando estructura Helm chart del frontend ($TF_FRONTEND)..."
 
-resource "vercel_project_environment_variable" "api_url" {
-  project_id = vercel_project.this.id
-  key        = "NEXT_PUBLIC_API_URL"
-  value      = var.api_url
-  target     = ["production", "preview", "development"]
-}
+mkdir -p \
+  "$TF_FRONTEND/chart/templates" \
+  "$TF_FRONTEND/environments/dev" \
+  "$TF_FRONTEND/environments/staging" \
+  "$TF_FRONTEND/environments/prod"
+
+# Chart.yaml
+cat > "$TF_FRONTEND/chart/Chart.yaml" << EOF
+apiVersion: v2
+name: ${PROJECT_NAME}-frontend
+description: Frontend Next.js (K3s + Traefik Ingress)
+type: application
+version: 0.1.0
+appVersion: "latest"
 EOF
 
-cat > "$TF_FRONTEND/modules/vercel-project/variables.tf" << 'EOF'
-variable "project_name" {
-  description = "Nombre del proyecto en Vercel"
-  type        = string
-}
+# values.yaml base
+cat > "$TF_FRONTEND/chart/values.yaml" << EOF
+replicaCount: 1
 
-variable "framework" {
-  description = "Framework del proyecto (nextjs, create-react-app, etc.)"
-  type        = string
-  default     = "nextjs"
-}
+image:
+  repository: ${VPS_IP}:3000/${PROJECT_NAME}/frontend
+  tag: latest
+  pullPolicy: Always
 
-variable "api_url" {
-  description = "URL del backend expuesta al frontend"
-  type        = string
-}
+imagePullSecrets:
+  - name: gitea-registry-secret
+
+service:
+  type: ClusterIP
+  port: 3000
+
+ingress:
+  enabled: true
+  className: traefik
+  host: ""           # vacío = usar IP del nodo
+  path: /
+  pathType: Prefix
+
+env:
+  NEXT_PUBLIC_API_URL: "http://${VPS_IP}:8080"
 EOF
 
-cat > "$TF_FRONTEND/modules/vercel-project/outputs.tf" << 'EOF'
-output "project_id" {
-  description = "ID del proyecto Vercel"
-  value       = vercel_project.this.id
-}
-
-output "deployment_url" {
-  description = "URL de despliegue del proyecto"
-  value       = "https://${vercel_project.this.name}.vercel.app"
-}
+# Deployment
+cat > "$TF_FRONTEND/chart/templates/deployment.yaml" << 'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-frontend
+  labels:
+    app: {{ .Release.Name }}-frontend
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ .Release.Name }}-frontend
+  template:
+    metadata:
+      labels:
+        app: {{ .Release.Name }}-frontend
+    spec:
+      imagePullSecrets:
+        {{- toYaml .Values.imagePullSecrets | nindent 8 }}
+      containers:
+        - name: frontend
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - containerPort: 3000
+          env:
+            {{- range $k, $v := .Values.env }}
+            - name: {{ $k }}
+              value: "{{ $v }}"
+            {{- end }}
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 3000
+            initialDelaySeconds: 10
+            periodSeconds: 5
 EOF
 
-cat > "$TF_FRONTEND/environments/dev/providers.tf" << 'EOF'
-terraform {
-  required_version = ">= 1.6.0"
-
-  required_providers {
-    vercel = {
-      source  = "vercel/vercel"
-      version = "~> 2.0"
-    }
-  }
-}
-
-provider "vercel" {
-  api_token = var.vercel_api_token
-  team      = var.vercel_team
-}
+# Service
+cat > "$TF_FRONTEND/chart/templates/service.yaml" << 'EOF'
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-frontend
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    app: {{ .Release.Name }}-frontend
+  ports:
+    - port: {{ .Values.service.port }}
+      targetPort: 3000
 EOF
 
-cat > "$TF_FRONTEND/environments/dev/variables.tf" << 'EOF'
-variable "vercel_api_token" {
-  description = "Token de API de Vercel"
-  type        = string
-  sensitive   = true
-}
-
-variable "vercel_team" {
-  description = "Slug del equipo en Vercel (vacío = cuenta personal)"
-  type        = string
-  default     = ""
-}
-
-variable "api_url" {
-  description = "URL del backend (dev usa Floci en localhost)"
-  type        = string
-  default     = "http://localhost:8080"
-}
+# Ingress
+cat > "$TF_FRONTEND/chart/templates/ingress.yaml" << 'EOF'
+{{- if .Values.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ .Release.Name }}-frontend
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: web
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  rules:
+    - host: {{ .Values.ingress.host | default "" }}
+      http:
+        paths:
+          - path: {{ .Values.ingress.path }}
+            pathType: {{ .Values.ingress.pathType }}
+            backend:
+              service:
+                name: {{ .Release.Name }}-frontend
+                port:
+                  number: {{ .Values.service.port }}
+{{- end }}
 EOF
 
-cat > "$TF_FRONTEND/environments/dev/main.tf" << EOF
-module "frontend" {
-  source       = "../../modules/vercel-project"
-  project_name = "${PROJECT_NAME}-dev"
-  api_url      = var.api_url
-}
+# values por ambiente
+for env in dev staging prod; do
+  cat > "$TF_FRONTEND/environments/$env/values.yaml" << EOF
+image:
+  repository: ${VPS_IP}:3000/${PROJECT_NAME}/frontend
+  tag: latest
+
+env:
+  NEXT_PUBLIC_API_URL: "http://${VPS_IP}:8080"
 EOF
-
-touch "$TF_FRONTEND/environments/dev/outputs.tf"
-
-for env in staging prod; do
-cat > "$TF_FRONTEND/environments/$env/providers.tf" << EOF
-terraform {
-  required_version = ">= 1.6.0"
-
-  required_providers {
-    vercel = {
-      source  = "vercel/vercel"
-      version = "~> 2.0"
-    }
-  }
-}
-
-provider "vercel" {
-  api_token = var.vercel_api_token
-  team      = var.vercel_team
-}
-EOF
-
-cat > "$TF_FRONTEND/environments/$env/variables.tf" << 'EOF'
-variable "vercel_api_token" {
-  description = "Token de API de Vercel"
-  type        = string
-  sensitive   = true
-}
-
-variable "vercel_team" {
-  description = "Slug del equipo en Vercel (vacío = cuenta personal)"
-  type        = string
-  default     = ""
-}
-
-variable "api_url" {
-  description = "URL del backend"
-  type        = string
-}
-EOF
-
-cat > "$TF_FRONTEND/environments/$env/main.tf" << EOF
-module "frontend" {
-  source       = "../../modules/vercel-project"
-  project_name = "${PROJECT_NAME}-${env}"
-  api_url      = var.api_url
-}
-EOF
-
-  touch "$TF_FRONTEND/environments/$env/outputs.tf"
 done
+
+log_ok "Helm chart del frontend generado en $TF_FRONTEND/chart/"
+log "  Para desplegar: helm upgrade --install ${PROJECT_NAME}-frontend $TF_FRONTEND/chart/ \\"
+log "    --kubeconfig $KUBE_DIR/config-k3s -f $TF_FRONTEND/environments/dev/values.yaml"
 
 # ===========================================================================
 # BACKEND — módulo EKS
@@ -1122,43 +1022,14 @@ resource "aws_iam_policy" "secrets_read" {
   }
 }
 
-resource "aws_iam_policy" "ecr_pull" {
-  name        = "${var.project_name}-${var.environment}-ecr-pull"
-  description = "Allow pulling images from ECR"
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect = "Allow"
-      Action = [
-        "ecr:GetAuthorizationToken",
-        "ecr:BatchCheckLayerAvailability",
-        "ecr:GetDownloadUrlForLayer",
-        "ecr:BatchGetImage"
-      ]
-      Resource = "*"
-    }]
-  })
-
-  lifecycle {
-    ignore_changes = [description, tags_all]
-  }
-}
-
-resource "aws_iam_role_policy_attachment" "task_ecr" {
-  role       = aws_iam_role.ecs_task.name
-  policy_arn = aws_iam_policy.ecr_pull.arn
-}
-
 resource "aws_iam_role_policy_attachment" "task_secrets" {
   role       = aws_iam_role.ecs_task.name
   policy_arn = aws_iam_policy.secrets_read.arn
-
-  # Floci pierde una de dos llamadas AttachRolePolicy concurrentes sobre el mismo
-  # rol (race en su IAM): la relectura devuelve "empty result". Serializar ambas
-  # attachments evita la carrera. Inofensivo en AWS real (solo algo más lento).
-  depends_on = [aws_iam_role_policy_attachment.task_ecr]
 }
+
+# ECR pull policy eliminada: el registry de imágenes es Gitea Package Registry (OCI nativo).
+# Los pods de K3s autentican con imagePullSecrets (Secret kubernetes.io/dockerconfigjson).
+# Para staging/prod con ECR real, agregar la política aws_iam_policy.ecr_pull aquí.
 EOF
 
 cat > "$TF_BACKEND/modules/iam/variables.tf" << 'EOF'
@@ -1189,9 +1060,9 @@ output "secrets_read_policy_arn" {
   value       = aws_iam_policy.secrets_read.arn
 }
 
-output "ecr_pull_policy_arn" {
-  description = "ARN de la política de pull de ECR"
-  value       = aws_iam_policy.ecr_pull.arn
+output "secrets_read_policy_arn_task" {
+  description = "ARN de la política de lectura de Secrets Manager (task role)"
+  value       = aws_iam_policy.secrets_read.arn
 }
 EOF
 
@@ -3430,15 +3301,15 @@ locals {
   vpc_cidr   = data.aws_vpc.default.cidr_block
   subnet_ids = data.aws_subnets.default.ids
 
-  # Apache Kafka standalone (KRaft) que levanta floci-start en floci-net (no MSK).
-  # Interno: para microservicios como contenedores en floci-net. Externo: desde el host.
-  kafka_bootstrap_brokers          = "__PROJECT_NAME__-kafka-dev:9092"
-  kafka_bootstrap_brokers_external = "localhost:29092"
+  # Apache Kafka nativo (KRaft) en el VPS. Acceso desde microservicios (K3s pods): VPS_IP:9092.
+  # Externo (CLI/herramientas desde el host): VPS_IP:29092.
+  kafka_bootstrap_brokers          = "__VPS_IP__:9092"
+  kafka_bootstrap_brokers_external = "__VPS_IP__:29092"
 
-  # Registry de imágenes de dev: el que crea k3d (`--registry-create`). Reemplaza al
-  # ECR emulado de floci (cuyo pull de capas es poco fiable). Jenkins/Kaniko empuja
-  # aquí y K3d hace pull desde aquí. Interno a floci-net; el host lo ve en localhost:5100.
-  dev_registry = "k3d-__PROJECT_NAME__-registry:5100"
+  # Registry de imágenes de dev: Gitea Package Registry (OCI nativo) en el VPS.
+  # Jenkins push: docker push __VPS_IP__:3000/__PROJECT_NAME__/<servicio>:<tag>
+  # K3s pull: usa imagePullSecrets con credenciales de Gitea.
+  gitea_registry = "__VPS_IP__:3000/__PROJECT_NAME__"
 }
 
 module "iam" {
@@ -3471,64 +3342,26 @@ module "secrets_manager" {
   services    = local.services
 }
 
-module "ecr" {
-  source       = "../../modules/ecr"
-  environment  = local.environment
-  project_name = local.project_name
-  services     = local.services
-}
+# ECR eliminado en dev: Gitea Package Registry (OCI nativo) reemplaza ECR.
+# El módulo terraform/backend/modules/ecr se conserva para staging/prod (AWS ECR real).
 
-# En dev NO se usa EKS (módulo eks): el plano de cómputo real es el cluster K3d que
-# levanta floci-start (__PROJECT_NAME__-dev en floci-net). Tampoco se usa el módulo jenkins
-# (controller EC2 + agentes EKS): en dev el controller Jenkins corre como contenedor
-# en floci-net y lanza agentes como pods en K3d (lo configura setup-cicd-pipeline.sh).
-#
-# ArgoCD (CD por GitOps) se instala en el cluster K3d vía Helm. En dev el server se
-# expone como NodePort (en EKS sería LoadBalancer); se accede con kubectl port-forward.
+# RDS eliminado en dev: PostgreSQL 16 corre como servicio nativo (postgresql.service)
+# en el VPS. Conexión directa: __VPS_IP__:5432. Sin Terraform ni floci.
+# El módulo terraform/backend/modules/rds se conserva para staging/prod (AWS RDS real).
+
+# MSK eliminado en dev: Kafka nativo (KRaft) en el VPS (__VPS_IP__:9092).
+# El módulo terraform/backend/modules/msk se conserva para staging/prod (AWS MSK real).
+
+# ArgoCD se instala en K3s nativo del VPS via Helm CLI (vps-setup.sh k3s).
 # Los ApplicationSet/AppProject se aplican desde environments/dev/argocd-bootstrap/.
-module "argocd" {
-  source              = "../../modules/argocd"
-  environment         = local.environment
-  project_name        = local.project_name
-  server_service_type = "NodePort"
-  argocd_domain       = "localhost"
-}
-
-# MSK desactivado en dev: floci deja el cluster en estado CREATING para siempre y el
-# provider de AWS crashea al leerlo (nil pointer en kafka/cluster.go). Kafka local lo
-# da el contenedor Apache Kafka standalone (__PROJECT_NAME__-kafka-dev en floci-net, KRaft)
-# que levanta floci-start; los microservicios apuntan a local.kafka_bootstrap_brokers.
-# El módulo queda reservado para staging/prod (AWS real).
-module "msk" {
-  source       = "../../modules/msk"
-  environment  = local.environment
-  project_name = local.project_name
-  vpc_id       = local.vpc_id
-  vpc_cidr     = local.vpc_cidr
-  subnet_ids   = local.subnet_ids
-  enabled      = false
-}
-
-# Floci levanta un contenedor PostgreSQL real (postgres:16-alpine) y proxya TCP
-# en un puerto del rango 7001-7099 (no 5432): leerlo del output rds_endpoint/rds_port.
-# vpc_security_group_ids vacío en dev: el SG no aplica al proxy TCP de floci y
-# evitamos referenciar el sg-00000000 de prueba.
-module "rds" {
-  source                 = "../../modules/rds"
-  environment            = local.environment
-  project_name           = local.project_name
-  subnet_ids             = local.subnet_ids
-  vpc_security_group_ids = []
-  db_name                = var.db_name
-  db_username            = var.db_username
-  db_password            = var.db_password
-  enabled                = true
-  floci                  = true
-}
+# El módulo terraform/backend/modules/argocd se conserva para staging/prod (EKS real).
 EOF
 
-# El heredoc de main.tf es 'EOF' (sin expansión), así que sustituimos el slug aquí.
-sed -i "s/__PROJECT_NAME__/${PROJECT_NAME}/" "$TF_BACKEND/environments/dev/main.tf"
+# Sustituir placeholders
+sed -i \
+  -e "s/__PROJECT_NAME__/${PROJECT_NAME}/g" \
+  -e "s/__VPS_IP__/${VPS_IP}/g" \
+  "$TF_BACKEND/environments/dev/main.tf"
 
 # Capa serverless de reportería (EventBridge + lambdas PDF/XLS/CSV).
 # Se activa cuando ENABLE_REPORTING_SERVERLESS=1 (default). El módulo se popula con
@@ -3552,17 +3385,17 @@ fi
 
 cat > "$TF_BACKEND/environments/dev/outputs.tf" << 'EOF'
 output "api_endpoint" {
-  description = "URL base del API Gateway"
+  description = "URL base del API Gateway (floci)"
   value       = module.api_gateway.api_endpoint
 }
 
 output "user_pool_id" {
-  description = "ID del User Pool de Cognito"
+  description = "ID del User Pool de Cognito (floci)"
   value       = module.cognito.user_pool_id
 }
 
 output "user_pool_client_id" {
-  description = "App Client ID de Cognito"
+  description = "App Client ID de Cognito (floci)"
   value       = module.cognito.client_id
 }
 
@@ -3571,20 +3404,15 @@ output "user_pool_endpoint" {
   value       = module.cognito.user_pool_endpoint
 }
 
-output "ecr_repository_urls" {
-  description = "URLs de los repositorios ECR"
-  value       = module.ecr.repository_urls
-}
-
-# En dev el registry es el de k3d (no ECR). setup-cicd-pipeline.sh lee este output
-# para configurar ECR_REGISTRY del JCasC de Jenkins y construir los image tags.
-output "ecr_registry" {
-  description = "Registry de imágenes de dev (k3d). En floci-net: k3d-__PROJECT_NAME__-registry:5100"
-  value       = local.dev_registry
+# Registry de imágenes: Gitea Package Registry (OCI nativo) en el VPS.
+# setup-cicd-pipeline.sh lee este output para configurar GITEA_REGISTRY en Jenkins.
+output "gitea_registry" {
+  description = "Registry de imágenes de dev (Gitea Package Registry en VPS). Formato: <VPS_IP>:3000/<org>"
+  value       = local.gitea_registry
 }
 
 output "secret_arns" {
-  description = "ARNs de los secrets en Secrets Manager"
+  description = "ARNs de los secrets en Secrets Manager (floci)"
   value       = module.secrets_manager.secret_arns
   sensitive   = true
 }
@@ -3599,53 +3427,39 @@ output "task_role_arn" {
   value       = module.iam.task_role_arn
 }
 
-# ArgoCD corre en el cluster K3d. La UI se accede con port-forward (no hay LoadBalancer
-# en dev). El password inicial del admin se lee del secret argocd-initial-admin-secret.
-output "argocd_namespace" {
-  description = "Namespace donde quedó instalado ArgoCD en K3d"
-  value       = module.argocd.namespace
-}
-
-output "argocd_admin_password_cmd" {
-  description = "Comando para leer la contraseña inicial del admin de ArgoCD"
-  value       = module.argocd.admin_password_cmd
-}
-
-output "argocd_port_forward_cmd" {
-  description = "Comando para exponer la UI de ArgoCD en https://localhost:8090"
-  value       = "kubectl --kubeconfig .kube/config-k3d -n ${module.argocd.namespace} port-forward svc/argocd-server 8090:443"
+# ArgoCD se instaló via Helm en K3s nativo (vps-setup.sh k3s).
+# UI: http://<VPS_IP>:30080  |  HTTPS: http://<VPS_IP>:30443
+# Password admin: kubectl --kubeconfig ~/.kube/config-k3s-vps \
+#   get secret argocd-initial-admin-secret -n argocd -o jsonpath='{.data.password}' | base64 -d
+output "argocd_ui_url" {
+  description = "URL de la UI de ArgoCD en K3s (NodePort)"
+  value       = "http://__VPS_IP__:30080"
 }
 
 output "kafka_bootstrap_brokers" {
-  description = "Bootstrap brokers de Apache Kafka para microservicios como contenedores en floci-net"
+  description = "Bootstrap brokers de Kafka nativo en VPS (para microservicios en K3s)"
   value       = local.kafka_bootstrap_brokers
 }
 
 output "kafka_bootstrap_brokers_external" {
-  description = "Bootstrap brokers de Apache Kafka accesibles desde el host (CLI/herramientas)"
+  description = "Bootstrap brokers de Kafka accesibles desde el host"
   value       = local.kafka_bootstrap_brokers_external
 }
 
-output "rds_endpoint" {
-  description = "Endpoint de conexión a RDS"
-  value       = module.rds.endpoint
+# PostgreSQL nativo en VPS: acceder directamente via VPS_IP:5432
+# Sin módulo Terraform — las BDs se crean con init-databases.sh apuntando al VPS.
+output "postgres_host" {
+  description = "Host de PostgreSQL nativo en VPS (no gestionado por Terraform)"
+  value       = "__VPS_IP__"
 }
 
-output "rds_port" {
-  description = "Puerto de conexión a RDS"
-  value       = module.rds.port
-}
-
-output "rds_db_name" {
-  description = "Nombre de la base de datos"
-  value       = module.rds.db_name
-}
-
-output "rds_arn" {
-  description = "ARN de la instancia RDS"
-  value       = module.rds.arn
+output "postgres_port" {
+  description = "Puerto de PostgreSQL nativo en VPS"
+  value       = 5432
 }
 EOF
+
+sed -i "s/__VPS_IP__/${VPS_IP}/g" "$TF_BACKEND/environments/dev/outputs.tf"
 
 # --- Manifiestos bootstrap de ArgoCD para dev (K3d) --------------------------
 # Mismos objetos que staging/prod (AppProject + ApplicationSet + repo-creds), pero

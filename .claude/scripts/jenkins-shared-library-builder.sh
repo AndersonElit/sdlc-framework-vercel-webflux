@@ -5,11 +5,12 @@
 #   - maven_hexagonal_scaffold.py  (backend)
 #   - nextjs_feature_scaffold.py   (frontend, reutiliza notify)
 #
-# Modelo CI/CD: Jenkins hace CI (build, test, scan, build & push de imagen a ECR)
-# y, en lugar de desplegar, escribe el nuevo image tag en Git (bumpImageTag).
-# ArgoCD hace CD por GitOps: observa helm/<service>/values-<env>.yaml y sincroniza
-# el cluster EKS contra el estado deseado. La instalación de ArgoCD vive en el
-# módulo Terraform 'argocd' (ver base-infrastructure-builder.sh).
+# Modelo CI/CD: Jenkins hace CI (build, test, scan, build & push de imagen al
+# Gitea Package Registry) y, en lugar de desplegar, escribe el nuevo image tag
+# en Git (bumpImageTag). ArgoCD hace CD por GitOps: observa
+# helm/<service>/values-<env>.yaml y sincroniza el cluster K3s (VPS en dev,
+# EKS en staging/prod) contra el estado deseado. ArgoCD se instala via Helm
+# (vps-setup.sh k3s en dev; módulo Terraform 'argocd' en staging/prod).
 #
 # Uso:
 #   bash .claude/scripts/jenkins-shared-library-builder.sh -P <proyecto> [-o DIR] [--no-git]
@@ -33,13 +34,16 @@ log_err() { echo "[$(date '+%H:%M:%S')] ERR $*" >&2; }
 OUT_DIR="jenkins-shared-library"
 DO_GIT=1
 PROJECT_NAME=""
+VPS_IP="${VPS_IP:-}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -P|--project) PROJECT_NAME="${2:-}"; shift 2 ;;
-    --project=*)  PROJECT_NAME="${1#*=}"; shift ;;
-    -o|--output) OUT_DIR="$2"; shift 2 ;;
-    --no-git) DO_GIT=0; shift ;;
+    -P|--project)  PROJECT_NAME="${2:-}"; shift 2 ;;
+    --project=*)   PROJECT_NAME="${1#*=}"; shift ;;
+    -o|--output)   OUT_DIR="$2"; shift 2 ;;
+    --vps-ip)      VPS_IP="${2:-}"; shift 2 ;;
+    --vps-ip=*)    VPS_IP="${1#*=}"; shift ;;
+    --no-git)      DO_GIT=0; shift ;;
     -h|--help)
       grep '^#' "$0" | sed 's/^# \{0,1\}//'
       exit 0 ;;
@@ -51,6 +55,10 @@ if [[ -z "$PROJECT_NAME" ]]; then
   log_err "Falta el parámetro obligatorio -P/--project."
   exit 1
 fi
+
+# Gitea URL: si hay VPS_IP usarla; si no, fallback a localhost (port-forward manual)
+GITEA_BASE="${VPS_IP:+http://${VPS_IP}:3000}"
+GITEA_BASE="${GITEA_BASE:-http://localhost:3000}"
 
 # Slug saneado para el paquete Java / path de recursos (sin guiones ni mayúsculas).
 ORG_SLUG="$(echo "$PROJECT_NAME" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9')"
@@ -189,23 +197,23 @@ def call(Map args = [:]) {
 }
 EOF
 
-# buildAndPushImage — Kaniko build + push al registry (ECR o registry de K3d en dev)
+# buildAndPushImage — Kaniko build + push al Gitea Package Registry
 cat > "$OUT_DIR/vars/buildAndPushImage.groovy" <<'EOF'
-// Construye la imagen multi-stage con Kaniko y la publica en el registry.
-// staging/prod: Amazon ECR (HTTPS, auth IRSA). dev: registry de k3d (HTTP, anónimo)
-// → env.REGISTRY_INSECURE='true' activa los flags de Kaniko para registry inseguro.
+// Construye la imagen multi-stage con Kaniko y la publica en el Gitea Package Registry.
+// staging/prod: Gitea con TLS. dev: Gitea HTTP (sin TLS ni auth AWS) —
+// env.REGISTRY_INSECURE='true' activa los flags de Kaniko para registry inseguro.
 // Producción usa solo el tag inmutable; otros ambientes añaden 'latest'.
 def call(Map args = [:]) {
-    def ecrRepo  = args.ecrRepo  ?: error('buildAndPushImage: falta ecrRepo')
-    def imageTag = args.imageTag ?: error('buildAndPushImage: falta imageTag')
-    def registry = env.ECR_REGISTRY ?: error('buildAndPushImage: falta env.ECR_REGISTRY')
+    def imageRepo = args.imageRepo ?: args.ecrRepo ?: error('buildAndPushImage: falta imageRepo')
+    def imageTag  = args.imageTag  ?: error('buildAndPushImage: falta imageTag')
+    def registry  = env.GITEA_REGISTRY ?: error('buildAndPushImage: falta env.GITEA_REGISTRY')
 
-    def destinations = "--destination ${registry}/${ecrRepo}:${imageTag}"
+    def destinations = "--destination ${registry}/${imageRepo}:${imageTag}"
     if (env.DEPLOY_ENV != 'prod') {
-        destinations += " --destination ${registry}/${ecrRepo}:latest"
+        destinations += " --destination ${registry}/${imageRepo}:latest"
     }
 
-    // Registry inseguro (HTTP) en dev: el registry de k3d no tiene TLS ni auth.
+    // Registry inseguro (HTTP) en dev: Gitea Package Registry sin TLS.
     def insecureFlags = ""
     if (env.REGISTRY_INSECURE == 'true') {
         insecureFlags = "--insecure --skip-tls-verify"
@@ -227,10 +235,10 @@ EOF
 cat > "$OUT_DIR/vars/scanImage.groovy" <<'EOF'
 // Escaneo de la imagen publicada con Trivy. Falla ante CVE crítico.
 def call(Map args = [:]) {
-    def ecrRepo  = args.ecrRepo  ?: error('scanImage: falta ecrRepo')
-    def imageTag = args.imageTag ?: error('scanImage: falta imageTag')
-    def registry = env.ECR_REGISTRY ?: error('scanImage: falta env.ECR_REGISTRY')
-    def image = "${registry}/${ecrRepo}:${imageTag}"
+    def imageRepo = args.imageRepo ?: args.ecrRepo ?: error('scanImage: falta imageRepo')
+    def imageTag  = args.imageTag  ?: error('scanImage: falta imageTag')
+    def registry  = env.GITEA_REGISTRY ?: error('scanImage: falta env.GITEA_REGISTRY')
+    def image = "${registry}/${imageRepo}:${imageTag}"
     // Registry inseguro (HTTP) en dev: Trivy necesita --insecure para extraer la imagen.
     def insecure = env.REGISTRY_INSECURE == 'true' ? "--insecure " : ""
     container('trivy') {
@@ -241,16 +249,17 @@ EOF
 
 # bumpImageTag — actualiza el estado deseado en Git (GitOps). NO despliega.
 cat > "$OUT_DIR/vars/bumpImageTag.groovy" <<'EOF'
-// Frontera CI → CD. Tras publicar la imagen en ECR, este paso reescribe
-// image.repository / image.tag en helm/<service>/values-<env>.yaml y commitea
-// el cambio al repo del servicio. ArgoCD observa ese path y sincroniza el
-// cluster contra el nuevo estado deseado (auto-sync en dev/staging; sync manual
-// en prod). Jenkins nunca ejecuta helm/kubectl de despliegue: el CD vive en ArgoCD.
+// Frontera CI → CD. Tras publicar la imagen en el Gitea Package Registry, este
+// paso reescribe image.repository / image.tag en helm/<service>/values-<env>.yaml
+// y commitea el cambio al repo del servicio. ArgoCD observa ese path y sincroniza
+// el cluster (K3s en dev, EKS en staging/prod) contra el nuevo estado deseado
+// (auto-sync en dev/staging; sync manual en prod). Jenkins nunca ejecuta
+// helm/kubectl de despliegue: el CD vive en ArgoCD.
 def call(Map args = [:]) {
     def service    = args.service  ?: error('bumpImageTag: falta service')
     def envName    = args.env      ?: error('bumpImageTag: falta env')
     def imageTag   = args.imageTag ?: error('bumpImageTag: falta imageTag')
-    def registry   = env.ECR_REGISTRY ?: error('bumpImageTag: falta env.ECR_REGISTRY')
+    def registry   = env.GITEA_REGISTRY ?: error('bumpImageTag: falta env.GITEA_REGISTRY')
     def credId     = args.credentialsId ?: env.GITOPS_CREDENTIALS_ID ?: 'gitops-git-credentials'
     def valuesFile = "helm/${service}/values-${envName}.yaml"
 
@@ -304,13 +313,13 @@ def call(Map args = [:]) {
     def namespace = args.namespace ?: error('runSmokeTests: falta namespace')
     def imageTag  = args.imageTag  ?: error('runSmokeTests: falta imageTag')
     def region    = env.AWS_REGION ?: 'us-east-1'
-    // dev (K3d): el agente corre DENTRO del cluster con el SA jenkins-agent, así que
-    // kubectl usa la config in-cluster y no hay 'aws eks update-kubeconfig'.
+    // dev (K3s en VPS): el agente corre DENTRO del cluster con el SA jenkins-agent,
+    // así que kubectl usa la config in-cluster y no hay 'aws eks update-kubeconfig'.
     // staging/prod (EKS): el agente obtiene kubeconfig vía IRSA + aws eks.
     def inCluster = env.SMOKE_USE_INCLUSTER == 'true'
     container('deploy') {
         if (!inCluster) {
-            def cluster = env.EKS_CLUSTER_NAME ?: error('runSmokeTests: falta env.EKS_CLUSTER_NAME')
+            def cluster = env.K3S_CLUSTER_NAME ?: env.EKS_CLUSTER_NAME ?: error('runSmokeTests: falta env.K3S_CLUSTER_NAME')
             sh "aws eks update-kubeconfig --name ${cluster} --region ${region}"
         }
         sh """
@@ -383,10 +392,10 @@ log_ok "Clase auxiliar src/org/$ORG_SLUG/PipelineDefaults.groovy generada."
 # ---------------------------------------------------------------------------
 # resources/ — pods de agentes (cargados con libraryResource desde los
 # Jenkinsfile vía agent { kubernetes { yaml libraryResource(...) } }).
-# staging/prod: el SA jenkins-agent lleva la anotación IRSA (eks.amazonaws.com/
-# role-arn) que la infra crea; así kaniko (ECR) y deploy (EKS) obtienen creds.
-# dev (K3d): no hay IRSA; kaniko empuja al registry de k3d (HTTP, anónimo) y los
-# smoke tests usan la config in-cluster del propio SA (RBAC en jenkins-agent-rbac-dev.yaml).
+# staging/prod (EKS): el SA jenkins-agent lleva la anotación IRSA (eks.amazonaws.com/
+# role-arn) que la infra crea; así kaniko y deploy (kubectl) obtienen creds de AWS.
+# dev (K3s en VPS): no hay IRSA; kaniko empuja al Gitea Package Registry (HTTP, anónimo
+# en dev) y los smoke tests usan la config in-cluster del SA (RBAC en jenkins-agent-rbac-dev.yaml).
 # ---------------------------------------------------------------------------
 mkdir -p "$OUT_DIR/resources/org/$ORG_SLUG"
 
@@ -438,7 +447,8 @@ spec:
           value: ""
 EOF
 
-# Pod frontend — solo Node (build + deploy a Vercel via CLI + Playwright).
+# Pod frontend — Node (build + docker push Gitea registry + Playwright).
+# Sin despliegue a Vercel: el frontend se despliega como pod en K3s via ArgoCD.
 cat > "$OUT_DIR/resources/org/$ORG_SLUG/podFrontend.yaml" <<'EOF'
 apiVersion: v1
 kind: Pod
@@ -453,6 +463,10 @@ spec:
         requests:
           cpu: 500m
           memory: 1Gi
+    - name: kaniko
+      image: gcr.io/kaniko-project/executor:debug
+      command: ['sleep']
+      args: ['infinity']
 EOF
 
 # Pod Scala batch — SBT + Kaniko + Trivy + gitleaks.
@@ -523,15 +537,15 @@ log_ok "Manifiesto bootstrap/jenkins-agent-rbac.yaml generado."
 
 # ---------------------------------------------------------------------------
 # docker/ — imagen del controller con JCasC + plugins horneados.
-# Construir y publicar en ECR; apuntar var.jenkins_image del módulo Terraform a
-# esta imagen. Los valores por ambiente se inyectan como variables de entorno
-# (ECR_REGISTRY, EKS_CLUSTER_NAME, AWS_REGION, JENKINS_URL, etc.) en el docker run.
+# En dev: construir y publicar al Gitea Package Registry del VPS; Jenkins corre
+# como servicio systemd en el VPS (no como contenedor local). Los valores por ambiente
+# se inyectan como variables de entorno (GITEA_REGISTRY, K3S_API_SERVER, etc.).
 # ---------------------------------------------------------------------------
 mkdir -p "$OUT_DIR/docker"
 
 cat > "$OUT_DIR/docker/plugins.txt" <<'EOF'
 # Plugins mínimos del controller (instalados con jenkins-plugin-cli).
-# Los repos internos (microservicios, shared library) viven en Gitea (floci-net).
+# Los repos internos (microservicios, shared library) viven en Gitea (VPS nativo).
 configuration-as-code
 kubernetes
 workflow-aggregator
@@ -570,16 +584,15 @@ jenkins:
   clouds:
     - kubernetes:
         name: "k8s"
-        # API server del cluster: EKS en staging/prod; K3d (serverlb:6443) en dev.
-        # El controller es externo (EC2 en prod; contenedor en floci-net en dev).
-        serverUrl: "${EKS_API_SERVER}"
+        # API server del cluster: K3s nativo en VPS en dev (VPS_IP:6443);
+        # EKS en staging/prod. El controller corre como servicio systemd en el VPS.
+        serverUrl: "${K3S_API_SERVER}"
         namespace: "jenkins"
         # URL por la que los pods agente alcanzan al controller.
         jenkinsUrl: "${JENKINS_URL}"
         jenkinsTunnel: "${JENKINS_TUNNEL}"   # host:50000 del controller
-        # Credencial kubeconfig: exec auth (aws eks get-token) en EKS; cert de
-        # cliente del kubeconfig de k3d en dev. Montada en /var/jenkins_home/.kube/config.
-        credentialsId: "eks-kubeconfig"
+        # Credencial kubeconfig: kubeconfig K3s del VPS en dev; exec auth EKS en staging/prod.
+        credentialsId: "k3s-kubeconfig"
         directConnection: false
         # Los pod templates vienen de los Jenkinsfile (yaml libraryResource);
         # no se declaran plantillas estáticas aquí.
@@ -588,16 +601,19 @@ jenkins:
   globalNodeProperties:
     - envVars:
         env:
-          - key: "ECR_REGISTRY"
-            value: "${ECR_REGISTRY}"
-          - key: "EKS_CLUSTER_NAME"
-            value: "${EKS_CLUSTER_NAME}"
+          # Gitea Package Registry del VPS (dev: VPS_IP:3000/<org>; staging/prod: registry propio)
+          - key: "GITEA_REGISTRY"
+            value: "${GITEA_REGISTRY}"
+          - key: "K3S_CLUSTER_NAME"
+            value: "${K3S_CLUSTER_NAME}"
+          - key: "K3S_API_SERVER"
+            value: "${K3S_API_SERVER}"
           - key: "AWS_REGION"
             value: "${AWS_REGION}"
-          # dev (K3d): registry HTTP sin auth → Kaniko/Trivy en modo inseguro.
+          # dev (K3s VPS): Gitea Package Registry HTTP sin TLS → Kaniko/Trivy en modo inseguro.
           - key: "REGISTRY_INSECURE"
             value: "${REGISTRY_INSECURE:-false}"
-          # dev (K3d): el agente corre dentro del cluster → smoke tests sin 'aws eks'.
+          # dev (K3s VPS): el agente corre dentro del cluster → smoke tests sin 'aws eks'.
           - key: "SMOKE_USE_INCLUSTER"
             value: "${SMOKE_USE_INCLUSTER:-false}"
           # Team domain de Slack (no secreto). Vacío en dev → notify omite Slack.
@@ -616,21 +632,15 @@ credentials:
               scope: GLOBAL
               id: "slack-token"
               secret: "${SLACK_TOKEN}"
-          - string:
+          # Credenciales del Gitea Package Registry (dev: gitea-admin; staging/prod: token CI)
+          - usernamePassword:
               scope: GLOBAL
-              id: "vercel-token"
-              secret: "${VERCEL_TOKEN}"
-          - string:
-              scope: GLOBAL
-              id: "vercel-org-id"
-              secret: "${VERCEL_ORG_ID}"
-          - string:
-              scope: GLOBAL
-              id: "vercel-project-id"
-              secret: "${VERCEL_PROJECT_ID}"
+              id: "gitea-registry-credentials"
+              username: "${GITOPS_GIT_USERNAME}"
+              password: "${GITOPS_GIT_TOKEN}"
           - file:
               scope: GLOBAL
-              id: "eks-kubeconfig"
+              id: "k3s-kubeconfig"
               fileName: "kubeconfig"
               secretBytes: "${base64:${readFile:/var/jenkins_home/.kube/config}}"
           # Credencial git (usuario + token) que usa bumpImageTag para hacer push
@@ -694,8 +704,8 @@ con el nombre `jenkins-shared-library`, apuntando a este repositorio (rama `main
 | `runContractTests(group: …)` | Contract Tests de integraciones externas (WireMock, `@Tag("contract")`) |
 | `runQualityGates()` | Quality Gate (SonarQube) |
 | `runSecurityScans()` | Security Scans (OWASP + secretos) |
-| `buildAndPushImage(ecrRepo:, imageTag:)` | Build & Push Image (Kaniko → ECR) |
-| `scanImage(ecrRepo:, imageTag:)` | Image Scan (Trivy) |
+| `buildAndPushImage(imageRepo:, imageTag:)` | Build & Push Image (Kaniko → Gitea Package Registry) |
+| `scanImage(imageRepo:, imageTag:)` | Image Scan (Trivy) |
 | `bumpImageTag(service:, env:, imageTag:)` | Update GitOps — escribe el tag en `values-<env>.yaml` y commitea (frontera CI→CD) |
 | `runSmokeTests(service:, namespace:, imageTag:)` | Smoke Tests (post-sync ArgoCD; solo no-prod) |
 | `notify(status:, service:, env:)` | Notify (Slack/email) — también usado por el frontend |
@@ -709,46 +719,49 @@ al repo del servicio. ArgoCD observa ese path y sincroniza el cluster:
 - **dev/staging** → `syncPolicy.automated` (prune + selfHeal): se aplica solo al detectar el commit.
 - **prod** → sync manual en ArgoCD (reemplaza el antiguo approval de Jenkins).
 
-La instalación de ArgoCD y los `ApplicationSet`/`AppProject` los provee el módulo
-Terraform `argocd` y los manifiestos `argocd-bootstrap/` (ver `base-infrastructure-builder.sh`).
+La instalación de ArgoCD la provee `vps-setup.sh k3s` en dev (K3s nativo en VPS)
+y el módulo Terraform `argocd` en staging/prod (EKS). Los manifiestos
+`argocd-bootstrap/` los genera `base-infrastructure-builder.sh`.
 
 ## Modelo de ejecución
 
-- **Controller**: contenedor Docker en EC2 + EBS (config declarativa con JCasC,
-  ver `docker/`). No ejecuta builds (`numExecutors: 0`).
-- **Agentes**: pods efímeros en EKS (Kubernetes plugin). Los Jenkinsfile cargan
-  el pod con `agent { kubernetes { yaml libraryResource('org/__ORG_SLUG__/podBackend.yaml') } }`
+- **Controller**: servicio systemd `jenkins` en el VPS Ubuntu 26.04 LTS en dev
+  (config declarativa con JCasC, ver `docker/`); EC2 + EBS en staging/prod.
+  No ejecuta builds (`numExecutors: 0`).
+- **Agentes**: pods efímeros en K3s (VPS, dev) o EKS (staging/prod) via Kubernetes plugin.
+  Los Jenkinsfile cargan el pod con `agent { kubernetes { yaml libraryResource('org/__ORG_SLUG__/podBackend.yaml') } }`
   (frontend: `podFrontend.yaml`).
-- **Autenticación**: el ServiceAccount `jenkins-agent` usa IRSA. kaniko hace push
-  a ECR; `bumpImageTag` hace push a Git con la credencial `gitops-git-credentials`;
-  `runSmokeTests` usa el contenedor `deploy` (`aws eks update-kubeconfig` + kubectl).
+- **Autenticación (dev)**: SA `jenkins-agent` con RBAC (sin IRSA); kaniko hace push
+  al Gitea Package Registry (`GITEA_REGISTRY`, HTTP en dev); `bumpImageTag` hace push
+  a Git con `gitops-git-credentials`; `runSmokeTests` usa config in-cluster.
 
 ## Variables de entorno / credenciales esperadas (inyectadas por JCasC / infra)
 
-- `ECR_REGISTRY` — `<acct>.dkr.ecr.<region>.amazonaws.com`.
-- `EKS_CLUSTER_NAME`, `AWS_REGION` — usados por `runSmokeTests`.
+- `GITEA_REGISTRY` — `VPS_IP:3000/<org>` en dev; registry propio en staging/prod.
+- `K3S_CLUSTER_NAME`, `K3S_API_SERVER` — usados por `runSmokeTests` y el cloud Kubernetes en dev.
+- `AWS_REGION` — usado por `runSmokeTests` en staging/prod (EKS).
+- `gitea-registry-credentials` — usuario + token para push al Gitea Package Registry.
 - `gitops-git-credentials` — credencial git (usuario + token con permiso de push al
-  repo del servicio) usada por `bumpImageTag`. En el JCasC se alimenta de
-  `GITOPS_GIT_USERNAME` / `GITOPS_GIT_TOKEN`. Opcional: `GITOPS_CREDENTIALS_ID`
-  para sobreescribir el id por defecto.
+  repo del servicio) usada por `bumpImageTag`. Alimentada de `GITOPS_GIT_USERNAME`/`GITOPS_GIT_TOKEN`.
 
 ## Puesta en marcha
 
-1. Construye y publica la imagen del controller (`docker/`) en ECR; apunta
-   `var.jenkins_image` del módulo Jenkins de Terraform a esa imagen.
-2. Aplica `bootstrap/jenkins-agent-rbac.yaml` en el cluster (sustituyendo
-   `<JENKINS_AGENT_ROLE_ARN>` por el output `agent_role_arn`).
+1. En dev: el VPS ya tiene Jenkins corriendo como systemd (`vps-setup.sh services`).
+   Construye la imagen del controller (`docker/`) y publícala en el Gitea Package Registry
+   del VPS. En staging/prod: publicar en ECR y apuntar `var.jenkins_image` del módulo Jenkins.
+2. Aplica `bootstrap/jenkins-agent-rbac.yaml` en el cluster K3s del VPS (dev, sin sustituir
+   `<JENKINS_AGENT_ROLE_ARN>`) o en EKS sustituido por el output `agent_role_arn`.
 3. Provee las credenciales referenciadas por el JCasC: `sonar-token`,
-   `slack-token`, `vercel-*`, el kubeconfig `eks-kubeconfig` y
-   `gitops-git-credentials` (token git con permiso de push para `bumpImageTag`).
-4. Instala ArgoCD (módulo Terraform `argocd`) y aplica los manifiestos
-   `argocd-bootstrap/` del ambiente; ArgoCD se encarga del CD por GitOps.
+   `slack-token` (opcional en dev), `gitea-registry-credentials`,
+   `k3s-kubeconfig` (kubeconfig K3s del VPS) y `gitops-git-credentials`.
+4. En dev: ArgoCD ya está instalado en K3s (`vps-setup.sh k3s`). Aplica los manifiestos
+   `argocd-bootstrap/` para crear AppProject/ApplicationSet. En staging/prod: módulo Terraform `argocd`.
 
 ## Pods de agentes (`resources/org/__ORG_SLUG__/`)
 
 - `podBackend.yaml` — contenedores `maven` (default), `kaniko`, `trivy`,
   `gitleaks`, `deploy` (alpine/k8s) y sidecar `dind` (Testcontainers).
-- `podFrontend.yaml` — contenedor `node` (build + deploy Vercel + Playwright).
+- `podFrontend.yaml` — contenedores `node` (build + Playwright) y `kaniko` (push Gitea registry → ArgoCD deploy en K3s).
 
 ## Plugins requeridos
 
@@ -788,33 +801,29 @@ if [[ "$DO_GIT" -eq 1 ]]; then
     fi
     git -C "$OUT_DIR" add -A
     git -C "$OUT_DIR" commit -q -m "chore: scaffold jenkins-shared-library"
-    # Crear el repo en Gitea si el contenedor está activo, luego apuntar el remote.
-    # URL de host (localhost:3000) para push desde la máquina de desarrollo.
-    # Jenkins y ArgoCD usan la URL interna: http://gitea:3000/${PROJECT_NAME}/jenkins-shared-library.git
-    if curl -sf http://localhost:3000/api/healthz &>/dev/null; then
-      # Capturar el código HTTP para distinguir creado (201) / ya existe (409)
-      # de un fallo de auth (401 → el admin no existe, correr base-infrastructure-builder.sh).
+    # Crear el repo en Gitea (VPS) y apuntar el remote.
+    # GITEA_BASE se resuelve a VPS_IP:3000 si se pasó --vps-ip; sino localhost:3000.
+    if curl -sf "${GITEA_BASE}/api/healthz" &>/dev/null; then
       repo_code=$(curl -s -o /dev/null -w "%{http_code}" -u "gitea-admin:gitea-admin" -X POST \
-        "http://localhost:3000/api/v1/orgs/${PROJECT_NAME}/repos" \
+        "${GITEA_BASE}/api/v1/orgs/${PROJECT_NAME}/repos" \
         -H "Content-Type: application/json" \
         -d '{"name":"jenkins-shared-library","private":true,"auto_init":false,"default_branch":"main"}')
       case "$repo_code" in
-        201) log_ok "Repo ${PROJECT_NAME}/jenkins-shared-library creado en Gitea." ;;
+        201) log_ok "Repo ${PROJECT_NAME}/jenkins-shared-library creado en Gitea (${GITEA_BASE})." ;;
         409) log "Repo jenkins-shared-library ya existe en Gitea." ;;
-        401) log_err "Gitea devolvió HTTP 401: el usuario admin no existe. Correr base-infrastructure-builder.sh primero." ;;
+        401) log_err "Gitea devolvió HTTP 401: el usuario admin no existe. Ejecuta primero base-infrastructure-builder.sh --vps-ip." ;;
         *)   log_err "Gitea devolvió HTTP $repo_code al crear el repo jenkins-shared-library." ;;
       esac
     else
-      log "Gitea no está activo — el repo se creará manualmente. Correr base-infrastructure-builder.sh primero."
+      log "Gitea no disponible en ${GITEA_BASE} — el repo se creará manualmente."
     fi
-    git -C "$OUT_DIR" remote add origin "http://localhost:3000/${PROJECT_NAME}/jenkins-shared-library.git" \
-      2>/dev/null || git -C "$OUT_DIR" remote set-url origin "http://localhost:3000/${PROJECT_NAME}/jenkins-shared-library.git"
+    git -C "$OUT_DIR" remote add origin "${GITEA_BASE}/${PROJECT_NAME}/jenkins-shared-library.git" \
+      2>/dev/null || git -C "$OUT_DIR" remote set-url origin "${GITEA_BASE}/${PROJECT_NAME}/jenkins-shared-library.git"
     log_ok "Repositorio git inicializado (rama main) con commit inicial."
-    log_ok "Remote 'origin' → http://localhost:3000/${PROJECT_NAME}/jenkins-shared-library.git"
-    # Auto-push con credenciales embebidas (sin guardarlas en .git/config).
-    # Si falla (Gitea caído / repo inexistente) queda el push manual como fallback.
-    if curl -sf http://localhost:3000/api/healthz &>/dev/null; then
-      if git -C "$OUT_DIR" push "http://gitea-admin:gitea-admin@localhost:3000/${PROJECT_NAME}/jenkins-shared-library.git" main &>/dev/null; then
+    log_ok "Remote 'origin' → ${GITEA_BASE}/${PROJECT_NAME}/jenkins-shared-library.git"
+    if curl -sf "${GITEA_BASE}/api/healthz" &>/dev/null; then
+      PUSH_URL=$(echo "${GITEA_BASE}" | sed "s#http://#http://gitea-admin:gitea-admin@#")
+      if git -C "$OUT_DIR" push "${PUSH_URL}/${PROJECT_NAME}/jenkins-shared-library.git" main &>/dev/null; then
         log_ok "Push a Gitea completado (rama main)."
       else
         log "Push automático no realizado — publicá manualmente: cd $OUT_DIR && git push -u origin main"
@@ -829,20 +838,20 @@ echo
 log_ok "Shared Library lista en: $(cd "$OUT_DIR" && pwd)"
 echo
 echo "  Siguientes pasos:"
-echo "  1. Publica la shared library en Gitea (requiere que base-infrastructure-builder.sh"
-echo "     haya corrido primero para que el contenedor gitea esté activo):"
-echo ""
+echo "  1. La shared library se publicó automáticamente en Gitea (${GITEA_BASE})."
+echo "     Si el push automático falló:"
 echo "       cd $OUT_DIR"
 echo "       git push -u origin main"
 echo "       # Credenciales: gitea-admin / gitea-admin"
 echo ""
-echo "     URL interna (para Jenkins y ArgoCD en floci-net):"
-echo "       SHARED_LIBRARY_REPO=http://gitea:3000/${PROJECT_NAME}/jenkins-shared-library.git"
+echo "     SHARED_LIBRARY_REPO=${GITEA_BASE}/${PROJECT_NAME}/jenkins-shared-library.git"
+echo "     (para Jenkins/ArgoCD usar la URL del VPS directamente)"
 echo ""
-echo "  2. Construye y publica la imagen del controller (docker/) en ECR y apunta"
-echo "     var.jenkins_image del módulo Jenkins de Terraform a esa imagen."
-echo "  3. Aplica bootstrap/jenkins-agent-rbac.yaml en el cluster (namespace +"
-echo "     ServiceAccount IRSA) usando el output agent_role_arn de Terraform."
+echo "  2. Construye la imagen del controller (docker/) y publícala en Gitea Package"
+echo "     Registry del VPS: docker build -t VPS_IP:3000/${PROJECT_NAME}/${PROJECT_NAME}-jenkins:latest docker/"
+echo "     En staging/prod: publicar en ECR y apuntar var.jenkins_image del módulo Jenkins."
+echo "  3. Aplica bootstrap/jenkins-agent-rbac-dev.yaml en el cluster K3s del VPS:"
+echo "     kubectl --kubeconfig ~/.kube/config-k3s-vps apply -f bootstrap/jenkins-agent-rbac-dev.yaml"
 echo "  4. Los Jenkinsfile generados por los scaffolds ya referencian la librería"
 echo "     con @Library('jenkins-shared-library@main') _ y cargan los pods con"
 echo "     libraryResource('org/${ORG_SLUG}/podBackend.yaml' | 'podFrontend.yaml')."

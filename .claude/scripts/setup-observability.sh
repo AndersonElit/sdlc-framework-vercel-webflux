@@ -39,12 +39,12 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-KUBECONFIG_PATH="$REPO_ROOT/terraform/backend/environments/dev/.kube/config-k3d"
+KUBECONFIG_PATH="$REPO_ROOT/terraform/backend/environments/dev/.kube/config-k3s"
 OBS_ENV_FILE="$REPO_ROOT/terraform/backend/environments/dev/.observability-env"
 
 export KUBECONFIG="$KUBECONFIG_PATH"
 
-log "Configurando observabilidad para el proyecto: $PROJECT_NAME"
+log "Configurando observabilidad para el proyecto: $PROJECT_NAME (K3s nativo en VPS)"
 
 # ---------------------------------------------------------------------------
 # Dependencias
@@ -59,9 +59,15 @@ for cmd in helm kubectl; do
   fi
 done
 
+if [[ ! -f "$KUBECONFIG_PATH" ]]; then
+  log_err "Kubeconfig de K3s no encontrado: $KUBECONFIG_PATH"
+  log_err "  Ejecutá primero: base-infrastructure-builder.sh -P $PROJECT_NAME --vps-ip <IP>"
+  exit 1
+fi
+
 kubectl cluster-info --request-timeout=5s &>/dev/null \
-  || { log_err "No hay conectividad con el cluster K3d. Ejecuta init-dev-environment.sh primero."; exit 1; }
-log_ok "Cluster K3d accesible."
+  || { log_err "No hay conectividad con el cluster K3s en VPS. Verifica: kubectl --kubeconfig $KUBECONFIG_PATH get nodes"; exit 1; }
+log_ok "Cluster K3s (VPS) accesible."
 
 # ---------------------------------------------------------------------------
 # Paso 1 — Repositorios Helm

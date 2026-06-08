@@ -5,13 +5,15 @@
 # Cada sección es una función autocontenida. Se ejecutan en orden.
 #
 # Uso:
-#   bash .claude/scripts/setup-cicd-pipeline.sh -P <proyecto> -S <svc1,svc2,...> [-F <frontend>]
+#   bash .claude/scripts/setup-cicd-pipeline.sh -P <proyecto> -S <svc1,svc2,...> \
+#     --vps-ip <IP> [-F <frontend>]
 #
 #   -P, --project NOMBRE      Slug del proyecto (obligatorio). Nombra la imagen del
-#                             controller (<proyecto>-jenkins), el cluster K3d/EKS,
+#                             controller (<proyecto>-jenkins), el cluster K3s,
 #                             la organización Gitea y los recursos de ArgoCD.
 #   -S, --services SVC1,SVC2  Lista de microservicios backend separados por coma (obligatorio).
 #                             Ejemplo: --services seguridad,clientes,tasas,originacion
+#   --vps-ip IP               IP del VPS donde corren Jenkins (systemd), Gitea y K3s. (obligatorio)
 #   -F, --frontend NOMBRE     Nombre del repositorio/job del frontend (opcional).
 #                             Si se omite no se crea job de frontend.
 #                             Ejemplo: --frontend pagofacil-web
@@ -28,6 +30,10 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 PROJECT_NAME=""
 SERVICES=""
 FRONTEND_NAME=""
+VPS_IP=""
+VPS_USER="${VPS_USER:-ubuntu}"
+VPS_SSH_KEY="${VPS_SSH_KEY:-$HOME/.ssh/id_ed25519}"
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -P|--project)  PROJECT_NAME="${2:-}"; shift 2 ;;
@@ -36,6 +42,10 @@ while [[ $# -gt 0 ]]; do
     --services=*)  SERVICES="${1#*=}"; shift ;;
     -F|--frontend) FRONTEND_NAME="${2:-}"; shift 2 ;;
     --frontend=*)  FRONTEND_NAME="${1#*=}"; shift ;;
+    --vps-ip)      VPS_IP="${2:-}"; shift 2 ;;
+    --vps-ip=*)    VPS_IP="${1#*=}"; shift ;;
+    --vps-user)    VPS_USER="${2:-}"; shift 2 ;;
+    --vps-ssh-key) VPS_SSH_KEY="${2:-}"; shift 2 ;;
     -h|--help)     grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) log_err "Argumento desconocido: $1"; exit 1 ;;
   esac
@@ -48,7 +58,15 @@ if [[ -z "$SERVICES" ]]; then
   log_err "Falta el parámetro obligatorio -S/--services (ej: --services seguridad,clientes,tasas)."
   exit 1
 fi
+if [[ -z "$VPS_IP" ]]; then
+  log_err "Falta el parámetro obligatorio --vps-ip."
+  exit 1
+fi
+
 ORG_SLUG="$(echo "$PROJECT_NAME" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9')"
+
+ssh_vps() { ssh -i "$VPS_SSH_KEY" -o StrictHostKeyChecking=no -o ConnectTimeout=15 \
+              -o BatchMode=yes "${VPS_USER}@${VPS_IP}" "$@"; }
 
 # Calcular total de jobs esperados (backends + frontend opcional)
 EXPECTED_JOB_COUNT=0
@@ -65,7 +83,7 @@ done
 section_0_generar_shared_library() {
   log "=== Sección 0 — Generar la Shared Library ==="
 
-  bash "$SCRIPT_DIR/jenkins-shared-library-builder.sh" -P "$PROJECT_NAME" -o "$PROJECT_ROOT/jenkins-shared-library"
+  bash "$SCRIPT_DIR/jenkins-shared-library-builder.sh" -P "$PROJECT_NAME" -o "$PROJECT_ROOT/jenkins-shared-library" --vps-ip "$VPS_IP"
 
   # Verificación
   local expected_vars=(
@@ -103,100 +121,55 @@ section_1_construir_imagen_controller() {
 
   local env_name="${DEPLOY_ENV:-dev}"
 
-  # dev (K3d): el controller Jenkins corre como contenedor local en floci-net,
-  # directamente desde la imagen construida. No se publica en ningún registry
-  # (K3d no necesita la imagen del controller; solo las de los microservicios).
+  # dev (VPS): Jenkins corre como servicio systemd en el VPS.
+  # La imagen del controller se construye localmente y se publica en el
+  # Gitea Package Registry del VPS para que el agente K3s pueda hacer pull.
   if [[ "$env_name" == "dev" ]]; then
-    log "Construyendo imagen del controller: $image_name:$image_tag (dev, sin push)"
+    # Gitea registry: VPS_IP:3000/<org>/<imagen>
+    local gitea_registry="${VPS_IP}:3000/${PROJECT_NAME}"
+    local remote_image="${gitea_registry}/${image_name}:${image_tag}"
+
+    if [[ ! -f "$docker_dir/Dockerfile" ]]; then
+      log_err "Dockerfile no encontrado en $docker_dir."
+      exit 1
+    fi
+
+    log "Construyendo imagen del controller: $image_name:$image_tag"
     docker build -t "$image_name:$image_tag" "$docker_dir"
-    log_ok "Sección 1 completada — imagen local $image_name:$image_tag lista (corre en floci-net)."
+
+    log "Publicando en Gitea Package Registry: $remote_image"
+    echo "gitea-admin" | docker login "${VPS_IP}:3000" \
+      --username gitea-admin --password-stdin 2>/dev/null || true
+    docker tag "$image_name:$image_tag" "$remote_image"
+    docker push "$remote_image"
+
+    log_ok "Sección 1 completada — imagen publicada en Gitea registry: $remote_image"
     return 0
   fi
 
-  # ECR registry: se toma de variable de entorno o se intenta leer de Terraform
-  local ecr_registry="${ECR_REGISTRY:-}"
-  if [[ -z "$ecr_registry" ]]; then
-    # Intentar leer de output de Terraform (módulo ecr)
-    local tf_dir="$PROJECT_ROOT/terraform/backend/environments/dev"
+  # staging/prod: Gitea registry o ECR real según variable de entorno
+  local registry="${GITEA_REGISTRY:-${ECR_REGISTRY:-}}"
+  if [[ -z "$registry" ]]; then
+    local tf_dir="$PROJECT_ROOT/terraform/backend/environments/$env_name"
     if [[ -d "$tf_dir" ]]; then
-      ecr_registry=$(cd "$tf_dir" && terraform output -raw ecr_registry 2>/dev/null || true)
+      registry=$(cd "$tf_dir" && terraform output -raw gitea_registry 2>/dev/null || true)
     fi
   fi
-  if [[ -z "$ecr_registry" ]]; then
-    log_err "ECR_REGISTRY no definido. Exportalo o asegurate de que 'terraform output ecr_registry' esté disponible."
-    log_err "  Ejemplo: export ECR_REGISTRY=000000000000.dkr.ecr.us-east-1.amazonaws.com"
+  if [[ -z "$registry" ]]; then
+    log_err "GITEA_REGISTRY no definido. Exportalo: export GITEA_REGISTRY=<VPS_IP>:3000/<org>"
     exit 1
   fi
-  log "ECR registry: $ecr_registry"
+  log "Registry: $registry"
 
-  # Determinar si estamos en dev (floci) o staging/prod (AWS real)
-  local aws_endpoint=""
-  if [[ -n "${AWS_ENDPOINT_URL:-}" ]]; then
-    aws_endpoint="$AWS_ENDPOINT_URL"
-  elif curl -sf http://localhost:4566/_localstack/health &>/dev/null 2>&1; then
-    aws_endpoint="http://localhost:4566"
-    log "floci detectado en http://localhost:4566"
-  fi
-
-  local aws_region="${AWS_REGION:-us-east-1}"
-
-  # 1. Build de la imagen del controller
   log "Construyendo imagen Docker: $image_name:$image_tag"
   docker build -t "$image_name:$image_tag" "$docker_dir"
 
-  # 2. Crear repositorio ECR si no existe
-  log "Verificando/creando repositorio ECR: $image_name"
-  local ecr_args=(ecr describe-repositories --repository-names "$image_name" --region "$aws_region")
-  if [[ -n "$aws_endpoint" ]]; then
-    ecr_args=(--endpoint-url="$aws_endpoint" "${ecr_args[@]}")
-  fi
-  if ! aws "${ecr_args[@]}" &>/dev/null; then
-    log "Repositorio no existe, creándolo..."
-    local create_args=(ecr create-repository --repository-name "$image_name" --region "$aws_region")
-    if [[ -n "$aws_endpoint" ]]; then
-      create_args=(--endpoint-url="$aws_endpoint" "${create_args[@]}")
-    fi
-    aws "${create_args[@]}" >/dev/null
-    log_ok "Repositorio ECR creado: $image_name"
-  fi
-
-  # 3. Login a ECR
-  log "Autenticando en ECR..."
-  if [[ -n "$aws_endpoint" ]]; then
-    aws --endpoint-url="$aws_endpoint" ecr get-login-password --region "$aws_region" \
-      | docker login --username AWS --password-stdin "$ecr_registry"
-  else
-    aws ecr get-login-password --region "$aws_region" \
-      | docker login --username AWS --password-stdin "$ecr_registry"
-  fi
-
-  # 4. Tag y push
-  local remote_image="${ecr_registry}/${image_name}:${image_tag}"
-  log "Tageando y publicando: $remote_image"
+  local remote_image="${registry}/${image_name}:${image_tag}"
+  log "Publicando: $remote_image"
   docker tag "$image_name:$image_tag" "$remote_image"
   docker push "$remote_image"
 
-  # Verificación: en floci el ECR API no registra imágenes pusheadas vía Docker
-  # registry (limitación del emulador), así que usamos 'docker pull'.
-  # En AWS real usamos 'aws ecr describe-images'.
-  log "Verificando imagen en ECR..."
-  if [[ -n "$aws_endpoint" ]]; then
-    # floci: verificar con docker pull
-    if ! docker pull "$remote_image" &>/dev/null; then
-      log_err "La imagen no se encuentra en ECR: $remote_image"
-      exit 1
-    fi
-  else
-    # AWS real: verificar con describe-images
-    if ! aws ecr describe-images --repository-name "$image_name" --image-ids "imageTag=$image_tag" --region "$aws_region" --output text &>/dev/null; then
-      log_err "La imagen no se encuentra en ECR: $image_name:$image_tag"
-      exit 1
-    fi
-  fi
-
-  log_ok "Sección 1 completada — Imagen publicada en ECR: $remote_image"
-  echo "  Actualizá var.jenkins_image en el módulo Terraform 'jenkins' con:"
-  echo "    jenkins_image = \"$remote_image\""
+  log_ok "Sección 1 completada — Imagen publicada: $remote_image"
 }
 
 # ---------------------------------------------------------------------------
@@ -219,27 +192,27 @@ section_2_bootstrap_cluster() {
     exit 1
   fi
 
-  # --- dev (K3d): cluster real, sin IRSA ---
-  # Se aplica el RBAC del agente que genera base-infrastructure-builder.sh: namespace
-  # jenkins + SA jenkins-agent + Role/RoleBinding para smoke tests en el namespace dev.
+  # --- dev (K3s nativo en VPS): cluster real, sin IRSA ---
+  # Se aplica el RBAC del agente: namespace jenkins + SA jenkins-agent +
+  # Role/RoleBinding para smoke tests en el namespace dev.
   if [[ "$env_name" == "dev" ]]; then
-    local kubeconfig="$tf_dir/.kube/config-k3d"
+    local kubeconfig="$tf_dir/.kube/config-k3s"
     local dev_rbac="$tf_dir/argocd-bootstrap/jenkins-agent-rbac-dev.yaml"
     if [[ ! -f "$kubeconfig" ]]; then
-      log_err "Kubeconfig de K3d no encontrado: $kubeconfig. Ejecutá primero base-infrastructure-builder.sh (floci-start)."
+      log_err "Kubeconfig de K3s no encontrado: $kubeconfig. Ejecutá primero base-infrastructure-builder.sh con --vps-ip."
       exit 1
     fi
     if [[ ! -f "$dev_rbac" ]]; then
       log_err "No se encontró $dev_rbac. Regenerá la infra con base-infrastructure-builder.sh."
       exit 1
     fi
-    log "Aplicando RBAC del agente al cluster K3d..."
+    log "Aplicando RBAC del agente al cluster K3s..."
     kubectl --kubeconfig "$kubeconfig" apply -f "$dev_rbac"
     if ! kubectl --kubeconfig "$kubeconfig" get serviceaccount jenkins-agent -n jenkins &>/dev/null; then
       log_err "ServiceAccount 'jenkins-agent' no se creó en namespace 'jenkins'."
       exit 1
     fi
-    log_ok "Sección 2 completada — RBAC del agente aplicado en K3d (sin IRSA)."
+    log_ok "Sección 2 completada — RBAC del agente aplicado en K3s."
     return 0
   fi
 
@@ -307,68 +280,53 @@ section_3_variables_credenciales() {
   }
 
   # --- Auto-detectar valores desde Terraform ---
-  local ecr_registry
-  ecr_registry=$(tf_output ecr_registry "${ECR_REGISTRY:-}")
+  local gitea_registry
+  gitea_registry=$(tf_output gitea_registry "${GITEA_REGISTRY:-${VPS_IP}:3000/${PROJECT_NAME}}")
 
-  local eks_api_server
-  eks_api_server=$(tf_output eks_cluster_endpoint "https://placeholder.eks.us-east-1.amazonaws.com")
+  local k3s_api_server
+  k3s_api_server=$(tf_output k3s_cluster_endpoint "https://${VPS_IP}:6443")
 
-  local eks_cluster_name
-  eks_cluster_name=$(tf_output eks_cluster_name "${PROJECT_NAME}-${env_name}")
+  local k3s_cluster_name
+  k3s_cluster_name=$(tf_output k3s_cluster_name "k3s-${PROJECT_NAME}-dev")
 
   local aws_region="${AWS_REGION:-us-east-1}"
 
-  # --- Overrides para dev (K3d) ---
-  # El API server es el load balancer de k3d en floci-net; el registry es inseguro
-  # (HTTP) y el agente corre dentro del cluster (smoke tests sin 'aws eks').
-  local registry_insecure="false"
-  local smoke_use_incluster="false"
+  # --- Overrides para dev (K3s nativo en VPS) ---
+  local registry_insecure="true"   # Gitea HTTP (sin TLS en dev)
+  local smoke_use_incluster="true"
   if [[ "$env_name" == "dev" ]]; then
-    eks_api_server="https://k3d-${PROJECT_NAME}-dev-serverlb:6443"
-    eks_cluster_name="${PROJECT_NAME}-dev"
-    registry_insecure="true"
-    smoke_use_incluster="true"
+    k3s_api_server="https://${VPS_IP}:6443"
+    k3s_cluster_name="k3s-${PROJECT_NAME}-dev"
   fi
 
   local jenkins_url
-  jenkins_url=$(tf_output jenkins_url "http://localhost:8080")
+  jenkins_url=$(tf_output jenkins_url "http://${VPS_IP}:8080")
 
   local jenkins_tunnel
-  jenkins_tunnel=$(tf_output jenkins_tunnel "localhost:50000")
+  jenkins_tunnel=$(tf_output jenkins_tunnel "${VPS_IP}:50000")
 
-  # Shared library repo — usa Gitea local en dev, remoto en staging/prod
+  # Shared library repo — usa Gitea en VPS en dev
   local shared_library_repo="${SHARED_LIBRARY_REPO:-}"
   if [[ -z "$shared_library_repo" ]]; then
     if [[ "$env_name" == "dev" ]]; then
-      shared_library_repo="http://gitea:3000/${PROJECT_NAME}/jenkins-shared-library.git"
+      shared_library_repo="http://${VPS_IP}:3000/${PROJECT_NAME}/jenkins-shared-library.git"
     fi
   fi
 
-  # Configuración externa (obligatoria; si no están definidas se registran como pendientes)
   local sonar_url="${SONAR_URL:-}"
   local sonar_token="${SONAR_TOKEN:-}"
   local slack_team="${SLACK_TEAM:-}"
   local slack_token="${SLACK_TOKEN:-}"
-  local vercel_token="${VERCEL_TOKEN:-}"
-  local vercel_org_id="${VERCEL_ORG_ID:-}"
-  local vercel_project_id="${VERCEL_PROJECT_ID:-}"
   local gitops_git_username="${GITOPS_GIT_USERNAME:-}"
   local gitops_git_token="${GITOPS_GIT_TOKEN:-}"
-  # En dev los repos GitOps viven en Gitea local: bumpImageTag pushea con las
-  # mismas credenciales fijas del admin (gitea-admin/gitea-admin), igual que el
-  # resto del script. No es una credencial "externa" que el usuario deba proveer.
+
   if [[ "$env_name" == "dev" ]]; then
     gitops_git_username="${gitops_git_username:-gitea-admin}"
     gitops_git_token="${gitops_git_token:-gitea-admin}"
-    # SonarQube se aprovisiona en floci-start (base-infrastructure-builder.sh),
-    # que persiste URL + token en .sonar-env. Los leemos para no pedirlos a mano.
+    # SonarQube se configura en base-infrastructure-builder.sh, persiste en .sonar-env.
     if [[ -f "$tf_dir/.sonar-env" ]]; then
-      if [[ -z "$sonar_url" ]]; then
-        sonar_url="$(grep -E '^SONAR_URL=' "$tf_dir/.sonar-env" | cut -d= -f2- || true)"
-      fi
-      if [[ -z "$sonar_token" ]]; then
-        sonar_token="$(grep -E '^SONAR_TOKEN=' "$tf_dir/.sonar-env" | cut -d= -f2- || true)"
-      fi
+      [[ -z "$sonar_url" ]]   && sonar_url="$(grep -E '^SONAR_URL='   "$tf_dir/.sonar-env" | cut -d= -f2- || true)"
+      [[ -z "$sonar_token" ]] && sonar_token="$(grep -E '^SONAR_TOKEN=' "$tf_dir/.sonar-env" | cut -d= -f2- || true)"
     fi
   fi
 
@@ -380,23 +338,23 @@ section_3_variables_credenciales() {
 # Ambiente: $env_name
 
 # Infraestructura del cluster / registry
-ECR_REGISTRY=$ecr_registry
-EKS_API_SERVER=$eks_api_server
-EKS_CLUSTER_NAME=$eks_cluster_name
+GITEA_REGISTRY=$gitea_registry
+K3S_API_SERVER=$k3s_api_server
+K3S_CLUSTER_NAME=$k3s_cluster_name
 AWS_REGION=$aws_region
 
-# dev (K3d): registry inseguro (HTTP) y smoke tests in-cluster. false en EKS.
+# dev (K3s): registry Gitea HTTP (inseguro) y smoke tests in-cluster.
 REGISTRY_INSECURE=$registry_insecure
 SMOKE_USE_INCLUSTER=$smoke_use_incluster
 
-# Jenkins networking (controller ↔ agentes)
+# Jenkins networking (controller ↔ agentes en K3s)
 JENKINS_URL=$jenkins_url
 JENKINS_TUNNEL=$jenkins_tunnel
 
-# Shared Library
+# Shared Library (Gitea en VPS)
 SHARED_LIBRARY_REPO=$shared_library_repo
 
-# SonarQube
+# SonarQube (VPS nativo)
 SONAR_URL=$sonar_url
 SONAR_TOKEN=$sonar_token
 
@@ -404,12 +362,7 @@ SONAR_TOKEN=$sonar_token
 SLACK_TEAM=$slack_team
 SLACK_TOKEN=$slack_token
 
-# Vercel (deploy frontend)
-VERCEL_TOKEN=$vercel_token
-VERCEL_ORG_ID=$vercel_org_id
-VERCEL_PROJECT_ID=$vercel_project_id
-
-# GitOps (bumpImageTag push)
+# GitOps (bumpImageTag push a Gitea)
 GITOPS_GIT_USERNAME=$gitops_git_username
 GITOPS_GIT_TOKEN=$gitops_git_token
 EOF
@@ -418,77 +371,49 @@ EOF
   [[ -z "$shared_library_repo" ]] && missing+=("SHARED_LIBRARY_REPO")
   [[ -z "$sonar_url" ]]          && missing+=("SONAR_URL")
   [[ -z "$sonar_token" ]]        && missing+=("SONAR_TOKEN")
-  # Slack es opcional en dev (notify hace fallback a echo); obligatorio en staging/prod.
   [[ "$env_name" != "dev" ]] && {
-    [[ -z "$slack_team" ]]        && missing+=("SLACK_TEAM")
-    [[ -z "$slack_token" ]]       && missing+=("SLACK_TOKEN")
-    [[ -z "$vercel_token" ]]      && missing+=("VERCEL_TOKEN")
-    [[ -z "$vercel_org_id" ]]     && missing+=("VERCEL_ORG_ID")
-    [[ -z "$vercel_project_id" ]] && missing+=("VERCEL_PROJECT_ID")
+    [[ -z "$slack_team" ]]  && missing+=("SLACK_TEAM")
+    [[ -z "$slack_token" ]] && missing+=("SLACK_TOKEN")
   }
   [[ -z "$gitops_git_username" ]] && missing+=("GITOPS_GIT_USERNAME")
   [[ -z "$gitops_git_token" ]]   && missing+=("GITOPS_GIT_TOKEN")
 
   if [[ ${#missing[@]} -gt 0 ]]; then
-    log "Las siguientes variables requieren configuración manual:"
-    for var in "${missing[@]}"; do
-      echo "  - $var"
-    done
+    log "Variables pendientes de configuración manual:"
+    for var in "${missing[@]}"; do echo "  - $var"; done
     echo ""
-    echo "  Editá $env_file y completá los valores faltantes."
+    echo "  Edita $env_file y completa los valores faltantes."
   fi
 
-  # --- Levantar el controller Jenkins en dev (docker run) ---
-  # El controller corre en floci-net (alcanza gitea, k3d-serverlb, registry). El
-  # kubeconfig interno de k3d se monta en /var/jenkins_home/.kube/config: el JCasC lo
-  # lee para la credencial 'eks-kubeconfig' y el cloud Kubernetes lanza agentes en K3d.
-  # Se usa la imagen LOCAL ${PROJECT_NAME}-jenkins:latest (la Sección 1 no la publica en dev).
-  # En staging/prod el controller lo gestiona Terraform (módulo Jenkins en EKS), no acá.
+  # --- Verificar Jenkins en VPS (servicio systemd) ---
   if [[ "$env_name" == "dev" ]]; then
     echo ""
-    log "Levantando el controller Jenkins en dev (docker run)..."
-
-    local jenkins_image="${PROJECT_NAME}-jenkins:latest"
-    local kubeconfig_internal="$PROJECT_ROOT/terraform/backend/environments/dev/.kube/config-k3d-internal"
-
-    if ! docker image inspect "$jenkins_image" &>/dev/null; then
-      log_err "Imagen $jenkins_image no encontrada — corré la Sección 1 (build) primero. Omito el arranque."
-    elif [[ ! -f "$kubeconfig_internal" ]]; then
-      log_err "Kubeconfig interno de K3d no encontrado: $kubeconfig_internal"
-      log_err "  Corré base-infrastructure-builder.sh (floci-start) primero. Omito el arranque."
-    elif ! docker network inspect floci-net &>/dev/null; then
-      log_err "Red floci-net no existe — corré floci-start primero. Omito el arranque."
+    log "Verificando Jenkins en VPS ($VPS_IP:8080)..."
+    if ssh_vps "systemctl is-active --quiet jenkins" 2>/dev/null; then
+      log_ok "Jenkins activo en VPS."
     else
-      # Idempotente: recrear el contenedor conserva el volumen jenkins_home.
-      if docker ps -a --format '{{.Names}}' | grep -qx "jenkins-controller"; then
-        log "Contenedor jenkins-controller ya existe — recreando (jenkins_home se conserva)..."
-        docker rm -f jenkins-controller &>/dev/null || true
+      log "Iniciando Jenkins en VPS..."
+      ssh_vps "sudo systemctl start jenkins"
+    fi
+
+    # Copiar .env.jenkins al VPS y recargar Jenkins si es posible
+    log "Copiando .env.jenkins al VPS..."
+    scp -i "$VPS_SSH_KEY" -o StrictHostKeyChecking=no \
+      "$env_file" "${VPS_USER}@${VPS_IP}:/tmp/.env.jenkins" 2>/dev/null || true
+
+    log "Esperando a que Jenkins responda (puede tardar ~60 s)..."
+    local jenkins_ready=0
+    for _ in $(seq 1 40); do
+      if curl -sf -o /dev/null "http://${VPS_IP}:8080/login" 2>/dev/null; then
+        jenkins_ready=1
+        break
       fi
-      if docker run -d --name jenkins-controller \
-        --env-file "$env_file" \
-        --network floci-net \
-        -p 8080:8080 -p 50000:50000 \
-        -v jenkins_home:/var/jenkins_home \
-        -v "${kubeconfig_internal}:/var/jenkins_home/.kube/config:ro" \
-        "$jenkins_image" >/dev/null; then
-        log_ok "Controller Jenkins levantado en floci-net."
-        log "Esperando a que Jenkins responda (puede tardar ~60s)..."
-        local jenkins_ready=0
-        for _ in $(seq 1 40); do
-          if curl -sf -o /dev/null http://localhost:8080/login 2>/dev/null; then
-            jenkins_ready=1
-            break
-          fi
-          sleep 3
-        done
-        if [[ "$jenkins_ready" -eq 1 ]]; then
-          log_ok "Jenkins respondiendo en http://localhost:8080."
-        else
-          log "Jenkins aún no responde (~2 min). Seguí el arranque con: docker logs -f jenkins-controller"
-        fi
-      else
-        log_err "Falló el arranque del controller. Revisá: docker logs jenkins-controller"
-      fi
+      sleep 3
+    done
+    if [[ "$jenkins_ready" -eq 1 ]]; then
+      log_ok "Jenkins respondiendo en http://${VPS_IP}:8080."
+    else
+      log "Jenkins aún no responde. SSH al VPS: sudo systemctl status jenkins"
     fi
   fi
 
@@ -663,9 +588,9 @@ GROOVY_BODY
   if [[ "$env_name" == "dev" ]]; then
     echo ""
     log "Configurando webhooks en Gitea (push + pull_request → Jenkins)..."
-    local gitea_api="http://localhost:3000/api/v1"
+    local gitea_api="http://${VPS_IP}:3000/api/v1"
     local gitea_auth="gitea-admin:gitea-admin"
-    local jenkins_internal="http://jenkins-controller:8080"
+    local jenkins_internal="http://${VPS_IP}:8080"
     local org_repos
     org_repos=$(curl -s -u "$gitea_auth" "$gitea_api/orgs/${PROJECT_NAME}/repos?limit=100" 2>/dev/null \
       | grep -o '"name":"[^"]*"' | cut -d'"' -f4 || true)
@@ -709,16 +634,16 @@ section_5_bootstrap_argocd() {
   local env_name="${DEPLOY_ENV:-dev}"
   local bootstrap_dir="$PROJECT_ROOT/terraform/backend/environments/$env_name/argocd-bootstrap"
 
-  # dev (K3d): ArgoCD se instala en el cluster K3d (módulo terraform 'argocd' en dev).
-  # Se opera con el kubeconfig host de k3d. staging/prod usan el contexto kubectl actual.
+  # dev (K3s nativo en VPS): ArgoCD se instaló vía Helm (vps-setup.sh k3s).
+  # Se opera con el kubeconfig descargado desde el VPS.
   if [[ "$env_name" == "dev" ]]; then
-    local kubeconfig="$PROJECT_ROOT/terraform/backend/environments/dev/.kube/config-k3d"
+    local kubeconfig="$PROJECT_ROOT/terraform/backend/environments/dev/.kube/config-k3s"
     if [[ ! -f "$kubeconfig" ]]; then
-      log_err "Kubeconfig de K3d no encontrado: $kubeconfig. Ejecutá base-infrastructure-builder.sh (floci-start)."
+      log_err "Kubeconfig de K3s no encontrado: $kubeconfig. Ejecutá base-infrastructure-builder.sh con --vps-ip."
       exit 1
     fi
     export KUBECONFIG="$kubeconfig"
-    log "Usando cluster K3d (kubeconfig: $kubeconfig)."
+    log "Usando cluster K3s nativo en VPS (kubeconfig: $kubeconfig)."
   fi
 
   # Validar prerequisitos

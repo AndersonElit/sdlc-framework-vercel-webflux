@@ -53,6 +53,7 @@ PG_DB_NAME=""
 MONGO_DB_NAME=""
 DB_USER=""
 DB_PASSWORD=""
+VPS_IP=""
 
 usage() {
   sed -n '9,17p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
@@ -66,6 +67,7 @@ while [[ $# -gt 0 ]]; do
     -m|--mongo-db) MONGO_DB_NAME="$2"; shift 2 ;;
     -u|--user)     DB_USER="$2";       shift 2 ;;
     -w|--password) DB_PASSWORD="$2";   shift 2 ;;
+    --vps-ip)      VPS_IP="$2";        shift 2 ;;
     -h|--help)     usage 0 ;;
     *) log_err "Opción desconocida: $1"; usage 1 ;;
   esac
@@ -77,6 +79,7 @@ MISSING_ARGS=()
 [[ -z "$MONGO_DB_NAME" ]] && MISSING_ARGS+=("-m/--mongo-db")
 [[ -z "$DB_USER"       ]] && MISSING_ARGS+=("-u/--user")
 [[ -z "$DB_PASSWORD"   ]] && MISSING_ARGS+=("-w/--password")
+[[ -z "$VPS_IP"        ]] && MISSING_ARGS+=("--vps-ip")
 
 if [[ ${#MISSING_ARGS[@]} -gt 0 ]]; then
   log_err "Faltan parámetros obligatorios: ${MISSING_ARGS[*]}"
@@ -104,28 +107,20 @@ if [[ ! -d "$TF_DEV_DIR" ]]; then
   exit 1
 fi
 
-# Usar variable de entorno si está definida; si no, leer desde Terraform.
-if [[ -z "${RDS_PORT:-}" ]]; then
-  RDS_PORT=$(cd "$TF_DEV_DIR" && terraform output -raw rds_port 2>/dev/null || true)
-fi
+# PostgreSQL nativo en VPS (puerto estándar 5432)
+PG_HOST="$VPS_IP"
+PG_PORT="5432"
 
 if [[ -z "${COGNITO_ISSUER_URI:-}" ]]; then
   COGNITO_ISSUER_URI=$(cd "$TF_DEV_DIR" && terraform output -raw user_pool_endpoint 2>/dev/null || true)
 fi
 
-if [[ -z "$RDS_PORT" ]]; then
-  log_err "rds_port no disponible en Terraform outputs."
-  log_err "Ejecutar: bash .claude/scripts/init-dev-environment.sh"
-  log_err "O exportar: export RDS_PORT=<puerto>"
-  exit 1
-fi
-
 if [[ -z "$COGNITO_ISSUER_URI" ]]; then
-  log_warn "user_pool_endpoint no disponible; usando fallback local."
-  COGNITO_ISSUER_URI="http://localhost:4566/us-east-1_dev"
+  log_warn "user_pool_endpoint no disponible; usando fallback floci."
+  COGNITO_ISSUER_URI="http://${VPS_IP}:4566/us-east-1_dev"
 fi
 
-log_ok "RDS_PORT          = $RDS_PORT"
+log_ok "PostgreSQL VPS    = $PG_HOST:$PG_PORT"
 log_ok "COGNITO_ISSUER_URI = $COGNITO_ISSUER_URI"
 
 # ── Paso 2: Detectar servicios ────────────────────────────────────────────────
@@ -261,10 +256,10 @@ for svc_path in "${services[@]}"; do
   case "$db_type" in
     postgres)
       secret_json=$(jq -n \
-        --arg r2dbc   "r2dbc:postgresql://localhost:${RDS_PORT}/${svc_pg_db}" \
+        --arg r2dbc   "r2dbc:postgresql://${PG_HOST}:${PG_PORT}/${svc_pg_db}" \
         --arg user    "$DB_USER" \
         --arg pass    "$DB_PASSWORD" \
-        --arg kafka   "localhost:29092" \
+        --arg kafka   "${VPS_IP}:29092" \
         --arg cognito "$COGNITO_ISSUER_URI" \
         '{
           R2DBC_URL:               $r2dbc,
@@ -276,8 +271,8 @@ for svc_path in "${services[@]}"; do
       ;;
     mongo)
       secret_json=$(jq -n \
-        --arg mongo   "mongodb://localhost:27017/${svc_mongo_db}" \
-        --arg kafka   "localhost:29092" \
+        --arg mongo   "mongodb://${VPS_IP}:27017/${svc_mongo_db}" \
+        --arg kafka   "${VPS_IP}:29092" \
         --arg cognito "$COGNITO_ISSUER_URI" \
         '{
           MONGODB_URI:             $mongo,
@@ -299,7 +294,7 @@ for svc_path in "${services[@]}"; do
 
   # integration-service: añadir coordinador LRA y URLs de sistemas externos (WireMock en dev).
   if [[ "$(detect_integration "$svc_path")" == "true" ]]; then
-    lra_url="http://${PROJECT_NAME}-lra-coordinator:8080/lra-coordinator"
+    lra_url="http://${VPS_IP}:50000/lra-coordinator"
     secret_json=$(echo "$secret_json" | jq --arg lra "$lra_url" '. + {LRA_COORDINATOR_URL: $lra}')
     while IFS= read -r ext; do
       [[ -z "$ext" ]] && continue
@@ -327,9 +322,9 @@ HEADER "Paso 3b — Secret de reportería"
 
 reporting_secret="${SECRET_PREFIX}/reporting"
 reporting_json=$(jq -n \
-  --arg endpoint "http://localhost:4566" \
+  --arg endpoint "http://${VPS_IP}:4566" \
   --arg bucket   "${PROJECT_NAME}-reports" \
-  --arg kafka    "localhost:29092" \
+  --arg kafka    "${VPS_IP}:29092" \
   --arg bus      "${PROJECT_NAME}-report-bus" \
   '{
     AWS_ENDPOINT_URL:        $endpoint,

@@ -6,26 +6,27 @@
 # Aplica (o inspecciona) los changelogs Liquibase de cada microservicio que
 # tenga un directorio db/<servicio>/ en la raíz del repo. No requiere JDK ni
 # Liquibase instalados: corre la imagen oficial liquibase/liquibase vía Docker
-# con --network host para alcanzar PostgreSQL en localhost.
+# conectándose directamente a PostgreSQL nativo en el VPS (VPS_IP:5432).
 #
 # Prerrequisito: init-databases.sh completado (BDs y usuario de aplicación
-#                creados). Docker debe estar activo.
+#                creados en el VPS). Docker debe estar activo en el host local.
 #
 # Uso:
 #   bash run-liquibase-migrations.sh -P <proyecto> -p <pg-prefix> -u <usuario> -w <clave>
-#     [-s <servicio-slug>] [-a update|rollback|status|validate]
+#     --vps-ip <IP> [-s <servicio-slug>] [-a update|rollback|status|validate]
 #
 #   -P, --project    NOMBRE   Slug del proyecto (para logs)                 (obligatorio)
 #   -p, --pg-db      PREFIX   Prefijo de BD PostgreSQL (<prefix>_<svc_slug>)(obligatorio)
 #   -u, --user       NOMBRE   Usuario de aplicación en PostgreSQL            (obligatorio)
 #   -w, --password   CLAVE    Clave del usuario de aplicación                (obligatorio)
+#   --vps-ip         IP       IP del VPS donde corre PostgreSQL 16 nativo    (obligatorio)
 #   -s, --service    SLUG     Procesar solo este servicio (ej: clientes-service)
 #   -a, --action     ACCION   update (default) | rollback | status | validate
 #   -h, --help                Muestra esta ayuda
 #
 # Qué hace:
-#   1. Verifica prerequisitos (docker, terraform)
-#   2. Obtiene rds_port desde terraform output
+#   1. Verifica prerequisitos (docker)
+#   2. Verifica conectividad con PostgreSQL en VPS_IP:5432
 #   3. Descubre directorios db/*-service/ en la raíz del repo
 #   4. Por cada servicio (o solo el indicado con -s), ejecuta:
 #        docker run liquibase/liquibase <action>
@@ -47,7 +48,6 @@ HEADER() { echo -e "\n${BOLD}━━━ $* ━━━${RESET}"; }
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 DB_DIR="$REPO_ROOT/db"
-TF_DEV_DIR="$REPO_ROOT/terraform/backend/environments/dev"
 
 LIQUIBASE_IMAGE="liquibase/liquibase:latest"
 
@@ -58,6 +58,7 @@ PROJECT_NAME=""
 PG_DB_NAME=""
 APP_USER=""
 APP_PASS=""
+VPS_IP=""
 FILTER_SERVICE=""
 ACTION="update"
 
@@ -72,6 +73,8 @@ while [[ $# -gt 0 ]]; do
     -p|--pg-db)    PG_DB_NAME="$2";      shift 2 ;;
     -u|--user)     APP_USER="$2";        shift 2 ;;
     -w|--password) APP_PASS="$2";        shift 2 ;;
+    --vps-ip)      VPS_IP="$2";          shift 2 ;;
+    --vps-ip=*)    VPS_IP="${1#*=}";     shift ;;
     -s|--service)  FILTER_SERVICE="$2";  shift 2 ;;
     -a|--action)   ACTION="$2";          shift 2 ;;
     -h|--help)     usage 0 ;;
@@ -84,6 +87,7 @@ MISSING_ARGS=()
 [[ -z "$PG_DB_NAME"   ]] && MISSING_ARGS+=("-p/--pg-db")
 [[ -z "$APP_USER"     ]] && MISSING_ARGS+=("-u/--user")
 [[ -z "$APP_PASS"     ]] && MISSING_ARGS+=("-w/--password")
+[[ -z "$VPS_IP"       ]] && MISSING_ARGS+=("--vps-ip")
 
 if [[ ${#MISSING_ARGS[@]} -gt 0 ]]; then
   log_err "Faltan parámetros obligatorios: ${MISSING_ARGS[*]}"
@@ -112,12 +116,6 @@ if ! docker info &>/dev/null; then
 fi
 log_ok "Docker daemon activo."
 
-if ! command -v terraform &>/dev/null; then
-  log_err "terraform no está instalado."
-  exit 1
-fi
-log_ok "terraform encontrado."
-
 if [[ ! -d "$DB_DIR" ]]; then
   log_err "Directorio db/ no encontrado: $DB_DIR"
   log_err "Ejecutar primero: bash .claude/scripts/scaffold-all-services.sh"
@@ -125,23 +123,24 @@ if [[ ! -d "$DB_DIR" ]]; then
 fi
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 2. Obtener rds_port desde Terraform
+# 2. Verificar conectividad con PostgreSQL nativo en VPS
 # ──────────────────────────────────────────────────────────────────────────────
-HEADER "2. Obteniendo puerto PostgreSQL (rds_port)"
+HEADER "2. Verificando PostgreSQL en VPS ($VPS_IP:5432)"
 
-if [[ ! -d "$TF_DEV_DIR" ]]; then
-  log_err "Directorio Terraform no encontrado: $TF_DEV_DIR"
-  log_err "Ejecute primero: bash .claude/scripts/init-dev-environment.sh"
-  exit 1
+PG_PORT="5432"
+
+# Verificar conectividad básica (timeout 3s)
+if command -v nc &>/dev/null; then
+  if ! nc -z -w3 "$VPS_IP" "$PG_PORT" &>/dev/null; then
+    log_err "No se puede alcanzar PostgreSQL en $VPS_IP:$PG_PORT."
+    log_err "  Verifica que el VPS está activo y postgresql.service está corriendo."
+    exit 1
+  fi
+  log_ok "PostgreSQL accesible en $VPS_IP:$PG_PORT"
+else
+  log_warn "nc no disponible — se omite la verificación de conectividad previa."
+  log "  PostgreSQL: $VPS_IP:$PG_PORT"
 fi
-
-RDS_PORT=$(cd "$TF_DEV_DIR" && terraform output -raw rds_port 2>/dev/null || echo "")
-
-if [[ -z "$RDS_PORT" ]]; then
-  log_err "No se pudo obtener rds_port de terraform output."
-  exit 1
-fi
-log_ok "PostgreSQL en localhost:$RDS_PORT"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 3. Descubrir servicios con changelogs Liquibase
@@ -201,12 +200,11 @@ run_liquibase_for_service() {
     return 0
   fi
 
-  log "  → $svc_name  [BD: $db_name  puerto: $RDS_PORT]"
+  log "  → $svc_name  [BD: $db_name  host: $VPS_IP:$PG_PORT]"
 
-  local jdbc_url="jdbc:postgresql://localhost:${RDS_PORT}/${db_name}"
+  local jdbc_url="jdbc:postgresql://${VPS_IP}:${PG_PORT}/${db_name}"
 
   if docker run --rm \
-    --network host \
     -v "$changelog_dir:/liquibase/changelog:ro" \
     -v "$props_file:/liquibase/liquibase.properties:ro" \
     "$LIQUIBASE_IMAGE" \
@@ -247,7 +245,7 @@ check_item() {
   fi
 }
 
-check_item "rds_port disponible ($RDS_PORT)" 0
+check_item "PostgreSQL nativo accesible en $VPS_IP:$PG_PORT" 0
 
 for svc_path in "${ALL_DB_SERVICES[@]}"; do
   svc_name="$(basename "$svc_path")"
@@ -278,7 +276,7 @@ HEADER "Resumen"
 
 echo ""
 printf "  %-40s %s\n" "Acción" "$ACTION"
-printf "  %-40s %s\n" "PostgreSQL" "localhost:$RDS_PORT"
+printf "  %-40s %s\n" "PostgreSQL (VPS nativo)" "$VPS_IP:$PG_PORT"
 printf "  %-40s %s\n" "Servicios procesados" "${#SERVICES_OK[@]} OK  /  ${#SERVICES_FAILED[@]} fallidos"
 echo ""
 

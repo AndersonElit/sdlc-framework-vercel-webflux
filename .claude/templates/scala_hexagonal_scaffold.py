@@ -151,25 +151,25 @@ def dotenv_files(root: Path, report_role: str | None = None,
     else:
         content = (
             "# --- AWS / S3 (floci en dev, AWS real en staging/prod) ---\n"
-            "AWS_ENDPOINT_URL=http://localhost:4566\n"
+            "AWS_ENDPOINT_URL=${FLOCI_ENDPOINT:-http://localhost:4566}\n"
             "AWS_ACCESS_KEY_ID=test\n"
             "AWS_SECRET_ACCESS_KEY=test\n"
             "AWS_REGION=us-east-1\n"
             "REPORT_BUCKET=reports\n"
-            "# --- Kafka ---\n"
-            "KAFKA_BOOTSTRAP_SERVERS=localhost:9092\n"
+            "# --- Kafka (VPS nativo) ---\n"
+            "KAFKA_BOOTSTRAP_SERVERS=${VPS_IP:-localhost}:29092\n"
         )
         if report_role == "extraction" and source == "mongo":
             content += (
-                "# --- Read model CQRS (MongoDB) ---\n"
-                "MONGO_URI=mongodb://localhost:27017\n"
+                "# --- Read model CQRS (MongoDB nativo en VPS) ---\n"
+                "MONGO_URI=mongodb://${VPS_IP:-localhost}:27017\n"
                 "MONGO_READ_DB=readmodel\n"
                 "MONGO_READ_COLLECTION=ventas\n"
             )
         elif report_role == "extraction" and source == "jdbc":
             content += (
-                "# --- Read model CQRS (PostgreSQL — BD dedicada de lectura) ---\n"
-                f"JDBC_URL=jdbc:postgresql://localhost:5432/{readmodel_db}\n"
+                "# --- Read model CQRS (PostgreSQL nativo en VPS) ---\n"
+                f"JDBC_URL=jdbc:postgresql://${{VPS_IP:-localhost}}:5432/{readmodel_db}\n"
                 "JDBC_TABLE=ventas\n"
                 "JDBC_USER=app\n"
                 "JDBC_PASSWORD=app\n"
@@ -266,7 +266,7 @@ pipeline {
         string(
             name: 'SERVICE_NAME',
             defaultValue: '__SVC__',
-            description: 'Nombre del batch job (deriva el repo ECR y el CronJob K8s).'
+            description: 'Nombre del batch job (deriva el repo en Gitea Package Registry y el CronJob K8s).'
         )
         choice(
             name: 'DEPLOY_ENV',
@@ -278,7 +278,7 @@ pipeline {
     environment {
         SERVICE_NAME  = "${params.SERVICE_NAME}"
         DEPLOY_ENV    = "${params.DEPLOY_ENV}"
-        ECR_REPO      = "${params.SERVICE_NAME}"
+        IMAGE_REPO    = "${params.SERVICE_NAME}"
         K8S_NAMESPACE = "${params.DEPLOY_ENV}"
     }
 
@@ -310,20 +310,20 @@ pipeline {
             steps { runSecurityScans(projectType: 'sbt') }
         }
 
-        // 5 — Imagen Docker multi-stage vía Kaniko → push a Amazon ECR.
+        // 5 — Imagen Docker multi-stage vía Kaniko → push a Gitea Package Registry.
         stage('Build & Push Image') {
             steps {
                 buildAndPushImage(
-                    service:  env.SERVICE_NAME,
-                    ecrRepo:  env.ECR_REPO,
-                    imageTag: env.IMAGE_TAG
+                    service:   env.SERVICE_NAME,
+                    imageRepo: env.IMAGE_REPO,
+                    imageTag:  env.IMAGE_TAG
                 )
             }
         }
 
         // 6 — Escaneo Trivy de la imagen publicada. Falla ante CVE crítico.
         stage('Image Scan (Trivy)') {
-            steps { scanImage(ecrRepo: env.ECR_REPO, imageTag: env.IMAGE_TAG) }
+            steps { scanImage(imageRepo: env.IMAGE_REPO, imageTag: env.IMAGE_TAG) }
         }
 
         // 7 — Frontera CI → CD: escribe image.repository/tag en
@@ -549,15 +549,17 @@ def _setup_gitea_repo(svc: str, root: Path, org: str = "myproject") -> None:
     import urllib.error
     import urllib.request
 
-    gitea_host = "http://localhost:3000"
+    import os
+    vps_ip = os.environ.get("VPS_IP", "")
+    gitea_host = f"http://{vps_ip}:3000" if vps_ip else "http://localhost:3000"
     credentials = base64.b64encode(b"gitea-admin:gitea-admin").decode()
 
     try:
         urllib.request.urlopen(f"{gitea_host}/api/healthz", timeout=3)
     except Exception:
         logger.warning(
-            "[Gitea] No activo en %s — crear el repo manualmente tras correr "
-            "base-infrastructure-builder.sh.", gitea_host
+            "[Gitea] No activo en %s — pasar VPS_IP=<IP> o crear repo manualmente "
+            "tras correr base-infrastructure-builder.sh --vps-ip.", gitea_host
         )
         return
 
@@ -611,7 +613,7 @@ def _update_argocd_applicationset(svc: str, org: str = "myproject") -> None:
     sentinel = "          # -- services managed by scaffold --\n"
     entry = (
         f"          - service: {svc}\n"
-        f"            repoURL: http://gitea:3000/{org}/{svc}.git\n"
+        f"            repoURL: {gitea_host}/{org}/{svc}.git\n"
         f"            revision: main\n"
     )
     for env in ("dev", "staging", "prod"):

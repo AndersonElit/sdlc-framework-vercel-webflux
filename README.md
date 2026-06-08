@@ -27,7 +27,7 @@ Cada etapa consume la salida de la etapa anterior, de modo que el conocimiento d
 ## Prerrequisitos
 
 - **Claude Code** instalado y ejecutándose desde la raíz de este repositorio (las skills viven en `.claude/skills/`).
-- Para la **etapa de implementación** (artefactos generados por `/development-plan`): Docker, Terraform, k3d, kubectl, Java 21, Node.js, Python 3 y el CLI de floci. No se necesitan para generar la documentación, solo para ejecutarla.
+- Para la **etapa de implementación** (artefactos generados por `/development-plan`): Terraform, kubectl, Java 21, Node.js, Python 3 en el host local. Los servicios del framework (MongoDB, Kafka, Gitea, SonarQube, Jenkins, WireMock, LRA Coordinator, floci, K3s) corren en el **VPS Ubuntu 26.04 LTS** creado con `qemu-vps.sh` e instalados con `vps-setup.sh`. No se necesitan para generar la documentación, solo para ejecutar los planes.
 
 ---
 
@@ -43,6 +43,8 @@ Cada etapa consume la salida de la etapa anterior, de modo que el conocimiento d
 │   ├── scripts/                  # Scripts de implementación (infra, scaffold, CI/CD…)
 │   └── templates/                # Scaffolders (Maven hexagonal, Next.js, Scala/Spark reportería, lambdas de formato)
 ├── requerimiento/                # Aquí guardas el formato de entrada diligenciado
+├── PLAN-VPS-LOCAL-QEMU.md        # Guía detallada de creación del VPS con QEMU/KVM
+├── PLAN-VPS-MIGRATION.md         # Decisiones arquitectónicas: Docker local → servicios systemd en VPS
 └── docs/                         # Salida generada por las skills
     ├── planning/                 # PID + ADC
     ├── requirements/             # SRS
@@ -139,12 +141,12 @@ Invoca `/development-plan`. Sin argumentos lee toda la carpeta `docs/design/`.
 | Documento | Contenido |
 |-----------|-----------|
 | `DEV-<proyecto>-roadmap.md` | Índice maestro, prerrequisitos, secuencia, mapa de microservicios y features |
-| `DEV-<proyecto>-00-infrastructure.md` | Infraestructura local (Terraform + floci + K3d) |
-| `DEV-<proyecto>-01-databases.md` | Bases de datos y migraciones |
+| `DEV-<proyecto>-00-infrastructure.md` | Infraestructura VPS (Terraform + floci + K3s nativo) |
+| `DEV-<proyecto>-01-databases.md` | Bases de datos y migraciones (PostgreSQL 16 y MongoDB 7 nativos en VPS) |
 | `DEV-<proyecto>-02-scaffold.md` | Scaffolding de proyectos |
-| `DEV-<proyecto>-02b-cicd.md` | Pipeline CI/CD (Jenkins + ArgoCD) |
+| `DEV-<proyecto>-02b-cicd.md` | Pipeline CI/CD (Jenkins systemd + ArgoCD en K3s) |
 | `DEV-<proyecto>-03-ms-<servicio>.md` | Un documento por microservicio (capas hexagonales) |
-| `DEV-<proyecto>-04-fe-<feature>.md` | Un documento por feature frontend (Next.js) |
+| `DEV-<proyecto>-04-fe-<feature>.md` | Un documento por feature frontend (Next.js, pod K3s) |
 | `DEV-<proyecto>-05-tests.md` | Integración, E2E, estrés y carga |
 
 ---
@@ -165,27 +167,58 @@ Invoca `/development-plan`. Sin argumentos lee toda la carpeta `docs/design/`.
 
 ## Implementación: Scripts de Apoyo
 
-Los planes generados en el paso 7 referencian scripts ejecutables en `.claude/scripts/` que automatizan la etapa de implementación en un ambiente **local-first (floci + K3d)**:
+Los planes generados en el paso 7 referencian scripts ejecutables en `.claude/scripts/` que automatizan la etapa de implementación en un ambiente **VPS-first (floci + K3s nativo)**. Los servicios del framework corren como unidades **systemd** en el VPS Ubuntu 26.04 LTS creado con `qemu-vps.sh`.
 
-| Script | Propósito |
-|--------|-----------|
-| `base-infrastructure-builder.sh` | Genera el árbol Terraform multi-ambiente y levanta la infraestructura base (floci, MongoDB, Kafka, Gitea, SonarQube, K3d + ArgoCD) |
-| `init-dev-environment.sh` | Inicializa el ambiente dev (Terraform apply, verificación de contenedores y cluster) |
-| `init-databases.sh` | Crea usuario/bases PostgreSQL y MongoDB y aplica el esquema |
-| `scaffold-all-services.sh` | Scaffolding de microservicios (Maven hexagonal) y frontend (Next.js), migraciones Flyway, secrets y push a Gitea |
-| `setup-cicd-pipeline.sh` | Configura el pipeline CI/CD completo (shared library, Jenkins, jobs, webhooks, ArgoCD) |
-| `compile-services.sh` / `verify-frontend.sh` | Verificación de compilación backend y frontend |
-| `create-all-secrets-dev.sh` | Crea los secrets de cada servicio en floci |
+### Scripts de gestión del VPS
 
-> En `dev` el cluster de Kubernetes es **K3d** (real, sobre `floci-net`); EKS se reserva para `staging`/`prod`. El frontend se despliega a **Vercel**.
+| Script | Propósito | Parámetros clave |
+|--------|-----------|-----------------|
+| `qemu-vps.sh` | Crea y gestiona la VM QEMU/KVM: `create`, `setup`, `snapshot`, `status`, `delete` | `--vm-ip`, `--vcpus`, `--ram`, `--disksize` |
+| `vps-setup.sh` | Instala servicios systemd en el VPS vía SSH: `prereqs`, `services`, `floci`, `k3s`, `all` | `--vm-ip`, `--project` |
+
+### Scripts de inicialización del proyecto
+
+| Script | Propósito | Parámetros clave |
+|--------|-----------|-----------------|
+| `base-infrastructure-builder.sh` | Genera el árbol Terraform multi-ambiente, verifica servicios en VPS vía SSH, descarga kubeconfig K3s, genera Helm chart del frontend (K3s + Traefik) | `-P`, `--vps-ip` |
+| `init-dev-environment.sh` | Terraform apply sobre floci en VPS, verifica K3s y ArgoCD, muestra tabla de endpoints del VPS | `-P`, `--vps-ip` |
+| `init-databases.sh` | Crea usuario y bases en PostgreSQL 16 nativo y MongoDB 7 nativo del VPS | `-P`, `--vps-ip`, `-p`, `-m`, `-u`, `-w` |
+| `run-liquibase-migrations.sh` | Aplica changelogs Liquibase contra PostgreSQL nativo del VPS (via imagen Docker local) | `-P`, `--vps-ip`, `-p`, `-u`, `-w` |
+
+### Scripts de scaffold y CI/CD
+
+| Script | Propósito | Parámetros clave |
+|--------|-----------|-----------------|
+| `scaffold-all-services.sh` | Scaffolding de microservicios (Maven hexagonal) y frontend (Next.js), changelogs Liquibase, secrets y push a Gitea en VPS | `-P`, `--vps-ip`, `--backend`, `--frontend`, `-p`, `-m`, `-u`, `-w` |
+| `jenkins-shared-library-builder.sh` | Genera la Shared Library de Jenkins (vars/, pods, JCasC, Dockerfile del controller) | `-P`, `--vps-ip`, `-o` |
+| `setup-cicd-pipeline.sh` | Configura el pipeline CI/CD: shared library, imagen controller → Gitea registry, bootstrap K3s, jobs multibranch, webhooks Gitea, ArgoCD bootstrap | `-P`, `-S`, `--vps-ip`, `-F` |
+| `setup-observability.sh` | Instala stack de observabilidad (Prometheus, Grafana, Jaeger, OTEL, Loki, Fluent Bit) en K3s del VPS via Helm | `-P` |
+| `create-all-secrets-dev.sh` | Crea/actualiza secrets de cada servicio en floci del VPS con endpoints nativos (VPS_IP:*) | `-P`, `--vps-ip`, `-p`, `-m`, `-u`, `-w` |
+| `compile-services.sh` / `verify-frontend.sh` | Verificación de compilación backend (Maven) y frontend (TypeScript/lint) | — |
+
+> **Dev:** K3s nativo en VPS — EKS se reserva para `staging`/`prod`. El frontend se despliega como pod K3s con Ingress Traefik, imagen publicada en el **Gitea Package Registry** del VPS (`VPS_IP:3000/<org>`). Jenkins corre como **servicio systemd** en el VPS (no como contenedor Docker local).
+
+### Templates de scaffolding
+
+Los scaffolders Python en `.claude/templates/` leen la variable de entorno **`VPS_IP`** para configurar los endpoints en los artefactos que generan (secret scripts, `.env`, JDBC URLs, Gitea remote URL):
+
+```bash
+VPS_IP=192.168.122.50 bash .claude/scripts/scaffold-all-services.sh \
+  -P miproyecto --vps-ip 192.168.122.50 \
+  --backend seguridad-service:postgres:none:8081 \
+  --backend clientes-service:postgres:kafka-producer:8082 \
+  -p miproyecto_dev -m miproyecto_audit \
+  -u appuser -w secret123 \
+  --frontend miproyecto-web
+```
 
 ---
 
-## VPS Local con QEMU/KVM (`qemu-vps.sh`)
+## VPS Local con QEMU/KVM
 
-El script `.claude/scripts/qemu-vps.sh` automatiza la creación y gestión de una VM Ubuntu que replica el entorno de un servidor OCI/cloud real, útil para validar despliegues antes de subir a producción.
+El framework requiere un VPS Ubuntu 26.04 LTS donde los servicios corren como unidades systemd. Se crea localmente con QEMU/KVM y se configura en dos pasos: `qemu-vps.sh` (gestión de la VM) y `vps-setup.sh` (instalación de servicios).
 
-### Prerrequisitos (una sola vez)
+### Paso 1 — Prerrequisitos del host (una sola vez)
 
 ```bash
 # 1. Verificar soporte de virtualización en el CPU (debe ser > 0)
@@ -206,105 +239,62 @@ wget -P ~/vms/iso https://releases.ubuntu.com/26.04/SHA256SUMS
 cd ~/vms/iso && sha256sum -c SHA256SUMS --ignore-missing
 ```
 
-### Crear un VPS local paso a paso
-
-**Paso 1 — Crear el disco y la VM**
+### Paso 2 — Crear y configurar la VM (`qemu-vps.sh`)
 
 ```bash
-# Valores por defecto: 4 vCPUs, 8 GB RAM, disco 60 GB, nombre "sdlc-vps"
-.claude/scripts/qemu-vps.sh create
+# Crear disco + VM (ajustar según hardware disponible)
+.claude/scripts/qemu-vps.sh create --vcpus 8 --ram 16384 --disksize 120G
 
-# O con valores personalizados
-.claude/scripts/qemu-vps.sh create --vcpus 2 --ram 4096 --disksize 40G --name mi-vps
-```
-
-**Paso 2 — Instalar Ubuntu (manual vía consola serial)**
-
-```bash
+# Instalar Ubuntu en la consola serial (ver PLAN-VPS-LOCAL-QEMU.md § Paso 3)
 virsh console sdlc-vps
-# Sigue el instalador de Ubuntu: idioma, teclado, red, particionado mínimo,
-# usuario "ubuntu" con contraseña temporal, instalar OpenSSH server.
-# Al terminar: sudo poweroff  →  Ctrl+] para salir de la consola.
-```
+# Seguir el instalador: idioma, red, usuario "ubuntu", instalar OpenSSH.
+# Al terminar: sudo poweroff  →  Ctrl+] para salir.
 
-**Paso 3 — Arrancar la VM e identificar su IP**
-
-```bash
+# Ver IP asignada
 virsh start sdlc-vps
-.claude/scripts/qemu-vps.sh status     # muestra IP, estado y snapshots
-```
+.claude/scripts/qemu-vps.sh status
 
-**Paso 4 — Configuración post-instalación (OCI-compatible)**
-
-```bash
-# El script copia tu clave SSH y ejecuta la configuración en la VM:
-# SSH key-only, sudo NOPASSWD, hostname, UTC, NTP, UFW, cloud-init NoCloud,
-# vm.max_map_count, límites nofile, consola serial persistente.
+# Configuración post-instalación OCI-compatible (SSH key-only, sudo NOPASSWD,
+# hostname, UTC, NTP, UFW, cloud-init NoCloud, sysctl vm.max_map_count)
 .claude/scripts/qemu-vps.sh setup --vm-ip 192.168.122.50
 
-# Si tu clave pública no está en ~/.ssh/id_ed25519.pub:
-.claude/scripts/qemu-vps.sh setup --vm-ip 192.168.122.50 --ssh-key ~/.ssh/id_rsa.pub
-```
-
-**Paso 5 — Crear snapshot de la imagen base**
-
-```bash
-# Guarda el estado limpio como "base-oci-config" para restaurar en cualquier momento
+# Snapshot base antes de instalar servicios
 .claude/scripts/qemu-vps.sh snapshot
+# Restaurar en el futuro: virsh snapshot-revert sdlc-vps base-oci-config
 ```
 
-Para restaurar al estado base en el futuro:
-```bash
-virsh snapshot-revert sdlc-vps base-oci-config
-```
-
-### Otras operaciones
-
-**Ver estado completo de la VM**
+### Paso 3 — Instalar servicios en el VPS (`vps-setup.sh`)
 
 ```bash
-.claude/scripts/qemu-vps.sh status
-# Muestra: estado, vCPUs/RAM, IP asignada, snapshots y tamaño del disco
+VPS_IP=192.168.122.50
+
+# Instalar todo de una vez (prereqs → services → floci → k3s)
+.claude/scripts/vps-setup.sh all --vm-ip $VPS_IP --project miproyecto
+
+# O en pasos individuales:
+.claude/scripts/vps-setup.sh prereqs  --vm-ip $VPS_IP   # Java 21, kubectl, helm, terraform, AWS CLI, Maven, yq
+.claude/scripts/vps-setup.sh services --vm-ip $VPS_IP   # MongoDB, Kafka, Gitea, SonarQube, Jenkins, WireMock, LRA
+.claude/scripts/vps-setup.sh floci    --vm-ip $VPS_IP   # floci CLI + contenedor floci/floci:latest (Docker)
+.claude/scripts/vps-setup.sh k3s      --vm-ip $VPS_IP   # K3s nativo + ArgoCD via Helm + kubeconfig descargado
 ```
 
-**Conectarse por SSH**
+`vps-setup.sh k3s` descarga el kubeconfig al host en `~/.kube/config-k3s-vps`.
+
+### Paso 4 — Verificar el VPS
 
 ```bash
-ssh ubuntu@$(virsh domifaddr sdlc-vps | awk '/ipv4/{print $4}' | cut -d/ -f1)
-# o bien la IP que muestra "status"
+.claude/scripts/vps-setup.sh status --vm-ip $VPS_IP
 ```
 
-**Apagar / arrancar manualmente**
-
-```bash
-virsh shutdown sdlc-vps   # apagado limpio (ACPI)
-virsh start    sdlc-vps   # arranque
-virsh suspend  sdlc-vps   # suspender (pausa, libera CPU)
-virsh resume   sdlc-vps   # reanudar
-```
-
-**Eliminar la VM completamente**
-
-```bash
-# Con confirmación interactiva (escribe "si" para confirmar)
-.claude/scripts/qemu-vps.sh delete --vm-ip 192.168.122.50
-
-# Sin confirmación (ideal para scripts)
-.claude/scripts/qemu-vps.sh delete --vm-ip 192.168.122.50 --force
-```
-
-El comando `delete` realiza en orden: apagado forzado → eliminación de snapshots → desregistro de libvirt + borrado del disco qcow2 → limpieza de reglas iptables → verificación final.
-
-### Referencia de comandos y opciones
+### Referencia `qemu-vps.sh`
 
 | Comando | Descripción |
 |---------|-------------|
-| `create` | Crea el disco qcow2 y define la VM en libvirt (pasos 1-2) |
-| `setup` | Configuración post-instalación OCI-compatible + port-forwarding iptables (pasos 4-5) |
-| `snapshot` | Crea el snapshot `base-oci-config` con la imagen limpia (paso 6) |
+| `create` | Crea el disco qcow2 y define la VM en libvirt |
+| `setup` | Configuración post-instalación OCI-compatible + port-forwarding iptables |
+| `snapshot` | Crea el snapshot `base-oci-config` |
 | `status` | Muestra estado, IP, snapshots y tamaño del disco |
 | `delete` | Destruye la VM, snapshots, definición libvirt, disco y reglas iptables |
-| `help` | Muestra la ayuda del script |
 
 | Opción | Por defecto | Descripción |
 |--------|-------------|-------------|
@@ -316,21 +306,36 @@ El comando `delete` realiza en orden: apagado forzado → eliminación de snapsh
 | `--ssh-key FILE` | `~/.ssh/id_ed25519.pub` | Ruta a la clave SSH pública |
 | `--force` | `false` | Omite confirmación interactiva (solo en `delete`) |
 
-### Puertos habilitados por defecto
+### Referencia `vps-setup.sh`
 
-El script configura UFW en la VM y port-forwarding en el host para los siguientes puertos:
+| Comando | Servicios instalados |
+|---------|---------------------|
+| `prereqs` | Java 21 LTS, Maven 3.9, kubectl, Helm, Terraform, AWS CLI v2, yq, git, curl, jq, python3 |
+| `services` | Docker, MongoDB 7 (`mongod`), Kafka 3.7 KRaft (`kafka`), Gitea 1.22 (`gitea`), SonarQube LTS (`sonarqube`), Jenkins LTS (`jenkins`), WireMock 3.9 (`wiremock`), Narayana LRA Coordinator (`lra-coordinator`) |
+| `floci` | floci CLI + contenedor `floci/floci:latest` (Docker requerido por floci) |
+| `k3s` | K3s nativo + ArgoCD via Helm (NodePort `VPS_IP:30080`) + kubeconfig descargado al host |
+| `all` | Ejecuta `prereqs` → `services` → `floci` → `k3s` en orden |
+| `status` | Muestra estado de todos los servicios systemd + pods K3s |
 
-| Puerto | Servicio |
-|--------|----------|
-| 22 | SSH |
-| 80 / 443 | HTTP / HTTPS |
-| 3000 / 3001 | Frontend / dev server |
-| 4566 | LocalStack (floci) |
-| 6443 | Kubernetes API (K3d) |
-| 8080 | Jenkins / app backend |
-| 9000 | SonarQube |
-| 9090 | Prometheus |
-| 16686 | Jaeger UI |
+### Endpoints del VPS por servicio
+
+| Servicio | Endpoint | Puerto |
+|----------|----------|--------|
+| SSH | `VPS_IP` | 22 |
+| floci (AWS emulado) | `http://VPS_IP:4566` | 4566 |
+| PostgreSQL 16 (nativo) | `VPS_IP` | 5432 |
+| MongoDB 7 (nativo) | `mongodb://VPS_IP` | 27017 |
+| Kafka (KRaft, externo) | `VPS_IP` | 29092 |
+| Kafka (KRaft, K3s pods) | `VPS_IP` | 9092 |
+| Gitea UI / API | `http://VPS_IP:3000` | 3000 |
+| Gitea Package Registry | `http://VPS_IP:3000/<org>` | 3000 |
+| Gitea SSH | `VPS_IP` | 2222 |
+| SonarQube | `http://VPS_IP:9000` | 9000 |
+| Jenkins | `http://VPS_IP:8080` | 8080 |
+| LRA Coordinator | `http://VPS_IP:50000` | 50000 |
+| WireMock | `http://VPS_IP:9999` | 9999 |
+| K3s API | `https://VPS_IP:6443` | 6443 |
+| ArgoCD UI | `http://VPS_IP:30080` | 30080 |
 
 ---
 
@@ -348,11 +353,11 @@ Se propaga por todo el pipeline: el ADC captura sistemas externos y estrategia t
 | Componente | Cómo se genera |
 |------------|----------------|
 | `integration-service` (Camel + saga orquestador) | Scaffolder dedicado `.claude/templates/integration_service_scaffold.py` |
-| Outbox + compensaciones en participantes | Banderas `--outbox` / `--saga-participant` de `maven_hexagonal_scaffold.py` (módulos inline + migración `V3__outbox.sql`) |
+| Outbox + compensaciones en participantes | Banderas `--outbox` / `--saga-participant` de `maven_hexagonal_scaffold.py` |
 | Orquestación | `scaffold-all-services.sh` con `--integration-service "sis=BC-XX,..."`, `--saga-flows f1,f2`, `--outbox <svc>`, `--saga-participant <svc>` |
-| Infraestructura local | `base-infrastructure-builder.sh` levanta el coordinador Narayana LRA y WireMock en `floci-net` (omitir con `ENABLE_SAGA=0`) |
-| Secretos | `create-all-secrets-dev.sh` detecta el `integration-service` y añade `LRA_COORDINATOR_URL` y `EXT_*_BASE_URL` |
-| CI/CD | Stage `Contract Tests` (WireMock) en el Jenkinsfile, activo solo para el `integration-service` |
+| Infraestructura VPS | `vps-setup.sh services` instala el coordinador Narayana LRA (`lra-coordinator.service`, VPS:50000) y WireMock (`wiremock.service`, VPS:9999) como servicios systemd. `base-infrastructure-builder.sh` verifica su estado via SSH (omitir con `ENABLE_SAGA=0`) |
+| Secretos | `create-all-secrets-dev.sh` detecta el `integration-service` y añade `LRA_COORDINATOR_URL=http://VPS_IP:50000/lra-coordinator` y `EXT_*_BASE_URL=http://VPS_IP:9999/<sistema>` |
+| CI/CD | Stage `Contract Tests` (WireMock) en el Jenkinsfile generado, activo solo para el `integration-service` |
 
 > Detalle completo y decisiones arquitectónicas: [PLAN-integracion-camel-saga.md](PLAN-integracion-camel-saga.md).
 
@@ -362,8 +367,8 @@ Se propaga por todo el pipeline: el ADC captura sistemas externos y estrategia t
 
 El framework soporta, de forma **opt-in y trazable end-to-end**, un subsistema de reportería para producir reportes (PDF/XLS/CSV) a partir de datos operacionales:
 
-- **ETL por lotes con Apache Spark** en dos microservicios Scala (arquitectura hexagonal, generados con `scala_hexagonal_scaffold.py`): **`report-extraction-service` (MS1)** extrae del **read model CQRS** (MongoDB; o JDBC en proyectos sin CQRS), **valida contra un esquema declarado** y materializa parquet crudo en S3, publicando `report.extracted`; **`report-processing-service` (MS2)** transforma por **tipo de reporte** (patrón Factory, abierto/cerrado) y produce parquet listo, publicando `report.processed`.
-- **Capa de formatos serverless** (AWS Lambda + EventBridge): un *Lambda Kafka Consumer* enruta por EventBridge (una rule por formato) a las lambdas **PDF/XLS/CSV**, que renderizan a `output/`. En dev corre sobre **floci** (S3/Lambda/EventBridge en `:4566`), con el **mismo Terraform** que en AWS real.
+- **ETL por lotes con Apache Spark** en dos microservicios Scala (arquitectura hexagonal, generados con `scala_hexagonal_scaffold.py`): **`report-extraction-service` (MS1)** extrae del **read model CQRS** (MongoDB nativo en VPS; o JDBC PostgreSQL nativo en proyectos sin CQRS), **valida contra un esquema declarado** y materializa parquet crudo en S3 (floci en dev), publicando `report.extracted`; **`report-processing-service` (MS2)** transforma por **tipo de reporte** (patrón Factory, abierto/cerrado) y produce parquet listo, publicando `report.processed`.
+- **Capa de formatos serverless** (AWS Lambda + EventBridge): un _Lambda Kafka Consumer_ enruta por EventBridge (una rule por formato) a las lambdas **PDF/XLS/CSV**, que renderizan a `output/`. En dev corre sobre **floci** (S3/Lambda/EventBridge en `VPS_IP:4566`), con el **mismo Terraform** que en AWS real.
 
 Se propaga por todo el pipeline: el ADC (sección 13) declara tipos de reporte/fuentes/formatos → el Strategic Design añade el bounded context de Reportería y `DS-xxx` → el Diseño Técnico genera los contenedores MS1/MS2 y la malla serverless en el C4, los esquemas parquet y `report_schema_catalog` en el modelo de datos, y los `ADR-xxx` → el Plan de Desarrollo emite los documentos `03-ms-report-extraction-service.md`, `03-ms-report-processing-service.md` y `06-reporting-serverless.md`, todo bajo **TDD**.
 
@@ -374,11 +379,11 @@ Se propaga por todo el pipeline: el ADC (sección 13) declara tipos de reporte/f
 | `report-extraction-service` (MS1, Spark) | `scala_hexagonal_scaffold.py --report-role extraction --source mongo\|jdbc` |
 | `report-processing-service` (MS2, Spark) | `scala_hexagonal_scaffold.py --report-role processing --report-types <lista>` (Factory de transformers) |
 | Capa serverless de formatos | `report_lambdas_scaffold.py --org <proyecto> --formats pdf,xls,csv` (lambdas + Terraform EventBridge) |
-| Orquestación | `scaffold-all-services.sh` con `--report-extraction`, `--report-processing`, `--report-types`, `--report-formats` |
-| Infraestructura local | `base-infrastructure-builder.sh` crea el bucket S3, los topics `report.*` y el bus EventBridge en floci (omitir con `ENABLE_REPORTING=0`; solo serverless con `ENABLE_REPORTING_SERVERLESS=0`) |
-| Catálogo de esquemas | `init-databases.sh` crea la tabla opcional `report_schema_catalog` |
-| Secretos | `create-all-secrets-dev.sh` crea el secret `<proyecto>/dev/reporting` (S3/floci, Kafka, EventBridge) |
-| CI/CD | Steps `assembleSparkService` (fat JAR Spark) y `deployReportingLambdas` (Terraform) en la shared library |
+| Orquestación | `scaffold-all-services.sh` con `--report-extraction`, `--report-processing`, `--report-types`, `--report-formats` y `--vps-ip` |
+| Infraestructura VPS | `base-infrastructure-builder.sh` crea el bucket S3, los topics `report.*` y el bus EventBridge en floci del VPS (`VPS_IP:4566`). Omitir con `ENABLE_REPORTING=0`; solo serverless con `ENABLE_REPORTING_SERVERLESS=0` |
+| Catálogo de esquemas | `init-databases.sh --vps-ip` crea la tabla opcional `report_schema_catalog` en PostgreSQL nativo del VPS |
+| Secretos | `create-all-secrets-dev.sh --vps-ip` crea el secret `<proyecto>/dev/reporting` (S3/floci `VPS_IP:4566`, Kafka `VPS_IP:29092`, EventBridge) |
+| CI/CD | Steps `assembleSparkService` (fat JAR Spark + Kaniko → Gitea registry) y `deployReportingLambdas` (Terraform con `TF_VAR_aws_endpoint_url=http://VPS_IP:4566`) en la shared library |
 
 > Detalle completo y decisiones arquitectónicas: [PLAN-reporteria-spark-etl.md](PLAN-reporteria-spark-etl.md).
 
@@ -389,4 +394,5 @@ Se propaga por todo el pipeline: el ADC (sección 13) declara tipos de reporte/f
 - **Trazabilidad end-to-end:** cada documento se deriva del anterior; el ADC y las decisiones estratégicas (DS-xxx) actúan como restricciones que se propagan al diseño técnico y a la implementación.
 - **Artefactos ejecutables:** el diseño no se queda en prosa — produce OpenAPI, DDL/colecciones, diagramas C4 y scripts de infraestructura reales.
 - **TDD obligatorio:** todos los planes de desarrollo exigen el ciclo Red-Green-Refactor por capa (dominio → aplicación → infraestructura → rest-api) y por artefacto frontend.
+- **VPS-first:** los servicios del framework corren como unidades systemd en un VPS Ubuntu 26.04 LTS (QEMU/KVM local), eliminando la carga de contenedores en la máquina de desarrollo. K3s reemplaza K3d; Gitea Package Registry reemplaza ECR en dev; PostgreSQL 16 nativo reemplaza RDS/floci; el frontend se despliega en K3s (no en Vercel).
 - **Documentos minimalistas y profesionales:** en español técnico, sin relleno, listos para revisión por stakeholders.

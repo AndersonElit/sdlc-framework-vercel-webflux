@@ -293,21 +293,22 @@ def get_integration_secrets_script(project_name: str, port: int, org: str, exter
     import json
     secret = {
         "SERVER_PORT": str(port),
-        "R2DBC_URL": "r2dbc:postgresql://localhost:5432/mydb",
+        "R2DBC_URL": "r2dbc:postgresql://${VPS_IP:-localhost}:5432/mydb",
         "DB_USERNAME": "postgres",
         "DB_PASSWORD": "change_me",
-        "KAFKA_BOOTSTRAP_SERVERS": "localhost:9092",
+        "KAFKA_BOOTSTRAP_SERVERS": "${VPS_IP:-localhost}:29092",
         "KAFKA_CONSUMER_GROUP_ID": f"{project_name}-group",
-        "LRA_COORDINATOR_URL": "http://localhost:50000/lra-coordinator",
+        "LRA_COORDINATOR_URL": "http://${VPS_IP:-localhost}:50000/lra-coordinator",
     }
     for name in externals:
-        secret[f"EXT_{name.upper().replace('-', '_')}_BASE_URL"] = f"http://localhost:9999/{name}"
+        secret[f"EXT_{name.upper().replace('-', '_')}_BASE_URL"] = f"http://${{VPS_IP:-localhost}}:9999/{name}"
     secret_json = json.dumps(secret)
     return f"""\
 #!/usr/bin/env bash
-# Crea (o actualiza) el secret de desarrollo del integration-service en floci.
+# Crea (o actualiza) el secret de desarrollo del integration-service en floci (VPS).
+# Uso: VPS_IP=192.168.122.50 bash create-secrets-dev.sh
 SECRET_NAME="{org}/dev/{project_name}"
-ENDPOINT="http://localhost:4566"
+ENDPOINT="${{FLOCI_ENDPOINT:-http://localhost:4566}}"
 REGION="us-east-1"
 
 if aws --endpoint-url="$ENDPOINT" secretsmanager describe-secret \\

@@ -69,6 +69,9 @@ PG_DB_NAME=""
 MONGO_DB_NAME=""
 APP_USER=""
 APP_PASS=""
+VPS_IP=""
+VPS_USER="${VPS_USER:-ubuntu}"
+VPS_SSH_KEY="${VPS_SSH_KEY:-$HOME/.ssh/id_ed25519}"
 
 usage() {
   sed -n '9,18p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
@@ -82,6 +85,9 @@ while [[ $# -gt 0 ]]; do
     -m|--mongo-db) MONGO_DB_NAME="$2"; shift 2 ;;
     -u|--user)     APP_USER="$2";     shift 2 ;;
     -w|--password) APP_PASS="$2";     shift 2 ;;
+    --vps-ip)      VPS_IP="$2";       shift 2 ;;
+    --vps-user)    VPS_USER="$2";     shift 2 ;;
+    --vps-ssh-key) VPS_SSH_KEY="$2";  shift 2 ;;
     -h|--help)     usage 0 ;;
     *) log_err "Opción desconocida: $1"; usage 1 ;;
   esac
@@ -93,13 +99,15 @@ MISSING_ARGS=()
 [[ -z "$MONGO_DB_NAME" ]] && MISSING_ARGS+=("-m/--mongo-db")
 [[ -z "$APP_USER"      ]] && MISSING_ARGS+=("-u/--user")
 [[ -z "$APP_PASS"      ]] && MISSING_ARGS+=("-w/--password")
+[[ -z "$VPS_IP"        ]] && MISSING_ARGS+=("--vps-ip")
 
 if [[ ${#MISSING_ARGS[@]} -gt 0 ]]; then
   log_err "Faltan parámetros obligatorios: ${MISSING_ARGS[*]}"
   usage 1
 fi
 
-KAFKA_CONTAINER="${PROJECT_NAME}-kafka-dev"
+ssh_vps() { ssh -i "$VPS_SSH_KEY" -o StrictHostKeyChecking=no -o ConnectTimeout=15 \
+              -o BatchMode=yes "${VPS_USER}@${VPS_IP}" "$@"; }
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 1. Validación de prerequisitos
@@ -116,7 +124,6 @@ check_cmd() {
 }
 
 check_cmd terraform
-check_cmd docker
 
 if ! command -v psql &>/dev/null; then
   log_err "psql no está instalado. Instale postgresql-client y reintente."
@@ -155,55 +162,45 @@ fi
 # ──────────────────────────────────────────────────────────────────────────────
 # 2. Verificar contenedores de soporte
 # ──────────────────────────────────────────────────────────────────────────────
-HEADER "2. Verificando contenedores de soporte en floci-net"
+HEADER "2. Verificando servicios systemd en VPS ($VPS_IP)"
 
-CONTAINERS_REQUIRED=("floci" "floci-mongo" "$KAFKA_CONTAINER")
-ALL_UP=1
-
-for c in "${CONTAINERS_REQUIRED[@]}"; do
-  if docker ps --filter "name=$c" --filter "network=floci-net" --format '{{.Names}}' | grep -qx "$c"; then
-    log_ok "Contenedor $c: UP en floci-net."
+SERVICES_OK=1
+for svc in mongod postgresql; do
+  if ssh_vps "systemctl is-active --quiet '$svc'" 2>/dev/null; then
+    log_ok "Servicio $svc: activo en VPS."
   else
-    log_err "Contenedor $c NO está corriendo en floci-net."
-    ALL_UP=0
+    log_err "Servicio $svc NO está activo en VPS $VPS_IP."
+    SERVICES_OK=0
   fi
 done
 
-if [[ "$ALL_UP" -eq 0 ]]; then
-  log_err "Faltan contenedores. Ejecute primero: bash .claude/scripts/init-dev-environment.sh"
+if [[ "$SERVICES_OK" -eq 0 ]]; then
+  log_err "Faltan servicios en el VPS. Ejecute primero: vps-setup.sh services --vm-ip $VPS_IP"
   exit 1
 fi
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 3. Obtener puerto PostgreSQL de Terraform
 # ──────────────────────────────────────────────────────────────────────────────
-HEADER "3. Obteniendo puerto PostgreSQL (rds_port)"
+HEADER "3. Conectando a PostgreSQL nativo en VPS ($VPS_IP:5432)"
 
-if [[ ! -d "$TF_DEV_DIR" ]]; then
-  log_err "Directorio no encontrado: $TF_DEV_DIR"
-  log_err "Ejecute primero: bash .claude/scripts/init-dev-environment.sh"
-  exit 1
-fi
+# PostgreSQL 16 corre como servicio nativo (postgresql.service) en el VPS.
+# Puerto estándar 5432 — sin Terraform ni floci.
+PG_HOST="$VPS_IP"
+PG_PORT="5432"
 
-RDS_PORT=$(cd "$TF_DEV_DIR" && terraform output -raw rds_port 2>/dev/null || echo "")
+log_ok "PostgreSQL nativo en $PG_HOST:$PG_PORT"
 
-if [[ -z "$RDS_PORT" ]]; then
-  log_err "No se pudo obtener rds_port de terraform output. Verifique que init-dev-environment.sh finalizó con checklist ✓."
-  exit 1
-fi
-
-log_ok "PostgreSQL en localhost:$RDS_PORT"
-
-PGADMIN="postgresql://admin:changeme123@localhost:${RDS_PORT}"
-PGAPP="postgresql://${APP_USER}:${APP_PASS}@localhost:${RDS_PORT}"
+PGADMIN="postgresql://postgres:@${PG_HOST}:${PG_PORT}"
+PGAPP="postgresql://${APP_USER}:${APP_PASS}@${PG_HOST}:${PG_PORT}"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 4. PostgreSQL — crear usuario de aplicación
 # ──────────────────────────────────────────────────────────────────────────────
 HEADER "4. PostgreSQL — usuario de aplicación"
 
-log "Creando usuario $APP_USER (idempotente)..."
-PGPASSWORD=changeme123 psql "$PGADMIN/postgres" \
+log "Creando usuario $APP_USER (idempotente) vía psql a VPS..."
+PGPASSWORD="" PGUSER=postgres PGHOST="$PG_HOST" PGPORT="$PG_PORT" psql \
   -c "CREATE USER \"$APP_USER\" WITH PASSWORD '$APP_PASS'" 2>/dev/null || true
 log_ok "Usuario $APP_USER listo."
 
@@ -217,21 +214,19 @@ PG_DBS_CREATED=()
 create_pg_db() {
   local db_name="$1"
   local db_exists
-  db_exists=$(PGPASSWORD=changeme123 psql "$PGADMIN/postgres" \
+  local pg_env="PGUSER=postgres PGHOST=$PG_HOST PGPORT=$PG_PORT PGPASSWORD="
+  db_exists=$(env $pg_env psql -d postgres \
     -tc "SELECT 1 FROM pg_database WHERE datname='$db_name'" 2>/dev/null | tr -d '[:space:]')
 
   if [[ "$db_exists" == "1" ]]; then
     log_ok "  BD $db_name ya existe — omitiendo."
   else
-    PGPASSWORD=changeme123 psql "$PGADMIN/postgres" \
-      -c "CREATE DATABASE \"$db_name\" OWNER \"$APP_USER\""
+    env $pg_env psql -d postgres -c "CREATE DATABASE \"$db_name\" OWNER \"$APP_USER\""
     log_ok "  BD $db_name creada (owner=$APP_USER)."
   fi
 
-  PGPASSWORD=changeme123 psql "$PGADMIN/$db_name" \
-    -c "GRANT ALL ON SCHEMA public TO \"$APP_USER\"" &>/dev/null
-  PGPASSWORD=changeme123 psql "$PGADMIN/$db_name" \
-    -c "CREATE EXTENSION IF NOT EXISTS pgcrypto" &>/dev/null
+  env $pg_env psql -d "$db_name" -c "GRANT ALL ON SCHEMA public TO \"$APP_USER\"" &>/dev/null
+  env $pg_env psql -d "$db_name" -c "CREATE EXTENSION IF NOT EXISTS pgcrypto" &>/dev/null
   log_ok "  $db_name — permisos y pgcrypto listos."
   PG_DBS_CREATED+=("$db_name")
 }
@@ -308,8 +303,8 @@ MONGO_DBS_CREATED=()
 
 create_mongo_db() {
   local db_name="$1"
-  local noauth_uri="mongodb://localhost:27017/$db_name"
-  local app_uri="mongodb://$APP_USER:$APP_PASS@localhost:27017/$db_name?authSource=$db_name"
+  local noauth_uri="mongodb://${VPS_IP}:27017/$db_name"
+  local app_uri="mongodb://$APP_USER:$APP_PASS@${VPS_IP}:27017/$db_name?authSource=$db_name"
 
   mongosh "$noauth_uri" --quiet --eval "
     db = db.getSiblingDB('$db_name');
@@ -345,7 +340,7 @@ done
 if [[ -n "${COLLECTIONS_JS:-}" && ${#MONGO_DBS_CREATED[@]} -gt 0 ]]; then
   log "Aplicando colecciones JS a cada BD MongoDB creada..."
   for db_name in "${MONGO_DBS_CREATED[@]}"; do
-    mongosh "mongodb://localhost:27017/$db_name" "$COLLECTIONS_JS" &>/dev/null \
+    mongosh "mongodb://${VPS_IP}:27017/$db_name" "$COLLECTIONS_JS" &>/dev/null \
       && log_ok "  $db_name — colecciones aplicadas." \
       || log_warn "  $db_name — no se pudieron aplicar colecciones (continúa)."
   done
@@ -376,9 +371,8 @@ check_item() {
   fi
 }
 
-# rds_port disponible
-[[ -n "$RDS_PORT" ]] && check_item "terraform output rds_port disponible ($RDS_PORT)" 0 \
-                      || check_item "terraform output rds_port disponible" 1
+# PostgreSQL nativo en VPS
+check_item "PostgreSQL nativo en VPS ($VPS_IP:5432)" 0
 
 # usuario de aplicación existe en PG
 USER_EXISTS=$(PGPASSWORD=changeme123 psql "$PGADMIN/postgres" \

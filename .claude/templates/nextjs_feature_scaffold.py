@@ -1881,26 +1881,23 @@ CMD ["node", "server.js"]
 
 
 def get_jenkinsfile(org: str = "myproject") -> str:
-    """Jenkinsfile del frontend: calidad + build + deploy a Vercel vía CLI + E2E.
+    """Jenkinsfile del frontend: calidad + build Docker + push Gitea registry + ArgoCD (K3s).
 
-    Jenkins es el único disparador de despliegues; la Git integration de Vercel
-    se desactiva (ver vercel.json / dashboard).
+    El frontend se despliega como pod en K3s con Ingress Traefik.
+    Jenkins hace CI (build, test, imagen Docker) y escribe el nuevo tag en Git
+    (bumpImageTag). ArgoCD hace CD sincronizando el Helm chart del frontend.
     """
-    # Slug saneado para el path del recurso (debe coincidir con el paquete
-    # org.<slug> de la Shared Library: sin guiones ni mayúsculas).
     lib_org = "".join(c for c in org.lower() if c.isascii() and c.isalnum()) or "myproject"
     template = """\
 @Library('jenkins-shared-library@main') _
 
 // ───────────────────────────────────────────────────────────────────────────
-// Jenkinsfile (frontend Next.js) — deploy a Vercel vía CLI controlado por Jenkins.
-// La Git integration de Vercel está desactivada: el único disparador de
-// despliegues es este pipeline.
+// Jenkinsfile (frontend Next.js) — build Docker + push Gitea Package Registry
+// + bumpImageTag → ArgoCD despliega como pod K3s con Ingress Traefik.
 //
-// Modelo de agentes: Kubernetes plugin. Corre en un pod efímero (EKS en
-// staging/prod, K3d en dev) con un contenedor 'node' (definido en
-// org/__LIB_ORG__/podFrontend.yaml de la Shared Library). defaultContainer 'node'
-// hace que todos los sh corran ahí. El deploy sigue siendo a Vercel (no al cluster).
+// Modelo de agentes: Kubernetes plugin. Corre en un pod efímero (K3s VPS en
+// dev, EKS en staging/prod) con contenedores 'node' y 'kaniko' (definidos en
+// org/__LIB_ORG__/podFrontend.yaml de la Shared Library).
 // ───────────────────────────────────────────────────────────────────────────
 
 pipeline {
@@ -1919,26 +1916,38 @@ pipeline {
     }
 
     parameters {
+        string(
+            name: 'SERVICE_NAME',
+            defaultValue: 'frontend',
+            description: 'Nombre del repo frontend (deriva el repo en Gitea Package Registry).'
+        )
         choice(
             name: 'DEPLOY_ENV',
             choices: ['dev', 'staging', 'prod'],
-            description: 'Ambiente destino del despliegue en Vercel.'
+            description: 'Ambiente destino del despliegue.'
         )
     }
 
     environment {
-        // Tokens de servicio desde el Jenkins Credentials Store (rotables, no personales).
-        VERCEL_TOKEN      = credentials('vercel-token')
-        VERCEL_ORG_ID     = credentials('vercel-org-id')
-        VERCEL_PROJECT_ID = credentials('vercel-project-id')
-        // dev/staging → preview ; prod → production
-        VERCEL_ENV = "${params.DEPLOY_ENV == 'prod' ? 'production' : 'preview'}"
-        PROD_FLAG  = "${params.DEPLOY_ENV == 'prod' ? '--prod' : ''}"
+        SERVICE_NAME = "${params.SERVICE_NAME}"
+        DEPLOY_ENV   = "${params.DEPLOY_ENV}"
+        IMAGE_REPO   = "${params.SERVICE_NAME}"
+        K8S_NAMESPACE = "${params.DEPLOY_ENV}"
     }
 
     stages {
-        // 1 — Checkout.
-        stage('Checkout') { steps { checkout scm } }
+        // 1 — Checkout + IMAGE_TAG inmutable.
+        stage('Checkout') {
+            steps {
+                checkout scm
+                script {
+                    def version = sh(script: "cat package.json | grep '\"version\"' | cut -d'\"' -f4", returnStdout: true).trim()
+                    def sha = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
+                    env.IMAGE_TAG = "${version}-${sha}"
+                    echo "IMAGE_TAG=${env.IMAGE_TAG}"
+                }
+            }
+        }
 
         // 2 — Install.
         stage('Install') { steps { sh 'npm ci' } }
@@ -1952,52 +1961,50 @@ pipeline {
         // 5 — Unit Tests (Vitest).
         stage('Unit Tests') { steps { sh 'npm run test' } }
 
-        // 6 — Pull de la configuración del proyecto desde Vercel.
-        stage('Pull config Vercel') {
-            steps { sh 'vercel pull --yes --environment=$VERCEL_ENV --token=$VERCEL_TOKEN' }
-        }
-
-        // 7 — Build (prebuilt artifact).
+        // 6 — Build Next.js (standalone para Docker).
         stage('Build') {
-            steps { sh 'vercel build $PROD_FLAG --token=$VERCEL_TOKEN' }
+            steps { sh 'npm run build' }
         }
 
-        // 8 — Deploy del artefacto prebuilt → captura la deployment URL.
-        stage('Deploy (prebuilt)') {
+        // 7 — Imagen Docker multi-stage vía Kaniko → push a Gitea Package Registry.
+        stage('Build & Push Image') {
             steps {
-                script {
-                    env.DEPLOYMENT_URL = sh(
-                        script: 'vercel deploy --prebuilt $PROD_FLAG --token=$VERCEL_TOKEN',
-                        returnStdout: true
-                    ).trim()
-                    echo "DEPLOYMENT_URL=${env.DEPLOYMENT_URL}"
-                }
+                buildAndPushImage(
+                    service:   env.SERVICE_NAME,
+                    imageRepo: env.IMAGE_REPO,
+                    imageTag:  env.IMAGE_TAG
+                )
             }
         }
 
-        // 9 — E2E (Playwright) contra la URL desplegada por Jenkins.
+        // 8 — Escaneo de imagen (Trivy). Falla ante CVE crítico.
+        stage('Image Scan (Trivy)') {
+            steps { scanImage(imageRepo: env.IMAGE_REPO, imageTag: env.IMAGE_TAG) }
+        }
+
+        // 9 — Frontera CI → CD: escribe image.repository/tag en
+        //     terraform/frontend/environments/<env>/values.yaml y commitea (GitOps).
+        //     ArgoCD detecta el commit y actualiza el pod K3s.
+        stage('Update GitOps (image tag)') {
+            steps {
+                bumpImageTag(
+                    service:  env.SERVICE_NAME,
+                    env:      env.DEPLOY_ENV,
+                    imageTag: env.IMAGE_TAG
+                )
+            }
+        }
+
+        // 10 — E2E (Playwright) contra la URL del pod K3s tras el sync de ArgoCD.
         stage('E2E Tests') {
+            when { expression { params.DEPLOY_ENV != 'prod' } }
             steps {
                 sh 'npx playwright install --with-deps'
-                sh "PLAYWRIGHT_TEST_BASE_URL=${env.DEPLOYMENT_URL} npm run test:e2e"
-            }
-        }
-
-        // 10 — Promote/Alias a producción tras E2E y aprobación manual.
-        stage('Promote / Alias (prod)') {
-            when { expression { params.DEPLOY_ENV == 'prod' } }
-            steps {
-                timeout(time: 30, unit: 'MINUTES') {
-                    input message: "Promover ${env.DEPLOYMENT_URL} a producción",
-                          ok: 'Promover',
-                          submitter: 'release-managers'
-                }
-                sh "vercel promote ${env.DEPLOYMENT_URL} --token=$VERCEL_TOKEN"
+                sh "PLAYWRIGHT_TEST_BASE_URL=${K8S_FRONTEND_URL:-http://localhost:3000} npm run test:e2e"
             }
         }
     }
 
-    // 11 — Notificación de resultado (Slack/email), reutilizando la Shared Library.
     post {
         success { notify(status: 'SUCCESS', service: 'frontend', env: params.DEPLOY_ENV) }
         failure { notify(status: 'FAILURE', service: 'frontend', env: params.DEPLOY_ENV) }
@@ -2140,7 +2147,6 @@ def scaffold(project_name: str, org: str = "myproject") -> None:
         "Dockerfile": get_dockerfile(),
         ".dockerignore": get_dockerignore(),
         "Jenkinsfile": get_jenkinsfile(org),
-        "vercel.json": get_vercel_json(),
 
         # Middleware (Next.js root)
         "src/middleware.ts": get_middleware(),
@@ -2253,15 +2259,17 @@ def _setup_gitea_repo(project_name: str, root: Path, org: str = "myproject") -> 
     import urllib.error
     import urllib.request
 
-    gitea_host = "http://localhost:3000"
+    import os
+    vps_ip = os.environ.get("VPS_IP", "")
+    gitea_host = f"http://{vps_ip}:3000" if vps_ip else "http://localhost:3000"
     credentials = base64.b64encode(b"gitea-admin:gitea-admin").decode()
 
     try:
         urllib.request.urlopen(f"{gitea_host}/api/healthz", timeout=3)
     except Exception:
         logger.warning(
-            "[Gitea] No activo en %s — crear el repo manualmente tras correr "
-            "base-infrastructure-builder.sh.", gitea_host
+            "[Gitea] No activo en %s — crear el repo manualmente "
+            "(VPS_IP=%s, base-infrastructure-builder.sh --vps-ip).", gitea_host, vps_ip or "no definido"
         )
         return
 
@@ -2304,7 +2312,7 @@ def _setup_gitea_repo(project_name: str, root: Path, org: str = "myproject") -> 
         remote_url = f"{gitea_host}/{org}/{project_name}.git"
         subprocess.run(["git", "remote", "add", "origin", remote_url], cwd=root, check=False)
         logger.info("[Gitea] Remote 'origin' → %s", remote_url)
-        logger.info("[Gitea] URL interna (Jenkins/ArgoCD): http://gitea:3000/%s/%s.git", org, project_name)
+        logger.info("[Gitea] URL para Jenkins/ArgoCD: %s/%s/%s.git", gitea_host, org, project_name)
         # Auto-push con credenciales embebidas (sin guardarlas en .git/config).
         push_url = remote_url.replace("http://", "http://gitea-admin:gitea-admin@", 1)
         push = subprocess.run(

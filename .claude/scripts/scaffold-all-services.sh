@@ -92,6 +92,7 @@ PG_DB_NAME=""
 MONGO_DB_NAME=""
 DB_USER=""
 DB_PASSWORD=""
+VPS_IP=""
 
 usage() {
   cat <<EOF
@@ -112,6 +113,9 @@ Uso: $0 -P <proyecto> --backend nombre:db:messaging:puerto [--backend ...] \
   -m, --mongo-db NOMBRE   Base de datos MongoDB    (obligatorio)
   -u, --user     NOMBRE   Usuario de aplicación    (obligatorio)
   -w, --password CLAVE    Clave del usuario         (obligatorio)
+  --vps-ip       IP       IP del VPS donde corren los servicios systemd.
+                          Se propaga a create-all-secrets-dev.sh, run-liquibase-migrations.sh
+                          y las verificaciones de floci. (obligatorio)
 
   --frontend  Nombre del proyecto frontend Next.js (opcional).
               Si se omite, no se genera frontend.
@@ -371,6 +375,14 @@ while [[ $# -gt 0 ]]; do
       REPORT_SCHEDULE="${1#*=}"
       shift
       ;;
+    --vps-ip)
+      VPS_IP="${2:?--vps-ip requiere una IP}"
+      shift 2
+      ;;
+    --vps-ip=*)
+      VPS_IP="${1#*=}"
+      shift
+      ;;
     -h|--help)
       usage
       ;;
@@ -388,6 +400,7 @@ MISSING_ARGS=()
 [[ -z "$MONGO_DB_NAME" ]] && MISSING_ARGS+=("-m/--mongo-db")
 [[ -z "$DB_USER"       ]] && MISSING_ARGS+=("-u/--user")
 [[ -z "$DB_PASSWORD"   ]] && MISSING_ARGS+=("-w/--password")
+[[ -z "$VPS_IP"        ]] && MISSING_ARGS+=("--vps-ip")
 
 if [[ ${#MISSING_ARGS[@]} -gt 0 ]]; then
   log_err "Faltan parámetros obligatorios: ${MISSING_ARGS[*]}"
@@ -900,25 +913,28 @@ else
 fi
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 11. Secrets floci
+# 11. Secrets floci (endpoints del VPS)
 # ──────────────────────────────────────────────────────────────────────────────
 HEADER "11. Secrets floci"
 
-log "Ejecutando create-all-secrets-dev.sh..."
+log "Ejecutando create-all-secrets-dev.sh (floci en $VPS_IP:4566)..."
 if bash "$SCRIPT_DIR/create-all-secrets-dev.sh" \
      --project  "$PROJECT_NAME" \
      --pg-db    "$PG_DB_NAME" \
      --mongo-db "$MONGO_DB_NAME" \
      --user     "$DB_USER" \
-     --password "$DB_PASSWORD"; then
-  log_ok "Secrets creados en floci."
+     --password "$DB_PASSWORD" \
+     --vps-ip   "$VPS_IP"; then
+  log_ok "Secrets creados en floci ($VPS_IP:4566)."
 else
   log_err "Creación de secrets falló."
   exit 1
 fi
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 12. Terraform apply (dev — ECR + Secrets Manager)
+# 12. Terraform apply (dev — Secrets Manager + Cognito + API Gateway)
+# Nota: ECR y RDS ya no existen en dev (eliminados en PLAN-VPS-MIGRATION.md).
+#       Terraform gestiona solo recursos floci: Cognito, API Gateway, Secrets Manager, IAM.
 # ──────────────────────────────────────────────────────────────────────────────
 HEADER "12. Terraform apply (dev)"
 
@@ -929,8 +945,9 @@ if [[ ! -d "$TERRAFORM_DEV_DIR" ]]; then
   exit 1
 fi
 
-log "Aplicando Terraform en $TERRAFORM_DEV_DIR..."
-if (cd "$TERRAFORM_DEV_DIR" && terraform apply -auto-approve); then
+log "Aplicando Terraform en $TERRAFORM_DEV_DIR (floci en $VPS_IP:4566)..."
+if (cd "$TERRAFORM_DEV_DIR" && \
+    AWS_ENDPOINT_URL="http://${VPS_IP}:4566" terraform apply -auto-approve); then
   log_ok "Terraform apply completado."
 else
   log_err "Terraform apply falló."
@@ -938,29 +955,29 @@ else
 fi
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 13. Verificación — repositorios ECR en floci
+# 13. Verificación — Gitea Package Registry en VPS
+# (reemplaza la verificación de ECR; el registry de imágenes es Gitea en el VPS)
 # ──────────────────────────────────────────────────────────────────────────────
-HEADER "13. Verificación ECR en floci"
+HEADER "13. Verificación Gitea Package Registry en VPS"
 
-log "Listando repositorios ECR en floci (localhost:4566)..."
-aws --endpoint-url=http://localhost:4566 ecr describe-repositories \
-  --region us-east-1 \
-  --query 'repositories[].repositoryName' \
-  --output table \
-  && log_ok "Repositorios ECR verificados." \
-  || log_warn "No se pudieron listar los repositorios ECR (floci puede no estar levantado)."
+log "Verificando acceso al Gitea Package Registry ($VPS_IP:3000)..."
+if curl -sf "http://${VPS_IP}:3000/api/healthz" &>/dev/null; then
+  log_ok "Gitea Package Registry accesible en http://$VPS_IP:3000/$PROJECT_NAME"
+else
+  log_warn "Gitea no responde en $VPS_IP:3000 — verificar que el servicio está activo en el VPS."
+fi
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 14. Verificación — secrets en floci
+# 14. Verificación — secrets en floci (VPS)
 # ──────────────────────────────────────────────────────────────────────────────
 HEADER "14. Verificación de secrets en floci"
 
-log "Listando secrets ${PROJECT_NAME}/dev/* en Secrets Manager de floci..."
-aws --endpoint-url=http://localhost:4566 secretsmanager list-secrets \
+log "Listando secrets ${PROJECT_NAME}/dev/* en Secrets Manager de floci ($VPS_IP:4566)..."
+aws --endpoint-url="http://${VPS_IP}:4566" secretsmanager list-secrets \
   --region us-east-1 \
   --query "SecretList[?starts_with(Name, \`${PROJECT_NAME}/dev/\`)].Name" \
   --output table \
   && log_ok "Secrets verificados." \
-  || log_warn "No se pudieron listar los secrets (floci puede no estar levantado)."
+  || log_warn "No se pudieron listar los secrets (floci puede no estar levantado en $VPS_IP:4566)."
 
 log_ok "Pipeline post-scaffolding completado exitosamente."

@@ -249,7 +249,8 @@ variable "aws_region" {
   default = "us-east-1"
 }
 
-# floci en dev (http://localhost:4566); vacío en staging/prod => AWS real.
+# floci en dev (http://VPS_IP:4566); vacío en staging/prod => AWS real.
+# En dev, sobreescribir con: TF_VAR_aws_endpoint_url=http://<VPS_IP>:4566 terraform apply
 variable "aws_endpoint_url" {
   type    = string
   default = "http://localhost:4566"
