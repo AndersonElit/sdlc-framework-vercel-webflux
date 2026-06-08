@@ -74,6 +74,7 @@ RAM=8192
 DISKSIZE="60G"
 VM_NAME="sdlc-vps"
 VM_IP=""
+VM_USER="ubuntu"
 SSH_KEY="$HOME/.ssh/id_ed25519.pub"
 ISO_PATH="$HOME/vms/iso/ubuntu-26.04-live-server-amd64.iso"
 DISK_DIR="$HOME/vms/disks"
@@ -92,6 +93,7 @@ while [[ $# -gt 0 ]]; do
     --name)     VM_NAME="$2";  shift 2 ;;
     --vm-ip)    VM_IP="$2";    shift 2 ;;
     --ssh-key)  SSH_KEY="$2";  shift 2 ;;
+    --user)     VM_USER="$2";  shift 2 ;;
     --force)    FORCE=true;    shift   ;;
     *) die "Opción desconocida: $1" ;;
   esac
@@ -118,7 +120,7 @@ require_vm_ip() {
 }
 
 ssh_vm() {
-  ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "ubuntu@${VM_IP}" "$@"
+  ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "${VM_USER}@${VM_IP}" "$@"
 }
 
 # ─── COMANDO: help ────────────────────────────────────────────────────────────
@@ -163,7 +165,8 @@ cmd_create() {
     --cpu host-model \
     --os-variant ubuntu24.04 \
     --disk "path=${DISK_PATH},format=qcow2,bus=virtio" \
-    --cdrom "$ISO_PATH" \
+    --location "${ISO_PATH},kernel=casper/vmlinuz,initrd=casper/initrd" \
+    --extra-args "console=ttyS0,115200n8 ---" \
     --network network=default,model=virtio \
     --graphics none \
     --console pty,target_type=serial \
@@ -188,13 +191,15 @@ cmd_setup() {
 
   [[ -f "$SSH_KEY" ]] || die "Clave SSH no encontrada: $SSH_KEY. Pasa --ssh-key con la ruta correcta."
 
-  info "Copiando clave SSH a la VM ($VM_IP)..."
-  ssh-copy-id -i "$SSH_KEY" "ubuntu@${VM_IP}"
+  info "Copiando clave SSH a la VM ($VM_IP) como usuario '$VM_USER'..."
+  ssh-copy-id -i "$SSH_KEY" "${VM_USER}@${VM_IP}"
 
   info "Ejecutando configuración OCI-compatible en la VM..."
 
-  ssh_vm "bash -s" <<'REMOTE'
+  local vm_user="$VM_USER"
+  ssh_vm "bash -s" <<REMOTE
 set -euo pipefail
+VM_USER="${vm_user}"
 
 # 4.2 — SSH key-only, deshabilitar password auth
 echo "[4.2] SSH key-only..."
@@ -203,9 +208,9 @@ sudo sed -i 's/^#*PubkeyAuthentication.*/PubkeyAuthentication yes/'     /etc/ssh
 sudo systemctl restart ssh
 
 # 4.3 — sudo sin password (igual que OCI)
-echo "[4.3] sudo NOPASSWD..."
-echo "ubuntu ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/ubuntu > /dev/null
-sudo chmod 440 /etc/sudoers.d/ubuntu
+echo "[4.3] sudo NOPASSWD para \$VM_USER..."
+echo "\$VM_USER ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/\$VM_USER > /dev/null
+sudo chmod 440 /etc/sudoers.d/\$VM_USER
 
 # 4.4 — hostname convención OCI
 echo "[4.4] Hostname..."
@@ -241,7 +246,7 @@ sudo apt-get install -y -qq ufw
 sudo ufw default deny incoming
 sudo ufw default allow outgoing
 for PORT in 22 80 443 3000 3001 4566 6443 8080 9000 9090 16686; do
-  sudo ufw allow "${PORT}/tcp"
+  sudo ufw allow "\${PORT}/tcp"
 done
 sudo ufw --force enable
 sudo ufw status verbose
@@ -254,11 +259,17 @@ sudo sysctl -p /etc/sysctl.d/99-sonarqube.conf
 # 4.10 — límites de archivos abiertos
 echo "[4.10] Límites nofile..."
 sudo tee /etc/security/limits.d/99-sdlc.conf > /dev/null <<EOF
-*      soft nofile 65536
-*      hard nofile 65536
-ubuntu soft nofile 65536
-ubuntu hard nofile 65536
+*          soft nofile 65536
+*          hard nofile 65536
+\$VM_USER   soft nofile 65536
+\$VM_USER   hard nofile 65536
 EOF
+
+# 4.11 — habilitar consola serial para virsh console
+echo "[4.11] Consola serial (virsh console)..."
+sudo sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT="console=tty0 console=ttyS0,115200n8"/' /etc/default/grub
+sudo update-grub
+sudo systemctl enable --now serial-getty@ttyS0.service
 
 echo "[OK] Configuración en VM completa."
 REMOTE
@@ -279,7 +290,7 @@ REMOTE
 
   sudo netfilter-persistent save
   ok "Port-forwarding configurado."
-  ok "Setup completo. SSH: ssh ubuntu@${VM_IP}"
+  ok "Setup completo. SSH: ssh ${VM_USER}@${VM_IP}"
 }
 
 # ─── COMANDO: snapshot  (Paso 6) ─────────────────────────────────────────────
@@ -346,7 +357,7 @@ cmd_status() {
 
   echo -e "\n${BOLD}Disco:${RESET}"
   if [[ -f "$DISK_PATH" ]]; then
-    qemu-img info "$DISK_PATH" | grep -E "(file format|virtual size|disk size)"
+    qemu-img info --force-share "$DISK_PATH" | grep -E "(file format|virtual size|disk size)"
   else
     warn "Disco no encontrado: $DISK_PATH"
   fi
