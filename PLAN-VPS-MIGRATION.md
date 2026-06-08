@@ -1,4 +1,4 @@
-# Plan de Migración: Docker Local → VPS Ubuntu Server 24.04 LTS
+# Plan de Migración: Docker Local → VPS Ubuntu Server 26.04 LTS
 
 ## Contexto
 
@@ -185,7 +185,7 @@ Estas no son servicios — son binarios/CLIs que los scripts del framework invoc
 ## Resumen de cambios por capa
 
 ```
-ANTES (local)                          DESPUÉS (VPS Ubuntu Server 24.04 LTS)
+ANTES (local)                          DESPUÉS (VPS Ubuntu Server 26.04 LTS)
 ─────────────────────────────────────  ──────────────────────────────────────────
 Docker container: floci              → Docker container: floci (se mantiene — 13 MiB idle)
                                          gestionado con floci CLI (floci start/stop/status)
@@ -218,15 +218,15 @@ Resultado: de 8 contenedores Docker → 1 contenedor Docker (floci)
 
 ## Requisitos del VPS
 
-| Recurso | Valor |
-|---|---|
-| **CPU** | 8 vCPU |
-| **RAM** | 16 GB |
-| **Disco** | 120 GB SSD |
-| **OS** | Ubuntu Server **24.04 LTS** (instalación minimal) |
-| **Red** | IP pública fija o dominio — acceso remoto a Gitea, Jenkins, SonarQube |
+| Recurso | Recomendado (todos los servicios) | Default `qemu-vps.sh` | Flag de override |
+|---|---|---|---|
+| **CPU** | 8 vCPU | 4 vCPU | `--vcpus 8` |
+| **RAM** | 16 GB | 8 GB (8192 MB) | `--ram 16384` |
+| **Disco** | 120 GB SSD | 60 GB | `--disksize 120G` |
+| **OS** | Ubuntu Server **26.04 LTS** (instalación minimal) | — | — |
+| **Red** | IP privada en red `default` de libvirt (NAT) + port-forwarding iptables automático | — | — |
 
-> **Por qué 24.04 y no 26.04:** todos los repos oficiales de las herramientas del framework (MongoDB 7, Jenkins, Java 17/21) publican paquetes verificados para `noble` (24.04). 26.04 es demasiado reciente y algunos repos aún no tienen paquetes estables para esa base. La diferencia de RAM entre versiones del OS es ~50 MB — irrelevante.
+> El VPS local se crea con `qemu-vps.sh create` (QEMU/KVM vía libvirt). Los defaults del script son mínimos para entornos de prueba; para ejecutar todos los servicios simultáneamente usar los valores recomendados.
 
 ---
 
@@ -330,8 +330,21 @@ Las variables relacionadas con Vercel desaparecen en todos los entornos:
 
 ## Próximos pasos sugeridos
 
-1. Provisionar el VPS (Ubuntu Server 24.04 LTS minimal, 16 GB RAM, 8 vCPU, 120 GB SSD).
-2. Instalar prerequisitos del sistema (Docker, AWS CLI, kubectl, helm, terraform, Java 21, Maven, curl, jq, yq, git, python3).
+1. **Aprovisionar el VPS local con `qemu-vps.sh`** (Ubuntu Server 26.04 LTS, QEMU/KVM):
+   ```bash
+   # Crear disco + VM (ajustar flags según hardware disponible)
+   ./qemu-vps.sh create --vcpus 8 --ram 16384 --disksize 120G
+
+   # Instalar Ubuntu en la consola serial (Paso 3 de PLAN-VPS-LOCAL-QEMU.md)
+   virsh console sdlc-vps
+
+   # Configuración post-instalación OCI-compatible + port-forwarding iptables
+   ./qemu-vps.sh setup --vm-ip <IP>   # IP visible con: ./qemu-vps.sh status
+
+   # Snapshot base antes de instalar servicios
+   ./qemu-vps.sh snapshot
+   ```
+2. Instalar prerequisitos del sistema en la VM (Docker, AWS CLI, kubectl, helm, terraform, Java 21, Maven, curl, jq, yq, git, python3).
 3. Instalar floci CLI (`curl -fsSL https://floci.io/install.sh | sh`) y levantar floci.
 4. Crear script `vps-setup.sh` que instale cada herramienta como servicio systemd (MongoDB, Kafka, Gitea, SonarQube, Jenkins, WireMock, LRA).
 5. Instalar K3s nativo (`curl -sfL https://get.k3s.io | sh -`).
