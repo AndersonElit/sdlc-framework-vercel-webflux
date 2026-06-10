@@ -180,28 +180,44 @@ if [[ "$SERVICES_OK" -eq 0 ]]; then
 fi
 
 # ──────────────────────────────────────────────────────────────────────────────
+# 2b. Tunnel SSH — MongoDB solo escucha en localhost del VPS.
+#     PostgreSQL se accede via SSH con peer auth (sudo -u postgres psql).
+# ──────────────────────────────────────────────────────────────────────────────
+log "Abriendo tunnel SSH (Mongo 27018 → VPS:27017)..."
+ssh -i "$VPS_SSH_KEY" -o StrictHostKeyChecking=no -o ExitOnForwardFailure=yes \
+    -N -L 27018:127.0.0.1:27017 \
+    "${VPS_USER}@${VPS_IP}" &
+TUNNEL_PID=$!
+trap "kill $TUNNEL_PID 2>/dev/null; wait $TUNNEL_PID 2>/dev/null" EXIT
+sleep 2
+if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
+  log_err "No se pudo abrir el tunnel SSH. Verificar acceso SSH al VPS."
+  exit 1
+fi
+log_ok "Tunnel SSH MongoDB activo (PID=$TUNNEL_PID)."
+
+# Helper: ejecuta psql en la VPS via SSH con peer auth (sin password)
+pg_vps() { ssh_vps "sudo -u postgres psql $*"; }
+
+# ──────────────────────────────────────────────────────────────────────────────
 # 3. Obtener puerto PostgreSQL de Terraform
 # ──────────────────────────────────────────────────────────────────────────────
 HEADER "3. Conectando a PostgreSQL nativo en VPS ($VPS_IP:5432)"
 
 # PostgreSQL 16 corre como servicio nativo (postgresql.service) en el VPS.
 # Puerto estándar 5432 — sin Terraform ni floci.
-PG_HOST="$VPS_IP"
-PG_PORT="5432"
+log_ok "PostgreSQL via SSH peer auth (sudo -u postgres psql)"
 
-log_ok "PostgreSQL nativo en $PG_HOST:$PG_PORT"
-
-PGADMIN="postgresql://postgres:@${PG_HOST}:${PG_PORT}"
-PGAPP="postgresql://${APP_USER}:${APP_PASS}@${PG_HOST}:${PG_PORT}"
+PGADMIN=""  # no usado; acceso via pg_vps()
+PGAPP=""    # no usado; acceso via pg_vps()
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 4. PostgreSQL — crear usuario de aplicación
 # ──────────────────────────────────────────────────────────────────────────────
 HEADER "4. PostgreSQL — usuario de aplicación"
 
-log "Creando usuario $APP_USER (idempotente) vía psql a VPS..."
-PGPASSWORD="" PGUSER=postgres PGHOST="$PG_HOST" PGPORT="$PG_PORT" psql \
-  -c "CREATE USER \"$APP_USER\" WITH PASSWORD '$APP_PASS'" 2>/dev/null || true
+log "Creando usuario $APP_USER (idempotente) vía SSH en VPS..."
+pg_vps "-d postgres -c \"CREATE USER \\\"$APP_USER\\\" WITH PASSWORD '$APP_PASS'\"" 2>/dev/null || true
 log_ok "Usuario $APP_USER listo."
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -214,18 +230,17 @@ PG_DBS_CREATED=()
 create_pg_db() {
   local db_name="$1"
   local db_exists
-  local pg_env="PGUSER=postgres PGHOST=$PG_HOST PGPORT=$PG_PORT PGPASSWORD="
-  db_exists=$(env $pg_env psql -d postgres \
-    -tc "SELECT 1 FROM pg_database WHERE datname='$db_name'" 2>/dev/null | tr -d '[:space:]')
+  db_exists=$(pg_vps "-d postgres -tc \"SELECT 1 FROM pg_database WHERE datname='$db_name'\"" \
+    2>/dev/null | tr -d '[:space:]')
 
   if [[ "$db_exists" == "1" ]]; then
     log_ok "  BD $db_name ya existe — omitiendo."
   else
-    env $pg_env psql -d postgres -c "CREATE DATABASE \"$db_name\" OWNER \"$APP_USER\""
+    pg_vps "-d postgres -c \"CREATE DATABASE \\\"$db_name\\\" OWNER \\\"$APP_USER\\\"\""
     log_ok "  BD $db_name creada (owner=$APP_USER)."
   fi
 
-  env $pg_env psql -d "$db_name" -c "GRANT ALL ON SCHEMA public TO \"$APP_USER\"" &>/dev/null
+  pg_vps "-d \"$db_name\" -c \"GRANT ALL ON SCHEMA public TO \\\"$APP_USER\\\"\"" &>/dev/null
   log_ok "  $db_name — permisos listos."
   PG_DBS_CREATED+=("$db_name")
 }
@@ -293,7 +308,7 @@ MONGO_DBS_CREATED=()
 
 create_mongo_db() {
   local db_name="$1"
-  local noauth_uri="mongodb://${VPS_IP}:27017/$db_name"
+  local noauth_uri="mongodb://127.0.0.1:27018/$db_name"
   local app_uri="mongodb://$APP_USER:$APP_PASS@${VPS_IP}:27017/$db_name?authSource=$db_name"
 
   mongosh "$noauth_uri" --quiet --eval "
@@ -330,7 +345,7 @@ done
 if [[ -n "${COLLECTIONS_JS:-}" && ${#MONGO_DBS_CREATED[@]} -gt 0 ]]; then
   log "Aplicando colecciones JS a cada BD MongoDB creada..."
   for db_name in "${MONGO_DBS_CREATED[@]}"; do
-    mongosh "mongodb://${VPS_IP}:27017/$db_name" "$COLLECTIONS_JS" &>/dev/null \
+    mongosh "mongodb://127.0.0.1:27018/$db_name" "$COLLECTIONS_JS" &>/dev/null \
       && log_ok "  $db_name — colecciones aplicadas." \
       || log_warn "  $db_name — no se pudieron aplicar colecciones (continúa)."
   done
@@ -365,15 +380,14 @@ check_item() {
 check_item "PostgreSQL nativo en VPS ($VPS_IP:5432)" 0
 
 # usuario de aplicación existe en PG
-USER_EXISTS=$(PGPASSWORD=changeme123 psql "$PGADMIN/postgres" \
-  -tc "SELECT 1 FROM pg_roles WHERE rolname='$APP_USER'" 2>/dev/null | tr -d '[:space:]')
+USER_EXISTS=$(pg_vps "-d postgres -tc \"SELECT 1 FROM pg_roles WHERE rolname='$APP_USER'\"" \
+  2>/dev/null | tr -d '[:space:]')
 [[ "$USER_EXISTS" == "1" ]] && check_item "Usuario $APP_USER existe en PostgreSQL" 0 \
                               || check_item "Usuario $APP_USER existe en PostgreSQL" 1
 
 # Una BD PostgreSQL por cada servicio detectado con adaptador postgres
 for db_name in "${PG_DBS_CREATED[@]}"; do
-  DB_OWNER=$(PGPASSWORD=changeme123 psql "$PGADMIN/postgres" \
-    -tc "SELECT pg_catalog.pg_get_userbyid(datdba) FROM pg_database WHERE datname='$db_name'" \
+  DB_OWNER=$(pg_vps "-d postgres -tc \"SELECT pg_catalog.pg_get_userbyid(datdba) FROM pg_database WHERE datname='$db_name'\"" \
     2>/dev/null | tr -d '[:space:]')
   [[ "$DB_OWNER" == "$APP_USER" ]] \
     && check_item "BD $db_name (owner=$APP_USER)" 0 \
@@ -385,7 +399,7 @@ done
 
 # Una BD MongoDB por cada servicio detectado con adaptador mongo
 for db_name in "${MONGO_DBS_CREATED[@]}"; do
-  MONGO_PING=$(mongosh "mongodb://localhost:27017/$db_name" --quiet \
+  MONGO_PING=$(mongosh "mongodb://127.0.0.1:27018/$db_name" --quiet \
     --eval 'db.runCommand({ping:1}).ok' 2>/dev/null | tr -d '[:space:]')
   [[ "$MONGO_PING" == "1" ]] \
     && check_item "BD MongoDB $db_name accesible" 0 \

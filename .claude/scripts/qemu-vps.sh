@@ -277,18 +277,20 @@ REMOTE
   header "Paso 5 — Port-forwarding host → VM (iptables)"
   info "VM IP: $VM_IP  |  puertos: ${PORTS[*]}"
 
-  for PORT in "${PORTS[@]}"; do
-    sudo iptables -t nat -C PREROUTING -p tcp --dport "$PORT" -j DNAT \
-      --to-destination "${VM_IP}:${PORT}" 2>/dev/null \
-      || sudo iptables -t nat -A PREROUTING -p tcp --dport "$PORT" -j DNAT \
-           --to-destination "${VM_IP}:${PORT}"
-    sudo iptables -C FORWARD -p tcp -d "$VM_IP" --dport "$PORT" -j ACCEPT 2>/dev/null \
-      || sudo iptables -A FORWARD -p tcp -d "$VM_IP" --dport "$PORT" -j ACCEPT
-  done
-  sudo iptables -t nat -C POSTROUTING -j MASQUERADE 2>/dev/null \
-    || sudo iptables -t nat -A POSTROUTING -j MASQUERADE
-
-  sudo netfilter-persistent save
+  sudo bash -c "
+    VM_IP='${VM_IP}'
+    for PORT in ${PORTS[*]}; do
+      iptables -t nat -C PREROUTING -p tcp --dport \"\$PORT\" -j DNAT \
+        --to-destination \"\${VM_IP}:\${PORT}\" 2>/dev/null \
+        || iptables -t nat -A PREROUTING -p tcp --dport \"\$PORT\" -j DNAT \
+             --to-destination \"\${VM_IP}:\${PORT}\"
+      iptables -C FORWARD -p tcp -d \"\$VM_IP\" --dport \"\$PORT\" -j ACCEPT 2>/dev/null \
+        || iptables -A FORWARD -p tcp -d \"\$VM_IP\" --dport \"\$PORT\" -j ACCEPT
+    done
+    iptables -t nat -C POSTROUTING -j MASQUERADE 2>/dev/null \
+      || iptables -t nat -A POSTROUTING -j MASQUERADE
+    netfilter-persistent save
+  "
   ok "Port-forwarding configurado."
   ok "Setup completo. SSH: ssh ${VM_USER}@${VM_IP}"
 }
@@ -415,12 +417,15 @@ cmd_delete() {
   step "4/5" "Limpiar reglas iptables"
   if [[ -n "$VM_IP" ]]; then
     info "Eliminando port-forwarding para $VM_IP (puertos: ${PORTS[*]})..."
-    for PORT in "${PORTS[@]}"; do
-      sudo iptables -t nat -D PREROUTING -p tcp --dport "$PORT" -j DNAT \
-        --to-destination "${VM_IP}:${PORT}" 2>/dev/null || true
-      sudo iptables -D FORWARD -p tcp -d "$VM_IP" --dport "$PORT" -j ACCEPT 2>/dev/null || true
-    done
-    sudo netfilter-persistent save
+    sudo bash -c "
+      VM_IP='${VM_IP}'
+      for PORT in ${PORTS[*]}; do
+        iptables -t nat -D PREROUTING -p tcp --dport \"\$PORT\" -j DNAT \
+          --to-destination \"\${VM_IP}:\${PORT}\" 2>/dev/null || true
+        iptables -D FORWARD -p tcp -d \"\$VM_IP\" --dport \"\$PORT\" -j ACCEPT 2>/dev/null || true
+      done
+      netfilter-persistent save
+    "
     ok "Reglas iptables eliminadas."
   else
     warn "Sin --vm-ip: iptables no modificado."

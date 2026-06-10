@@ -37,18 +37,19 @@ def get_yaml_content(project_name: str, database: str, messaging_system: str, po
             "    password: ${RABBITMQ_PASSWORD}",
         ]
 
-    if messaging_system.lower() in ("kafka-producer", "kafka-consumer"):
+    ms = messaging_system.lower()
+    if "kafka-producer" in ms or "kafka-consumer" in ms:
         lines += [
             "  kafka:",
             "    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS}",
         ]
-        if messaging_system.lower() == "kafka-producer":
+        if "kafka-producer" in ms:
             lines += [
                 "    producer:",
                 "      key-serializer: org.apache.kafka.common.serialization.StringSerializer",
                 "      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer",
             ]
-        else:
+        if "kafka-consumer" in ms:
             lines += [
                 "    consumer:",
                 "      group-id: ${KAFKA_CONSUMER_GROUP_ID}",
@@ -111,10 +112,10 @@ def get_secrets_setup_content(project_name: str, database: str, messaging_system
         secret["RABBITMQ_USERNAME"] = "guest"
         secret["RABBITMQ_PASSWORD"] = "guest"
 
-    if messaging_system.lower() in ("kafka-producer", "kafka-consumer"):
+    if "kafka-producer" in messaging_system.lower() or "kafka-consumer" in messaging_system.lower():
         secret["KAFKA_BOOTSTRAP_SERVERS"] = "${VPS_IP:-localhost}:29092"
 
-    if messaging_system.lower() == "kafka-consumer":
+    if "kafka-consumer" in messaging_system.lower():
         secret["KAFKA_CONSUMER_GROUP_ID"] = f"{project_name}-group"
 
     secret_json = json.dumps(secret)
@@ -167,11 +168,15 @@ def get_dockerfile_content(database: str, messaging_system: str, port: int = 808
         copy_poms.append(
             "COPY infrastructure/entry-points/rabbit-consumer/pom.xml infrastructure/entry-points/rabbit-consumer/"
         )
-    elif messaging_system.lower() == "kafka-producer":
+    elif "kafka-producer" in messaging_system.lower():
         copy_poms.append(
             "COPY infrastructure/driven-adapters/kafka-producer/pom.xml infrastructure/driven-adapters/kafka-producer/"
         )
-    elif messaging_system.lower() == "kafka-consumer":
+        if "kafka-consumer" in messaging_system.lower():
+            copy_poms.append(
+                "COPY infrastructure/entry-points/kafka-consumer/pom.xml infrastructure/entry-points/kafka-consumer/"
+            )
+    elif "kafka-consumer" in messaging_system.lower():
         copy_poms.append(
             "COPY infrastructure/entry-points/kafka-consumer/pom.xml infrastructure/entry-points/kafka-consumer/"
         )
@@ -616,9 +621,11 @@ def get_root_pom(project_name: str, database: str, messaging_system: str, outbox
         modules.append("infrastructure/driven-adapters/rabbit-producer")
     elif messaging_system.lower() == "rabbit-consumer":
         modules.append("infrastructure/entry-points/rabbit-consumer")
-    elif messaging_system.lower() == "kafka-producer":
+    elif "kafka-producer" in messaging_system.lower():
         modules.append("infrastructure/driven-adapters/kafka-producer")
-    elif messaging_system.lower() == "kafka-consumer":
+        if "kafka-consumer" in messaging_system.lower():
+            modules.append("infrastructure/entry-points/kafka-consumer")
+    elif "kafka-consumer" in messaging_system.lower():
         modules.append("infrastructure/entry-points/kafka-consumer")
 
     if outbox:
@@ -1538,10 +1545,13 @@ def scaffold(project_name: str, database: str, messaging_system: str, port: int 
     elif messaging_system.lower() == "rabbit-consumer":
         modules.append("infrastructure/entry-points/rabbit-consumer")
         logger.debug("Mensajería habilitada: rabbit-consumer")
-    elif messaging_system.lower() == "kafka-producer":
+    elif "kafka-producer" in messaging_system.lower():
         modules.append("infrastructure/driven-adapters/kafka-producer")
         logger.debug("Mensajería habilitada: kafka-producer")
-    elif messaging_system.lower() == "kafka-consumer":
+        if "kafka-consumer" in messaging_system.lower():
+            modules.append("infrastructure/entry-points/kafka-consumer")
+            logger.debug("Mensajería habilitada: kafka-consumer")
+    elif "kafka-consumer" in messaging_system.lower():
         modules.append("infrastructure/entry-points/kafka-consumer")
         logger.debug("Mensajería habilitada: kafka-consumer")
 
@@ -1646,9 +1656,11 @@ public class ApplicationConfig {{
         create_rabbit_producer_files(root, safe_name)
     elif messaging_system.lower() == "rabbit-consumer":
         create_rabbit_consumer_files(root, safe_name)
-    elif messaging_system.lower() == "kafka-producer":
+    elif "kafka-producer" in messaging_system.lower():
         create_kafka_producer_files(root, safe_name)
-    elif messaging_system.lower() == "kafka-consumer":
+        if "kafka-consumer" in messaging_system.lower():
+            create_kafka_consumer_files(root, safe_name)
+    elif "kafka-consumer" in messaging_system.lower():
         create_kafka_consumer_files(root, safe_name)
 
     if outbox:
@@ -1793,6 +1805,9 @@ def _setup_gitea_repo(project_name: str, root: Path, org: str = "myproject") -> 
 
 
 def _update_argocd_applicationset(service_name: str, org: str = "myproject") -> None:
+    import os as _os
+    _vps_ip = _os.environ.get("VPS_IP", "localhost")
+    gitea_host = f"http://{_vps_ip}:3000"
     repo_root = Path(__file__).parent.parent.parent
     envs = ["dev", "staging", "prod"]
     sentinel = "          # -- services managed by scaffold --\n"
@@ -1858,7 +1873,7 @@ def _print_run_instructions(project_name: str, root: Path, messaging_system: str
     rabbit_note = ""
     if messaging_system.lower() in ("rabbit-producer", "rabbit-consumer"):
         rabbit_note = "\n  # Asegúrate de tener RabbitMQ corriendo antes de iniciar:\n  docker run -d --name rabbitmq -p 5672:5672 -p 15672:15672 rabbitmq:3-management\n"
-    elif messaging_system.lower() in ("kafka-producer", "kafka-consumer"):
+    elif "kafka-producer" in messaging_system.lower() or "kafka-consumer" in messaging_system.lower():
         rabbit_note = "\n  # Asegúrate de tener Kafka corriendo antes de iniciar:\n  docker run -d --name kafka -p 9092:9092 -e KAFKA_CFG_NODE_ID=0 -e KAFKA_CFG_PROCESS_ROLES=controller,broker -e KAFKA_CFG_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093 -e KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT -e KAFKA_CFG_CONTROLLER_QUORUM_VOTERS=0@kafka:9093 -e KAFKA_CFG_CONTROLLER_LISTENER_NAMES=CONTROLLER bitnami/kafka:latest\n"
 
     instructions = f"""
@@ -1926,8 +1941,7 @@ def main() -> None:
     parser.add_argument("-d", "--database", required=True, default="postgres",
                         choices=["postgres", "mongo"], help="Base de datos a configurar")
     parser.add_argument("-m", "--messaging-system", default="none",
-                        choices=["none", "rabbit-producer", "rabbit-consumer", "kafka-producer", "kafka-consumer"],
-                        help="Sistema de mensajería a configurar")
+                        help="Sistema de mensajería (none|kafka-producer|kafka-consumer|kafka-producer+kafka-consumer|rabbit-producer|rabbit-consumer)")
     parser.add_argument("-p", "--port", type=int, default=8080,
                         metavar="PORT", help="Puerto HTTP del servidor (default: 8080)")
     parser.add_argument("--org", default="myproject", metavar="ORG",

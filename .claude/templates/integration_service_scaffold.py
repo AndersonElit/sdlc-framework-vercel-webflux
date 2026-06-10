@@ -218,7 +218,12 @@ def get_saga_camel_pom(parent_artifact_id: str, safe: str) -> str:
 def get_integration_app_pom(parent_artifact_id: str, safe: str, modules: list[str]) -> str:
     """El `app` ensambla todos los adaptadores/entry-points para que sus beans carguen."""
     infra = [m for m in modules if m.startswith("infrastructure/") and not m.endswith("/app")]
-    dep_blocks = []
+    dep_blocks = [f"""\
+        <dependency>
+            <groupId>com.{safe}.usecases</groupId>
+            <artifactId>application-use-cases</artifactId>
+            <version>${{project.version}}</version>
+        </dependency>"""]
     for m in infra:
         artifact = m.replace("/", "-")
         pkg = m.split("/")[-1].replace("-", "")
@@ -703,8 +708,11 @@ def scaffold_integration(project_name: str, externals: list[str], flows: list[st
             (module_dir / "pom.xml").write_text(get_saga_camel_pom(project_name, safe))
         elif module == "infrastructure/entry-points/app":
             (module_dir / "pom.xml").write_text(get_integration_app_pom(project_name, safe, modules))
+        elif module == "application/use-cases":
+            pom = _module_pom_header(project_name, safe, module) + _domain_dep(safe) + "</dependencies>\n</project>\n"
+            (module_dir / "pom.xml").write_text(pom)
         else:
-            # domain/model, use-cases, postgres, kafka-producer, rest-api, kafka-consumer
+            # domain/model, kafka-producer, rest-api, kafka-consumer
             (module_dir / "pom.xml").write_text(base.get_module_pom(project_name, safe, module))
 
     # Fuentes Kafka (producer de comandos + consumer de respuestas) reutilizando el base

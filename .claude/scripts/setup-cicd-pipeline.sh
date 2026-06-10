@@ -70,10 +70,14 @@ ssh_vps() { ssh -i "$VPS_SSH_KEY" -o StrictHostKeyChecking=no -o ConnectTimeout=
 
 # Calcular total de jobs esperados (backends + frontend opcional)
 EXPECTED_JOB_COUNT=0
+BACKEND_SERVICE_COUNT=0
 IFS=',' read -ra _svc_arr <<< "$SERVICES"
 for _svc in "${_svc_arr[@]}"; do
   _svc="${_svc// /}"
-  [[ -n "$_svc" ]] && EXPECTED_JOB_COUNT=$((EXPECTED_JOB_COUNT + 1))
+  if [[ -n "$_svc" ]]; then
+    EXPECTED_JOB_COUNT=$((EXPECTED_JOB_COUNT + 1))
+    BACKEND_SERVICE_COUNT=$((BACKEND_SERVICE_COUNT + 1))
+  fi
 done
 [[ -n "$FRONTEND_NAME" ]] && EXPECTED_JOB_COUNT=$((EXPECTED_JOB_COUNT + 1))
 
@@ -421,6 +425,62 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
+# Sección 3b — Instalar plugins en el Jenkins nativo del VPS
+# ---------------------------------------------------------------------------
+section_3b_instalar_plugins_jenkins() {
+  log "=== Sección 3b — Instalando plugins en Jenkins nativo ==="
+
+  local plugins_txt="$PROJECT_ROOT/jenkins-shared-library/docker/plugins.txt"
+  if [[ ! -f "$plugins_txt" ]]; then
+    log_err "plugins.txt no encontrado: $plugins_txt"
+    return 1
+  fi
+
+  # Verificar si los plugins ya están instalados (carpeta no vacía)
+  local plugin_count
+  plugin_count=$(ssh_vps "sudo ls /var/lib/jenkins/plugins/ 2>/dev/null | wc -l" || echo 0)
+  if [[ "$plugin_count" -gt 5 ]]; then
+    log_ok "Plugins ya instalados ($plugin_count entradas en /var/lib/jenkins/plugins/). Omitiendo."
+    return 0
+  fi
+
+  log "Descargando jenkins-plugin-manager en VPS..."
+  local pim_version="2.13.2"
+  local pim_jar="jenkins-plugin-manager-${pim_version}.jar"
+  local pim_url="https://github.com/jenkinsci/plugin-installation-manager-tool/releases/download/${pim_version}/${pim_jar}"
+
+  ssh_vps "sudo wget -q -O /tmp/${pim_jar} '${pim_url}'" 2>/dev/null || {
+    log_err "No se pudo descargar jenkins-plugin-manager. Verificar conectividad a internet en la VPS."
+    return 1
+  }
+  log_ok "jenkins-plugin-manager descargado."
+
+  log "Copiando plugins.txt al VPS..."
+  scp -i "$VPS_SSH_KEY" -o StrictHostKeyChecking=no \
+    "$plugins_txt" "${VPS_USER}@${VPS_IP}:/tmp/plugins.txt" 2>/dev/null
+
+  log "Instalando plugins (puede tardar varios minutos)..."
+  ssh_vps "sudo java -jar /tmp/${pim_jar} \
+    --plugin-file /tmp/plugins.txt \
+    --plugin-download-directory /var/lib/jenkins/plugins \
+    --war /usr/share/java/jenkins.war \
+    2>&1 | tail -5" || log_err "Plugin manager reportó errores (puede ser normal si algunos plugins ya existen)."
+
+  log "Ajustando permisos y reiniciando Jenkins..."
+  ssh_vps "sudo chown -R jenkins:jenkins /var/lib/jenkins/plugins && \
+           sudo systemctl restart jenkins"
+  sleep 15
+
+  local ready=0
+  for _ in $(seq 1 24); do
+    if curl -sf -o /dev/null "http://${VPS_IP}:8080/login" 2>/dev/null; then ready=1; break; fi
+    sleep 5
+  done
+  [[ "$ready" -eq 1 ]] && log_ok "Jenkins reiniciado con plugins instalados." \
+                        || log_err "Jenkins no respondió tras reinicio."
+}
+
+# ---------------------------------------------------------------------------
 # Sección 4 — Crear los jobs de pipeline en Jenkins
 # ---------------------------------------------------------------------------
 section_4_crear_jobs_jenkins() {
@@ -440,145 +500,104 @@ section_4_crear_jobs_jenkins() {
     git_base="${GIT_BASE_URL:-https://github.com/${PROJECT_NAME}}"
   fi
 
-  # --- Generar script Groovy para Jenkins Script Console ---
-  log "Generando script de creación de jobs: $jobs_script"
-
-  # Cabecera del script Groovy (heredoc quoted: $ de Groovy no se interpolan)
-  cat > "$jobs_script" <<'GROOVY_HEADER'
-import jenkins.model.Jenkins
-import jenkins.branch.BranchSource
-import jenkins.plugins.git.GitSCMSource
-import jenkins.plugins.git.traits.*
-import org.jenkinsci.plugins.workflow.multibranch.WorkflowMultiBranchProject
-
-def jenkins = Jenkins.getInstanceOrNull()
-if (jenkins == null) {
-  println "ERROR: No se pudo obtener la instancia de Jenkins."
-  return
-}
-
-// Lista de jobs a crear: [nombre, repo-url-relativo, es-frontend]
-def jobs = [
-GROOVY_HEADER
-
-  # Inyectar jobs dinámicamente desde --services y --frontend
-  IFS=',' read -ra _svc_list <<< "$SERVICES"
-  for _svc in "${_svc_list[@]}"; do
-    _svc="${_svc// /}"
-    [[ -z "$_svc" ]] && continue
-    printf "  ['%s', '%s', false],\n" "$_svc" "$_svc" >> "$jobs_script"
-  done
-  if [[ -n "$FRONTEND_NAME" ]]; then
-    printf "  ['%s', '%s', true ],\n" "$FRONTEND_NAME" "$FRONTEND_NAME" >> "$jobs_script"
+  # --- Crear jobs via XML REST API (evita problemas de classloader del Script Console) ---
+  # Obtener credenciales admin
+  local jenkins_admin_pass="${jenkins_token:-}"
+  if [[ -z "$jenkins_admin_pass" ]]; then
+    jenkins_admin_pass=$(ssh -i "$VPS_SSH_KEY" -o StrictHostKeyChecking=no -o BatchMode=yes \
+      "${VPS_USER}@${VPS_IP}" \
+      "sudo cat /var/lib/jenkins/secrets/initialAdminPassword 2>/dev/null" \
+      2>/dev/null | tr -d '[:space:]' || true)
   fi
 
-  # Resto del script Groovy
-  cat >> "$jobs_script" <<GROOVY_FOOTER
-]
+  if [[ -z "$jenkins_admin_pass" ]]; then
+    log_err "No se pudo obtener credenciales de Jenkins. Creá los jobs manualmente en la UI."
+  else
+    # Obtener crumb (CSRF token)
+    local cookie_jar="/tmp/jenkins-cookies-$$.txt"
+    local crumb
+    crumb=$(curl -s -u "admin:$jenkins_admin_pass" -c "$cookie_jar" \
+      "$jenkins_url/crumbIssuer/api/json" 2>/dev/null \
+      | grep -o '"crumb":"[^"]*"' | cut -d'"' -f4 || true)
+    local -a crumb_args=()
+    [[ -n "$crumb" ]] && crumb_args=(-H "Jenkins-Crumb: $crumb")
 
-def gitBase = '${git_base}'
+    # Generar XML de MultiBranch Pipeline y crear cada job via /createItem
+    create_multibranch_xml() {
+      local repo_url="$1"
+      cat <<JOBXML
+<?xml version='1.1' encoding='UTF-8'?>
+<org.jenkinsci.plugins.workflow.multibranch.WorkflowMultiBranchProject>
+  <description></description>
+  <properties/>
+  <orphanedItemStrategy class="com.cloudbees.hudson.plugins.folder.computed.DefaultOrphanedItemStrategy">
+    <pruneDeadBranches>true</pruneDeadBranches>
+    <daysToKeep>7</daysToKeep>
+    <numToKeep>-1</numToKeep>
+    <abortBuilds>false</abortBuilds>
+  </orphanedItemStrategy>
+  <triggers/>
+  <disabled>false</disabled>
+  <sources class="jenkins.branch.MultiBranchProject\$BranchSourceList">
+    <data>
+      <jenkins.branch.BranchSource>
+        <source class="jenkins.plugins.git.GitSCMSource">
+          <remote>${repo_url}</remote>
+          <credentialsId></credentialsId>
+          <traits>
+            <jenkins.plugins.git.traits.BranchDiscoveryTrait/>
+            <jenkins.plugins.git.traits.TagDiscoveryTrait/>
+          </traits>
+        </source>
+        <strategy class="jenkins.branch.DefaultBranchPropertyStrategy">
+          <properties class="empty-list"/>
+        </strategy>
+      </jenkins.branch.BranchSource>
+    </data>
+  </sources>
+  <factory class="org.jenkinsci.plugins.workflow.multibranch.WorkflowBranchProjectFactory">
+    <scriptPath>Jenkinsfile</scriptPath>
+  </factory>
+</org.jenkinsci.plugins.workflow.multibranch.WorkflowMultiBranchProject>
+JOBXML
+    }
 
-GROOVY_FOOTER
-
-  cat >> "$jobs_script" <<'GROOVY_BODY'
-jobs.each { jobName, repoName, isFrontend ->
-  def fullName = jobName
-  def existing = jenkins.getItemByFullName(fullName)
-  if (existing != null) {
-    println "Job '${fullName}' ya existe. Se omite."
-    return
-  }
-
-  def project = jenkins.createProject(WorkflowMultiBranchProject, fullName)
-  project.displayName = jobName
-
-  // Branch source: repositorio Git
-  def repoUrl = "${gitBase}/${repoName}.git"
-  def scmSource = new GitSCMSource(null, repoUrl, '', '*', '', true)
-  scmSource.traits = [
-    new BranchDiscoveryTrait(),
-    new OriginPullRequestDiscoveryTrait(1), // Merged PRs
-    new TagDiscoveryTrait()
-  ]
-
-  project.sourcesList.clear()
-  project.sourcesList.add(new BranchSource(scmSource))
-
-  // Orphaned item strategy: descartar ramas viejas tras 7 días
-  project.orphanedItemStrategy = new com.cloudbees.hudson.plugins.folder.computed.DefaultOrphanedItemStrategy(
-    true, '7', ''
-  )
-
-  // Trigger de webhook (plugin multibranch-scan-webhook-trigger): un POST de Gitea a
-  // /multibranch-webhook-trigger/invoke?token=<jobName> dispara el escaneo del
-  // multibranch. Vía reflection para no romper el script si el plugin no está.
-  try {
-    def triggerClass = Class.forName('com.igalg.jenkins.plugins.mswt.trigger.ComputedFolderWebHookTrigger')
-    project.addTrigger(triggerClass.getConstructor(String.class).newInstance(fullName))
-  } catch (Throwable t) {
-    println "WARN: no se pudo agregar el webhook trigger a ${fullName}: ${t}"
-  }
-
-  project.save()
-  println "Job creado: ${fullName}"
-}
-
-println "Listo. ${jobs.size()} jobs procesados."
-GROOVY_BODY
-
-  log "Script Groovy generado: $jobs_script"
-
-  # --- Aplicar los jobs en el controller ---
-  local script_content
-  script_content=$(cat "$jobs_script")
-
-  if [[ -n "$jenkins_token" ]]; then
-    # Con API token (override manual o staging/prod): auth básica, sin crumb.
-    log "Aplicando jobs vía REST API con token ($jenkins_url)..."
-    local http_code
-    http_code=$(curl -s -o /tmp/jenkins-job-result.txt -w "%{http_code}" \
-      -X POST "$jenkins_url/scriptText" \
-      --user "$jenkins_user:$jenkins_token" \
-      --data-urlencode "script=$script_content" 2>&1 || true)
-    if [[ "$http_code" == "200" ]]; then
-      log_ok "Jobs creados vía API:"; cat /tmp/jenkins-job-result.txt
-    else
-      log_err "La API de Jenkins respondió HTTP $http_code — aplicá el script manualmente (Script Console): $jobs_script"
-    fi
-  elif [[ "$env_name" == "dev" ]]; then
-    # dev: el controller corre sin security realm (anónimo = admin). Crumb + cookie.
-    log "Aplicando jobs en el controller dev vía /scriptText..."
-    local ready=0
-    for _ in $(seq 1 40); do
-      if curl -sf -o /dev/null "$jenkins_url/login" 2>/dev/null; then ready=1; break; fi
-      sleep 3
+    local jobs_created=0 jobs_skipped=0
+    local all_jobs=()
+    IFS=',' read -ra _svc_list <<< "$SERVICES"
+    for _svc in "${_svc_list[@]}"; do
+      _svc="${_svc// /}"; [[ -z "$_svc" ]] && continue
+      all_jobs+=("$_svc")
     done
-    if [[ "$ready" -eq 0 ]]; then
-      log_err "Jenkins no respondió en $jenkins_url — omito la creación de jobs. Revisá: docker logs jenkins-controller"
-    else
-      local cookie_jar="/tmp/jenkins-cookies-$$.txt"
-      local crumb
-      crumb=$(curl -s -c "$cookie_jar" "$jenkins_url/crumbIssuer/api/json" 2>/dev/null \
-        | grep -o '"crumb":"[^"]*"' | cut -d'"' -f4 || true)
-      local -a crumb_args=()
-      [[ -n "$crumb" ]] && crumb_args=(-H "Jenkins-Crumb: $crumb")
+    [[ -n "$FRONTEND_NAME" ]] && all_jobs+=("$FRONTEND_NAME")
+
+    for job_name in "${all_jobs[@]}"; do
+      local repo_url="${git_base}/${job_name}.git"
+      local xml_body
+      xml_body=$(create_multibranch_xml "$repo_url")
       local http_code
       http_code=$(curl -s -o /tmp/jenkins-job-result.txt -w "%{http_code}" \
+        -u "admin:$jenkins_admin_pass" \
         -b "$cookie_jar" "${crumb_args[@]}" \
-        -X POST "$jenkins_url/scriptText" \
-        --data-urlencode "script=$script_content" 2>&1 || true)
-      rm -f "$cookie_jar"
+        -X POST "${jenkins_url}/createItem?name=${job_name}" \
+        -H "Content-Type: application/xml" \
+        --data-binary "$xml_body" 2>/dev/null || echo "000")
       if [[ "$http_code" == "200" ]]; then
-        log_ok "Jobs creados en Jenkins:"; cat /tmp/jenkins-job-result.txt
+        log_ok "  Job creado: $job_name"
+        jobs_created=$((jobs_created + 1))
+      elif [[ "$http_code" == "400" ]]; then
+        log "  Job '$job_name' ya existe — omitiendo."
+        jobs_skipped=$((jobs_skipped + 1))
       else
-        log_err "Jenkins respondió HTTP $http_code al crear jobs. Salida:"
-        cat /tmp/jenkins-job-result.txt 2>/dev/null || true
+        log_err "  Job '$job_name' → HTTP $http_code: $(cat /tmp/jenkins-job-result.txt 2>/dev/null | head -3)"
       fi
-    fi
-  else
-    log "JENKINS_TOKEN no definido (staging/prod). Aplicá el script manualmente:"
-    echo "  export JENKINS_URL=...  JENKINS_USER=admin  JENKINS_TOKEN=<token>"
-    echo "  o Manage Jenkins → Script Console → pegar: $jobs_script"
+    done
+    rm -f "$cookie_jar"
+    log_ok "$jobs_created job(s) creados, $jobs_skipped ya existían."
+
+    # Guardar groovy de referencia para uso manual
+    log "Script Groovy de referencia (manual): $jobs_script"
+    printf '// Referencia: jobs creados via XML REST API\n// Ver setup-cicd-pipeline.sh para detalles\n' > "$jobs_script"
   fi
 
   # --- Webhooks de Gitea → Jenkins (dev) ---
@@ -730,7 +749,7 @@ section_6_verificar_pipeline() {
   log "=== Sección 6 — Verificación del pipeline completo ==="
 
   local env_name="${DEPLOY_ENV:-dev}"
-  local kubeconfig="$PROJECT_ROOT/terraform/backend/environments/dev/.kube/config-k3d"
+  local kubeconfig="$PROJECT_ROOT/terraform/backend/environments/dev/.kube/config-k3s"
   local env_file="$PROJECT_ROOT/jenkins-shared-library/docker/.env.jenkins"
   local checks_ok=0
   local checks_fail=0
@@ -810,14 +829,14 @@ section_6_verificar_pipeline() {
     fi
   fi
 
-  # --- 4. K3d — Namespace y ServiceAccount ---
+  # --- 4. K3s — Namespace y ServiceAccount ---
   echo ""
-  log "--- 4. K3d — Namespace y ServiceAccount del agente ---"
+  log "--- 4. K3s — Namespace y ServiceAccount del agente ---"
   if [[ -f "$kubeconfig" ]]; then
     if kubectl --kubeconfig "$kubeconfig" get namespace jenkins &>/dev/null; then
-      chk_ok "Namespace 'jenkins' existe en K3d"
+      chk_ok "Namespace 'jenkins' existe en K3s"
     else
-      chk_fail "Namespace 'jenkins' no encontrado en K3d"
+      chk_fail "Namespace 'jenkins' no encontrado en K3s"
     fi
     if kubectl --kubeconfig "$kubeconfig" get serviceaccount jenkins-agent -n jenkins &>/dev/null; then
       chk_ok "ServiceAccount 'jenkins-agent' existe en namespace 'jenkins'"
@@ -825,12 +844,12 @@ section_6_verificar_pipeline() {
       chk_fail "ServiceAccount 'jenkins-agent' no encontrada en namespace 'jenkins'"
     fi
     if kubectl --kubeconfig "$kubeconfig" get namespace dev &>/dev/null; then
-      chk_ok "Namespace 'dev' existe en K3d (requerido por smoke tests)"
+      chk_ok "Namespace 'dev' existe en K3s (requerido por smoke tests)"
     else
       chk_warn "Namespace 'dev' no existe — smoke tests pueden fallar"
     fi
   else
-    chk_fail "Kubeconfig K3d no encontrado: $kubeconfig"
+    chk_fail "Kubeconfig K3s no encontrado: $kubeconfig"
   fi
 
   # --- 5. ArgoCD — Applications ---
@@ -857,7 +876,7 @@ section_6_verificar_pipeline() {
       chk_warn "Ninguna Application en Synced — esperado hasta que los repos de servicio tengan charts Helm"
     fi
   else
-    chk_warn "Kubeconfig K3d no disponible — no se puede verificar ArgoCD"
+    chk_warn "Kubeconfig K3s no disponible — no se puede verificar ArgoCD"
   fi
 
   # --- 6. Variables de entorno ---
@@ -925,6 +944,7 @@ main() {
   section_1_construir_imagen_controller
   section_2_bootstrap_cluster
   section_3_variables_credenciales
+  section_3b_instalar_plugins_jenkins
   section_4_crear_jobs_jenkins
   section_5_bootstrap_argocd
   section_6_verificar_pipeline

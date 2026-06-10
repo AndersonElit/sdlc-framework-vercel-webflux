@@ -2688,23 +2688,21 @@ terraform {
   }
 }
 
-# Providers Kubernetes/Helm apuntando al cluster K3d local (lo crea floci-start con
-# `k3d cluster create __PROJECT_NAME__-dev`). A diferencia de staging/prod (EKS, auth por
-# `aws eks get-token`), aquí la autenticación es por certificado de cliente del
-# kubeconfig que k3d genera. El cluster debe existir antes de `terraform apply`.
+# Providers Kubernetes/Helm apuntando al cluster K3s nativo en el VPS.
+# kubeconfig descargado por base-infrastructure-builder.sh; contexto renombrado a k3s-__PROJECT_NAME__-dev.
 provider "kubernetes" {
-  config_path    = "${path.module}/.kube/config-k3d"
-  config_context = "k3d-__PROJECT_NAME__-dev"
+  config_path    = "${path.module}/.kube/config-k3s"
+  config_context = "k3s-__PROJECT_NAME__-dev"
 }
 
 provider "helm" {
   kubernetes {
-    config_path    = "${path.module}/.kube/config-k3d"
-    config_context = "k3d-__PROJECT_NAME__-dev"
+    config_path    = "${path.module}/.kube/config-k3s"
+    config_context = "k3s-__PROJECT_NAME__-dev"
   }
 }
 
-# Floci — emulador AWS local (puerto 4566)
+# Floci — emulador AWS en el VPS (puerto 4566)
 provider "aws" {
   region                      = "us-east-1"
   access_key                  = "test"
@@ -2714,25 +2712,25 @@ provider "aws" {
   skip_requesting_account_id  = true
 
   endpoints {
-    ec2              = "http://localhost:4566"
-    eks              = "http://localhost:4566"
-    rds              = "http://localhost:4566"
-    s3               = "http://localhost:4566"
-    iam              = "http://localhost:4566"
-    sts              = "http://localhost:4566"
-    cognitoidp       = "http://localhost:4566"
-    apigateway       = "http://localhost:4566"
-    apigatewayv2     = "http://localhost:4566"
-    secretsmanager         = "http://localhost:4566"
-    ecr                    = "http://localhost:4566"
-    elasticloadbalancing   = "http://localhost:4566"
-    elasticloadbalancingv2 = "http://localhost:4566"
-    kafka                  = "http://localhost:4566"
-    cloudwatchlogs       = "http://localhost:4566"
-    ssm                  = "http://localhost:4566"
-    autoscaling          = "http://localhost:4566"
-    lambda               = "http://localhost:4566"
-    events               = "http://localhost:4566"
+    ec2              = "http://__VPS_IP__:4566"
+    eks              = "http://__VPS_IP__:4566"
+    rds              = "http://__VPS_IP__:4566"
+    s3               = "http://__VPS_IP__:4566"
+    iam              = "http://__VPS_IP__:4566"
+    sts              = "http://__VPS_IP__:4566"
+    cognitoidp       = "http://__VPS_IP__:4566"
+    apigateway       = "http://__VPS_IP__:4566"
+    apigatewayv2     = "http://__VPS_IP__:4566"
+    secretsmanager         = "http://__VPS_IP__:4566"
+    ecr                    = "http://__VPS_IP__:4566"
+    elasticloadbalancing   = "http://__VPS_IP__:4566"
+    elasticloadbalancingv2 = "http://__VPS_IP__:4566"
+    kafka                  = "http://__VPS_IP__:4566"
+    cloudwatchlogs       = "http://__VPS_IP__:4566"
+    ssm                  = "http://__VPS_IP__:4566"
+    autoscaling          = "http://__VPS_IP__:4566"
+    lambda               = "http://__VPS_IP__:4566"
+    events               = "http://__VPS_IP__:4566"
   }
 }
 
@@ -3721,7 +3719,8 @@ log "Aplicando nombre de proyecto '$PROJECT_NAME' al árbol Terraform generado..
 find "$TERRAFORM_ROOT" -type f \
   \( -name '*.tf' -o -name '*.yaml' -o -name '*.yml' -o -name '*.tfvars' -o -name '*.json' \) \
   -print0 | xargs -0 --no-run-if-empty sed -i \
-    -e "s#__PROJECT_NAME__#${PROJECT_NAME}#g"
+    -e "s#__PROJECT_NAME__#${PROJECT_NAME}#g" \
+    -e "s#__VPS_IP__#${VPS_IP}#g"
 log_ok "Nombre de proyecto '$PROJECT_NAME' aplicado al árbol Terraform."
 
 log_ok "Estructura Terraform creada en $TERRAFORM_ROOT."

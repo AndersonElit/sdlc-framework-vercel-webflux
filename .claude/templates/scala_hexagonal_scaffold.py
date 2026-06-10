@@ -609,6 +609,9 @@ def _setup_gitea_repo(svc: str, root: Path, org: str = "myproject") -> None:
 
 
 def _update_argocd_applicationset(svc: str, org: str = "myproject") -> None:
+    import os as _os
+    _vps_ip = _os.environ.get("VPS_IP", "localhost")
+    gitea_host = f"http://{_vps_ip}:3000"
     repo_root = Path(__file__).parent.parent.parent
     sentinel = "          # -- services managed by scaffold --\n"
     entry = (

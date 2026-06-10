@@ -92,7 +92,7 @@ helm upgrade --install kube-prometheus-stack prometheus-community/kube-prometheu
   --set grafana.fullnameOverride="${PROJECT_NAME}-grafana" \
   --set prometheus.prometheusSpec.podMonitorSelectorNilUsesHelmValues=false \
   --set prometheus.prometheusSpec.serviceMonitorSelectorNilUsesHelmValues=false \
-  --wait --timeout=5m
+  --wait --timeout=12m
 log_ok "kube-prometheus-stack instalado."
 
 # ---------------------------------------------------------------------------
@@ -242,7 +242,9 @@ helm upgrade --install loki grafana/loki \
   --set read.replicas=0 \
   --set write.replicas=0 \
   --set backend.replicas=0 \
-  --wait --timeout=4m
+  --set chunksCache.enabled=false \
+  --set resultsCache.enabled=false \
+  --wait --timeout=8m
 
 _fluent_values=$(mktemp /tmp/fluent-bit-values-XXXX.yaml)
 cat > "$_fluent_values" <<'FLUENT_EOF'
@@ -251,8 +253,8 @@ config:
     [OUTPUT]
         Name        loki
         Match       kube.*
-        Host        loki.monitoring
-        Port        3100
+        Host        loki-gateway.monitoring
+        Port        80
         Labels      job=fluentbit,namespace=$kubernetes['namespace_name'],pod=$kubernetes['pod_name']
         label_keys  $traceId,$spanId
         auto_kubernetes_labels on

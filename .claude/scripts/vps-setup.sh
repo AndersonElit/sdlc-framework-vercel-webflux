@@ -9,10 +9,10 @@
 # Comandos:
 #   prereqs     Instala herramientas de sistema (Java 21, Docker, AWS CLI, kubectl, helm,
 #               terraform, argocd CLI, Maven, curl, jq, yq, git, python3)
-#   services    Instala servicios como systemd: MongoDB 7, Kafka 3.7, Gitea 1.22,
+#   services    Instala servicios como systemd: MongoDB 8, Kafka 3.7, Gitea 1.22,
 #               SonarQube LTS, Jenkins LTS, WireMock 3.9, Narayana LRA Coordinator
 #   k3s         Instala K3s nativo + ArgoCD + descarga kubeconfig al host
-#   floci       Instala floci CLI + levanta contenedor floci/floci:latest (Docker)
+#   floci       Instala floci CLI nativo (usa Docker solo para sus contenedores internos)
 #   status      Muestra estado de todos los servicios
 #   all         Ejecuta prereqs → services → floci → k3s en orden
 #
@@ -109,7 +109,7 @@ sudo apt-get install -y -qq openjdk-21-jdk
 java -version 2>&1 | head -1
 
 echo "[4/10] Maven 3.9+..."
-MAVEN_VERSION="3.9.9"
+MAVEN_VERSION="3.9.16"
 if ! mvn --version &>/dev/null 2>&1; then
   wget -qO /tmp/maven.tar.gz \
     "https://dlcdn.apache.org/maven/maven-3/${MAVEN_VERSION}/binaries/apache-maven-${MAVEN_VERSION}-bin.tar.gz"
@@ -176,6 +176,18 @@ if ! command -v liquibase &>/dev/null; then
 fi
 liquibase --version 2>&1 | head -1
 
+echo "[+] GraalVM JDK 25 (native-image para floci)..."
+GRAALVM_DIR="/opt/graalvm-25"
+if [[ ! -x "${GRAALVM_DIR}/bin/native-image" ]]; then
+  wget -qO /tmp/graalvm.tar.gz \
+    "https://download.oracle.com/graalvm/25/latest/graalvm-jdk-25_linux-x64_bin.tar.gz"
+  sudo mkdir -p "${GRAALVM_DIR}"
+  sudo tar -xzf /tmp/graalvm.tar.gz -C "${GRAALVM_DIR}" --strip-components=1
+  rm /tmp/graalvm.tar.gz
+fi
+${GRAALVM_DIR}/bin/java -version 2>&1 | head -1
+${GRAALVM_DIR}/bin/native-image --version 2>&1 | head -1
+
 echo "[OK] Prerequisitos instalados."
 REMOTE
   ok "Prerequisitos completados en $VM_IP"
@@ -207,23 +219,93 @@ if ! command -v docker &>/dev/null; then
 fi
 docker --version
 
-# ── 2. MongoDB 7 ─────────────────────────────────────────────────────────────
-echo "[MongoDB] Instalando MongoDB 7..."
-if ! command -v mongod &>/dev/null; then
-  curl -fsSL https://www.mongodb.org/static/pgp/server-7.0.asc \
-    | sudo gpg --dearmor -o /usr/share/keyrings/mongodb-server-7.0.gpg
-  echo "deb [ arch=amd64 signed-by=/usr/share/keyrings/mongodb-server-7.0.gpg ] \
-    https://repo.mongodb.org/apt/ubuntu noble/mongodb-org/7.0 multiverse" \
-    | sudo tee /etc/apt/sources.list.d/mongodb-org-7.0.list
-  sudo apt-get update -qq
-  sudo apt-get install -y -qq mongodb-org
-fi
-sudo systemctl enable --now mongod
-systemctl is-active mongod && echo "[OK] MongoDB activo." || echo "[WARN] MongoDB no activo."
+# ── 2. MongoDB / FerretDB (kernel-aware) ─────────────────────────────────────
+# MongoDB 8+ es incompatible con kernel >= 6.19 (SERVER-121912).
+# En kernels afectados se instala FerretDB como proxy MongoDB-compatible.
+echo "[MongoDB] Detectando versión de kernel..."
+KERNEL_MAJOR=\$(uname -r | cut -d. -f1)
+KERNEL_MINOR=\$(uname -r | cut -d. -f2)
 
-# ── 3. Apache Kafka 3.7 (KRaft, sin ZooKeeper) ──────────────────────────────
-echo "[Kafka] Instalando Apache Kafka 3.7..."
-KAFKA_VERSION="3.7.2"
+if [[ \$KERNEL_MAJOR -gt 6 ]] || { [[ \$KERNEL_MAJOR -eq 6 ]] && [[ \$KERNEL_MINOR -ge 19 ]]; }; then
+  echo "[MongoDB] Kernel \$(uname -r) >= 6.19 — MongoDB incompatible (SERVER-121912)."
+  echo "[MongoDB] Instalando FerretDB (proxy MongoDB-compatible sobre PostgreSQL)..."
+
+  FERRETDB_VERSION="1.24.0"
+  if ! command -v ferretdb &>/dev/null; then
+    # Intentar descarga directa del binario; si falla, probar el tarball
+    sudo wget -qO /usr/local/bin/ferretdb \
+      "https://github.com/FerretDB/FerretDB/releases/download/v\${FERRETDB_VERSION}/ferretdb-linux-amd64" \
+    || {
+      sudo wget -qO /tmp/ferretdb.tar.gz \
+        "https://github.com/FerretDB/FerretDB/releases/download/v\${FERRETDB_VERSION}/ferretdb_\${FERRETDB_VERSION}_linux_amd64.tar.gz"
+      sudo tar -xzf /tmp/ferretdb.tar.gz -C /usr/local/bin/ ferretdb 2>/dev/null \
+        || sudo tar -xzf /tmp/ferretdb.tar.gz --wildcards -C /usr/local/bin/ '*/ferretdb' --strip-components=1
+      rm -f /tmp/ferretdb.tar.gz
+    }
+    sudo chmod +x /usr/local/bin/ferretdb
+  fi
+  ferretdb --version 2>/dev/null | head -1 || true
+
+  id "ferretdb" &>/dev/null || sudo useradd -r -s /bin/false "ferretdb"
+  sudo mkdir -p /var/lib/ferretdb
+  sudo chown ferretdb:ferretdb /var/lib/ferretdb
+
+  sudo tee /etc/systemd/system/mongod.service > /dev/null <<EOF
+[Unit]
+Description=FerretDB (MongoDB-compatible, SQLite backend)
+After=network.target
+
+[Service]
+Type=simple
+User=ferretdb
+ExecStart=/usr/local/bin/ferretdb \\
+  --handler=sqlite \\
+  --sqlite-url=file:/var/lib/ferretdb/ \\
+  --state-dir=/var/lib/ferretdb \\
+  --listen-addr=:27017
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+else
+  # MongoDB nativo (kernel < 6.19)
+  echo "[MongoDB] Instalando MongoDB nativo..."
+  if ! command -v mongod &>/dev/null; then
+    sudo rm -f /etc/apt/sources.list.d/mongodb-org-*.list \
+               /usr/share/keyrings/mongodb-server-*.gpg
+
+    if grep -qc avx /proc/cpuinfo; then
+      MONGO_VER="8.0"
+      echo "[MongoDB] AVX disponible — instalando MongoDB 8.0"
+    else
+      MONGO_VER="7.0"
+      echo "[MongoDB] Sin AVX (VM KVM) — instalando MongoDB 7.0"
+    fi
+
+    curl -fsSL "https://www.mongodb.org/static/pgp/server-\${MONGO_VER}.asc" \
+      | sudo gpg --dearmor -o /usr/share/keyrings/mongodb-server-\${MONGO_VER}.gpg
+    MONGO_CS=\$(lsb_release -cs)
+    curl -sf "https://repo.mongodb.org/apt/ubuntu/dists/\${MONGO_CS}/mongodb-org/\${MONGO_VER}/InRelease" &>/dev/null \
+      || MONGO_CS="noble"
+    echo "deb [ arch=amd64 signed-by=/usr/share/keyrings/mongodb-server-\${MONGO_VER}.gpg ] \
+      https://repo.mongodb.org/apt/ubuntu \${MONGO_CS}/mongodb-org/\${MONGO_VER} multiverse" \
+      | sudo tee /etc/apt/sources.list.d/mongodb-org-\${MONGO_VER}.list
+    sudo apt-get update -qq
+    sudo apt-get install -y -qq mongodb-org
+  fi
+fi
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now mongod
+sleep 3
+systemctl is-active mongod && echo "[OK] MongoDB/FerretDB activo." || echo "[WARN] mongod no activo (revisar: journalctl -u mongod -n 20)."
+
+# ── 3. Apache Kafka 3.9 (KRaft, sin ZooKeeper) ──────────────────────────────
+echo "[Kafka] Instalando Apache Kafka 3.9..."
+KAFKA_VERSION="3.9.2"
 KAFKA_DIR="/opt/kafka"
 KAFKA_USER="kafka"
 
@@ -385,6 +467,13 @@ SONAR_USER="sonarqube"
 
 id "\$SONAR_USER" &>/dev/null || sudo useradd -r -s /bin/false "\$SONAR_USER"
 
+# Elasticsearch embebido requiere vm.max_map_count >= 524288
+sudo sysctl -w vm.max_map_count=524288 > /dev/null
+grep -q 'vm.max_map_count' /etc/sysctl.conf \
+  || echo 'vm.max_map_count=524288' | sudo tee -a /etc/sysctl.conf > /dev/null
+
+sudo apt-get install -y -qq openjdk-17-jdk
+
 if [[ ! -d "\$SONAR_DIR" ]]; then
   wget -qO /tmp/sonarqube.zip \
     "https://binaries.sonarsource.com/Distribution/sonarqube/sonarqube-\${SONAR_VERSION}.zip"
@@ -392,7 +481,11 @@ if [[ ! -d "\$SONAR_DIR" ]]; then
   sudo ln -sfn "/opt/sonarqube-\${SONAR_VERSION}" "\$SONAR_DIR"
   rm /tmp/sonarqube.zip
 fi
-sudo chown -R "\$SONAR_USER:\$SONAR_USER" "\$SONAR_DIR"
+sudo chown -R "\$SONAR_USER:\$SONAR_USER" "/opt/sonarqube-\${SONAR_VERSION}"
+
+# Kafka ocupa el puerto 9092; reemplazar la línea (comentada o activa) con el valor correcto
+sudo sed -i '/sonar\.embeddedDatabase\.port/d' "\$SONAR_DIR/conf/sonar.properties"
+echo 'sonar.embeddedDatabase.port=9094' | sudo tee -a "\$SONAR_DIR/conf/sonar.properties"
 
 sudo tee /etc/systemd/system/sonarqube.service > /dev/null <<EOF
 [Unit]
@@ -402,9 +495,12 @@ After=network.target
 [Service]
 Type=forking
 User=\$SONAR_USER
+Environment=JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+Environment="PATH=/usr/lib/jvm/java-17-openjdk-amd64/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 ExecStart=\$SONAR_DIR/bin/linux-x86-64/sonar.sh start
 ExecStop=\$SONAR_DIR/bin/linux-x86-64/sonar.sh stop
-PIDFile=\$SONAR_DIR/bin/linux-x86-64/.SonarQube.pid
+PIDFile=\$SONAR_DIR/bin/linux-x86-64/SonarQube.pid
+TimeoutStartSec=300
 Restart=on-failure
 LimitNOFILE=65536
 LimitNPROC=8192
@@ -415,15 +511,21 @@ EOF
 
 sudo systemctl daemon-reload
 sudo systemctl enable --now sonarqube
-sleep 5
-systemctl is-active sonarqube && echo "[OK] SonarQube activo." || echo "[WARN] SonarQube no activo (puede tardar 1-2 min en arrancar)."
+# SonarQube tarda 60-120 s en arrancar (Elasticsearch embebido)
+for _i in \$(seq 1 12); do
+  systemctl is-active --quiet sonarqube && break || sleep 10
+done
+systemctl is-active sonarqube && echo "[OK] SonarQube activo." || echo "[WARN] SonarQube no activo (revisar: journalctl -u sonarqube -n 30)."
 
 # ── 6. Jenkins LTS ───────────────────────────────────────────────────────────
 echo "[Jenkins] Instalando Jenkins LTS..."
 if ! command -v jenkins &>/dev/null && ! systemctl list-units --type=service | grep -q jenkins; then
-  curl -fsSL https://pkg.jenkins.io/debian-stable/jenkins.io-2023.key \
-    | sudo tee /usr/share/keyrings/jenkins-keyring.asc > /dev/null
-  echo "deb [signed-by=/usr/share/keyrings/jenkins-keyring.asc] \
+  sudo rm -f /usr/share/keyrings/jenkins-keyring.asc /usr/share/keyrings/jenkins-keyring.gpg \
+             /etc/apt/sources.list.d/jenkins.list
+  # La clave jenkins.io-2023.key expiró en mar-2026; obtener la vigente del keyserver
+  gpg --keyserver hkps://keyserver.ubuntu.com --recv-keys 7198F4B714ABFC68
+  gpg --export 7198F4B714ABFC68 | sudo tee /usr/share/keyrings/jenkins-keyring.gpg > /dev/null
+  echo "deb [signed-by=/usr/share/keyrings/jenkins-keyring.gpg] \
     https://pkg.jenkins.io/debian-stable binary/" \
     | sudo tee /etc/apt/sources.list.d/jenkins.list > /dev/null
   sudo apt-get update -qq
@@ -467,19 +569,60 @@ sudo systemctl enable --now wiremock
 sleep 2
 systemctl is-active wiremock && echo "[OK] WireMock activo." || echo "[WARN] WireMock no activo."
 
-# ── 8. Narayana LRA Coordinator (JAR standalone) ──────────────────────────────
-echo "[LRA] Instalando Narayana LRA Coordinator..."
-LRA_VERSION="7.0.3.Final"
-LRA_JAR="/opt/lra-coordinator/lra-coordinator.jar"
+# ── 8. Narayana LRA Coordinator (Quarkus standalone, compilado desde fuente) ──
+echo "[LRA] Compilando Narayana LRA Coordinator (Quarkus standalone)..."
+NARAYANA_VERSION="7.0.0.Final"
+LRA_DIR="/opt/lra-coordinator"
 LRA_USER="lra"
 
 id "\$LRA_USER" &>/dev/null || sudo useradd -r -s /bin/false "\$LRA_USER"
-sudo mkdir -p /opt/lra-coordinator
-if [[ ! -f "\$LRA_JAR" ]]; then
-  sudo wget -qO "\$LRA_JAR" \
-    "https://repo1.maven.org/maven2/org/jboss/narayana/lra/lra-coordinator-quarkus/\${LRA_VERSION}/lra-coordinator-quarkus-\${LRA_VERSION}-runner.jar"
+sudo mkdir -p "\$LRA_DIR"
+
+if [[ ! -f "\$LRA_DIR/lra-coordinator.jar" ]]; then
+  echo "[LRA] Clonando narayana \${NARAYANA_VERSION} (rama shallow)..."
+  sudo rm -rf /tmp/narayana-src
+  git clone --depth=1 --branch "\${NARAYANA_VERSION}" \
+    https://github.com/jbosstm/narayana.git /tmp/narayana-src
+
+  echo "[LRA] Localizando módulo lra/coordinator..."
+  LRA_MODULE=\$(find /tmp/narayana-src -path "*/lra/coordinator/pom.xml" \
+    ! -path "*/test*" 2>/dev/null | head -1 | sed "s|/tmp/narayana-src/||;s|/pom.xml||")
+  [[ -n "\$LRA_MODULE" ]] || { echo "[ERROR] Módulo lra/coordinator no encontrado en el repo"; exit 1; }
+  echo "[LRA] Módulo encontrado: \${LRA_MODULE}"
+
+  echo "[LRA] Instalando POMs padre y compilando coordinator (5-10 min)..."
+  # mvn -pl falla porque el módulo no está en el reactor por defecto;
+  # se instalan root + padres intermedios con -N (non-recursive) para que
+  # maven pueda resolver el módulo coordinator de forma standalone.
+  LRA_GRANDPARENT=\$(dirname \$(dirname "\$LRA_MODULE"))
+  LRA_PARENT=\$(dirname "\$LRA_MODULE")
+
+  cd /tmp/narayana-src
+  JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 mvn install -N -q -DskipTests
+
+  [[ "\$LRA_GRANDPARENT" != "." ]] && \
+    (cd /tmp/narayana-src/"\$LRA_GRANDPARENT" && \
+      JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 mvn install -N -q -DskipTests)
+
+  (cd /tmp/narayana-src/"\$LRA_PARENT" && \
+    JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 mvn install -N -q -DskipTests)
+
+  (cd /tmp/narayana-src/"\$LRA_MODULE" && \
+    JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 mvn package \
+      -DskipTests -Dquarkus.package.type=uber-jar -q)
+
+  LRA_JAR=\$(find /tmp/narayana-src/\${LRA_MODULE}/target \
+    -maxdepth 1 -name "*-runner.jar" 2>/dev/null | head -1)
+  [[ -n "\$LRA_JAR" ]] || LRA_JAR=\$(find /tmp/narayana-src/\${LRA_MODULE}/target \
+    -maxdepth 1 -name "*.jar" ! -name "*sources*" ! -name "*javadoc*" 2>/dev/null | tail -1)
+  [[ -n "\$LRA_JAR" ]] || { echo "[ERROR] JAR del LRA Coordinator no encontrado en target/"; exit 1; }
+
+  sudo cp "\$LRA_JAR" "\$LRA_DIR/lra-coordinator.jar"
+  sudo rm -rf /tmp/narayana-src
+  echo "[LRA] JAR instalado en \$LRA_DIR/lra-coordinator.jar"
 fi
-sudo chown -R "\$LRA_USER:\$LRA_USER" /opt/lra-coordinator
+
+sudo chown -R "\$LRA_USER:\$LRA_USER" "\$LRA_DIR"
 
 sudo tee /etc/systemd/system/lra-coordinator.service > /dev/null <<EOF
 [Unit]
@@ -489,7 +632,8 @@ After=network.target
 [Service]
 Type=simple
 User=\$LRA_USER
-ExecStart=/usr/bin/java -jar \$LRA_JAR -Dquarkus.http.port=50000
+Environment=QUARKUS_HTTP_PORT=50000
+ExecStart=/usr/bin/java -jar \$LRA_DIR/lra-coordinator.jar
 Restart=on-failure
 RestartSec=5
 
@@ -499,13 +643,28 @@ EOF
 
 sudo systemctl daemon-reload
 sudo systemctl enable --now lra-coordinator
-sleep 2
-systemctl is-active lra-coordinator && echo "[OK] LRA Coordinator activo." || echo "[WARN] LRA Coordinator no activo."
+# JVM tarda ~15-20 s en arrancar; reintentar hasta 30 s
+for _i in \$(seq 1 6); do
+  systemctl is-active --quiet lra-coordinator && break || sleep 5
+done
+systemctl is-active lra-coordinator \
+  && echo "[OK] LRA Coordinator activo." \
+  || echo "[WARN] LRA Coordinator no activo (revisar: journalctl -u lra-coordinator -n 20)."
 
 # ── 9. PostgreSQL 16 ──────────────────────────────────────────────────────────
 echo "[PostgreSQL] Instalando PostgreSQL 16..."
 if ! command -v psql &>/dev/null; then
-  sudo apt-get install -y -qq postgresql-16 postgresql-contrib-16
+  # Ubuntu 26.04 no trae postgresql-16 en apt; usar repositorio oficial PGDG
+  curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+    | sudo gpg --dearmor -o /usr/share/keyrings/postgresql.gpg
+  PGDG_CS=\$(lsb_release -cs)
+  # Si el codename no existe aún en PGDG (distro muy nueva) caer a noble
+  curl -sf "https://apt.postgresql.org/pub/repos/apt/dists/\${PGDG_CS}-pgdg/InRelease" &>/dev/null \
+    || PGDG_CS="noble"
+  echo "deb [signed-by=/usr/share/keyrings/postgresql.gpg] https://apt.postgresql.org/pub/repos/apt \${PGDG_CS}-pgdg main" \
+    | sudo tee /etc/apt/sources.list.d/pgdg.list > /dev/null
+  sudo apt-get update -qq
+  sudo apt-get install -y -qq postgresql-16
 fi
 # Escuchar en todas las interfaces para que los pods K3s accedan vía VPS_IP
 sudo sed -i "s|^#listen_addresses.*|listen_addresses = '*'|" \
@@ -525,6 +684,9 @@ REMOTE
 }
 
 # ─── COMANDO: floci ───────────────────────────────────────────────────────────
+# floci = CLI nativo (GraalVM) que gestiona un container Docker interno.
+# Systemd usa Type=oneshot + RemainAfterExit para que `systemctl is-active floci`
+# devuelva "active" después de que `floci start` termina (el container sigue vivo).
 cmd_floci() {
   require_vm_ip
   header "Instalando y levantando floci en $VM_IP"
@@ -532,32 +694,53 @@ cmd_floci() {
   ssh_vps "bash -s" <<'REMOTE'
 set -euo pipefail
 
-echo "[floci] Instalando floci CLI..."
+echo "[floci] Compilando binario nativo desde fuente..."
 if ! command -v floci &>/dev/null; then
-  curl -fsSL https://floci.io/install.sh | sh
+  sudo rm -rf /tmp/floci-src
+  git clone --depth=1 https://github.com/floci-io/floci-cli /tmp/floci-src
+
+  echo "[floci] Compilando con GraalVM native-image (5-10 min)..."
+  cd /tmp/floci-src
+  JAVA_HOME=/opt/graalvm-25 \
+    mvn clean package -Dnative -DskipTests -q
+
+  sudo cp target/floci /usr/local/bin/floci
+  sudo chmod +x /usr/local/bin/floci
+  cd /
+  sudo rm -rf /tmp/floci-src
 fi
 floci --version 2>/dev/null || true
 
-echo "[floci] Iniciando contenedor floci/floci:latest..."
-floci start 2>/dev/null || docker run -d \
-  --name floci \
-  --restart unless-stopped \
-  -p 4566:4566 \
-  -p 5000-5099:5000-5099 \
-  -p 5101-6499:5101-6499 \
-  -p 6501-8000:6501-8000 \
-  -v /var/run/docker.sock:/var/run/docker.sock \
-  -e DOCKER_NETWORK=bridge \
-  floci/floci:latest
+echo "[floci] Creando unidad systemd..."
+sudo tee /etc/systemd/system/floci.service > /dev/null <<EOF
+[Unit]
+Description=Floci cloud emulator (LocalStack-compatible)
+After=docker.service
+Requires=docker.service
 
-# Esperar a que responda
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/floci start
+ExecStop=/usr/local/bin/floci stop
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable floci
+
+# Si ya hay un container corriendo, detenerlo antes de (re)iniciar
+floci stop 2>/dev/null || true
+sudo systemctl start floci
+
+# Esperar health endpoint (hasta 60 s)
 for i in $(seq 1 30); do
-  if curl -sf http://localhost:4566/_localstack/health &>/dev/null; then
-    echo "[OK] floci respondiendo en http://localhost:4566."
-    break
-  fi
-  sleep 2
+  curl -sf http://localhost:4566/_localstack/health &>/dev/null && break || sleep 2
 done
+systemctl is-active floci && echo "[OK] floci activo (systemctl is-active devuelve active)." \
+  || echo "[WARN] floci no activo (revisar: journalctl -u floci -n 20)."
 REMOTE
 
   ok "floci levantado en $VM_IP:4566"
@@ -635,8 +818,9 @@ cmd_status() {
   ssh_vps "bash -s" <<'REMOTE'
 echo ""
 echo "── Servicios systemd ──────────────────────────────────────"
-for svc in mongod kafka gitea sonarqube jenkins wiremock lra-coordinator k3s; do
-  state=$(systemctl is-active "$svc" 2>/dev/null || echo "no instalado")
+for svc in mongod kafka gitea sonarqube jenkins wiremock lra-coordinator postgresql k3s; do
+  state=$(systemctl is-active "$svc" 2>/dev/null)
+  [[ "$state" == "unknown" || -z "$state" ]] && state="no instalado"
   printf "  %-22s %s\n" "$svc" "$state"
 done
 
@@ -646,7 +830,7 @@ docker ps --format "  {{.Names}}\t{{.Status}}" 2>/dev/null || echo "  Docker no 
 
 echo ""
 echo "── Puertos en escucha ─────────────────────────────────────"
-ss -tlnp 2>/dev/null | grep -E ':(22|80|443|2222|3000|4566|6443|8080|9000|9090|9092|9999|16686|27017|29092|50000)\s' \
+ss -tlnp 2>/dev/null | grep -E ':(22|80|443|2222|3000|4566|5432|6443|8080|9000|9090|9092|9999|16686|27017|29092|50000)\s' \
   | awk '{print "  " $4}' | sort -t: -k2 -n || true
 
 echo ""

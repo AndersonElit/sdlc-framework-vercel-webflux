@@ -28,16 +28,24 @@ failed=()
 
 for svc_path in "${services[@]}"; do
   svc_name="$(basename "$svc_path")"
-  if [[ ! -f "$svc_path/pom.xml" ]]; then
-    log_err "$svc_name: pom.xml no encontrado, omitiendo"
-    failed+=("$svc_name")
-    continue
-  fi
-  log "Compilando $svc_name..."
-  if (cd "$svc_path" && mvn compile -q); then
-    log_ok "$svc_name"
+  if [[ -f "$svc_path/build.sbt" ]]; then
+    log "Compilando $svc_name (sbt)..."
+    if (cd "$svc_path" && sbt --error compile 2>&1); then
+      log_ok "$svc_name"
+    else
+      log_err "$svc_name: falló sbt compile"
+      failed+=("$svc_name")
+    fi
+  elif [[ -f "$svc_path/pom.xml" ]]; then
+    log "Compilando $svc_name..."
+    if (cd "$svc_path" && mvn compile -q); then
+      log_ok "$svc_name"
+    else
+      log_err "$svc_name: falló mvn compile"
+      failed+=("$svc_name")
+    fi
   else
-    log_err "$svc_name: falló mvn compile"
+    log_err "$svc_name: ni pom.xml ni build.sbt encontrado, omitiendo"
     failed+=("$svc_name")
   fi
 done
